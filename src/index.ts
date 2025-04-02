@@ -1605,16 +1605,17 @@ class GodotServer {
           console.error(`Godot stderr indicates potential error during resource resave: ${stderr}`);
           const errorMatch = stderr.match(/ERROR: (.+)/);
           const specificError = errorMatch ? errorMatch[1] : stderr;
+          // If stderr contains "ERROR:", report it as an error regardless of exit code
           return this.createErrorResponse(`Godot reported an error during resource resave: ${specificError}`);
        }
 
-       if (stdout.includes('Resources resaved successfully')) {
-          return { content: [{ type: 'text', text: 'All project resources resaved successfully.' }] };
-       } else {
-          console.warn(`Resource resave process completed, but success message not found. Stdout: ${stdout}`);
-          return { content: [{ type: 'text', text: 'Resource resave process completed. Check logs for details.' }] };
-       }
+       // If we reach here, the process exited with code 0 and stderr did not contain "ERROR:"
+       // Consider this a success, even if the final stdout message wasn't captured reliably.
+       this.logDebug('Resource resave process exited cleanly (code 0) with no errors in stderr. Assuming success.');
+       return { content: [{ type: 'text', text: 'All project resources resaved successfully.' }] };
+
      } catch (error: any) {
+       // This catch block handles errors from executeOperation (e.g., non-zero exit code, spawn errors)
        console.error(`Error resaving resources: ${error.message}`);
        const stderrMatch = error.message.match(/Stderr: (.+)/);
        const godotError = stderrMatch ? stderrMatch[1] : 'Check server logs for details.';

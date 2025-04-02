@@ -22,23 +22,32 @@ func _init():
     
     # The operation should be 2 positions after the script path (script_index + 1 is the script path itself)
     var operation_index = script_index + 2
-    # The params should be 3 positions after the script path
+    # The params should be 3 positions after the script path (optional)
     var params_index = script_index + 3
-    
-    if args.size() <= params_index:
-        log_error("Usage: godot --headless --script godot_operations.gd <operation> <json_params>")
-        log_error("Not enough command-line arguments provided.")
+
+    # Check if operation argument exists
+    if args.size() <= operation_index:
+        log_error("Usage: godot --headless --script godot_operations.gd <operation> [json_params]")
+        log_error("Operation argument missing.")
         quit(1)
-    
+
     # Log all arguments for debugging
     log_debug("All arguments: " + str(args))
     log_debug("Script index: " + str(script_index))
     log_debug("Operation index: " + str(operation_index))
-    log_debug("Params index: " + str(params_index))
-    
+    log_debug("Params index: " + str(params_index)) # Note: params_index might be out of bounds
+
     var operation = args[operation_index]
-    var params_json = args[params_index]
-    
+    var params_json = "{}" # Default to empty JSON object
+    var params = {}      # Default to empty Dictionary
+
+    # Check if params argument exists and is not empty
+    if args.size() > params_index and not args[params_index].is_empty():
+        params_json = args[params_index]
+        log_debug("Params JSON provided: '" + params_json + "'")
+    else:
+        log_debug("No Params JSON provided or empty, defaulting to {}")
+
     # *** START DEBUG LOGGING ***
     print("[GDScript] Extracted Operation: ", operation)
     print("[GDScript] Extracted Params JSON String: '", params_json, "'")
@@ -46,41 +55,60 @@ func _init():
     # *** END DEBUG LOGGING ***
 
     log_info("Operation: " + operation)
-    log_debug("Params JSON: " + params_json)
-    
-    # Parse JSON using Godot 4.x API
-    var json = JSON.new()
-    log_debug("Attempting to parse JSON: '" + params_json + "'")
-    var error = json.parse(params_json)
-    var params = null
-    
-    # *** START DEBUG LOGGING ***
-    print("[GDScript] JSON Parse Result Code: ", error, " (OK = ", OK, ")")
-    printerr("[GDScript][stderr] JSON Parse Result Code: ", error, " (OK = ", OK, ")") # Also print to stderr
-    # *** END DEBUG LOGGING ***
+    log_debug("Params JSON to be processed: " + params_json)
 
-    if error == OK:
-        params = json.get_data()
+    # Only parse if params_json is not the default empty object string.
+    # Parsing "{}" is safe and handles potential whitespace like "{ }".
+    if params_json != "{}":
+        var json = JSON.new()
+        log_debug("Attempting to parse JSON: '" + params_json + "'")
+        var error = json.parse(params_json)
+        # params remains {} unless parsing succeeds and returns non-null data
+
         # *** START DEBUG LOGGING ***
-        print("[GDScript] Parsed Params Dictionary: ", params)
-        printerr("[GDScript][stderr] Parsed Params Dictionary: ", params) # Also print to stderr
+        print("[GDScript] JSON Parse Result Code: ", error, " (OK = ", OK, ")")
+        printerr("[GDScript][stderr] JSON Parse Result Code: ", error, " (OK = ", OK, ")") # Also print to stderr
         # *** END DEBUG LOGGING ***
-    else:
-        log_error("Failed to parse JSON parameters: " + params_json)
-        log_error("JSON Error: " + json.get_error_message() + " at line " + str(json.get_error_line()))
-        quit(1)
-    
-    if not params:
-        log_error("Failed to parse JSON parameters: " + params_json)
-        # *** START DEBUG LOGGING ***
-        printerr("[GDScript][stderr] Params variable is null AFTER supposed successful parse or before function call.")
-        # *** END DEBUG LOGGING ***
-        quit(1) # Quit here if params is null
-    
+
+        if error == OK:
+             # *** START MORE DEBUG LOGGING ***
+             print("[GDScript] JSON parse reported OK. Getting data...")
+             printerr("[GDScript][stderr] JSON parse reported OK. Getting data...")
+             var parsed_data = json.get_data()
+             print("[GDScript] Value returned by get_data(): ", parsed_data)
+             print("[GDScript] Type of value returned by get_data(): ", typeof(parsed_data))
+             printerr("[GDScript][stderr] Value returned by get_data(): ", parsed_data)
+             printerr("[GDScript][stderr] Type of value returned by get_data(): ", typeof(parsed_data))
+             # *** END MORE DEBUG LOGGING ***
+             if parsed_data != null: # Check if get_data() returned null despite OK
+                 params = parsed_data
+                 # *** START DEBUG LOGGING ***
+                 print("[GDScript] Parsed Params Dictionary: ", params)
+                 printerr("[GDScript][stderr] Parsed Params Dictionary: ", params) # Also print to stderr
+                 # *** END DEBUG LOGGING ***
+             else:
+                 # This case should ideally not happen if error is OK, but handle defensively
+                 log_error("JSON parsing returned OK but get_data() returned null. Using empty dictionary.")
+                 printerr("[GDScript][stderr] JSON parsing returned OK but get_data() returned null. Using empty dictionary.")
+                 params = {} # Fallback to empty dictionary
+        else:
+             log_error("Failed to parse JSON parameters: " + params_json)
+             log_error("JSON Error: " + json.get_error_message() + " at line " + str(json.get_error_line()))
+             quit(1)
+    else: # This 'else' corresponds to 'if params_json != "{}"'
+         log_debug("Using default empty dictionary for params.")
+         # params is already {}
+
+    # The problematic 'if not params:' check is removed.
+
     log_info("Executing operation: " + operation)
-    
+
+    # Add parameter validation within specific functions that require them
     match operation:
         "create_scene":
+            if not params.has("scene_path"):
+                 log_error("Missing required parameter 'scene_path' for create_scene")
+                 quit(1)
             # *** START DEBUG LOGGING ***
             print("[GDScript] Entering create_scene function.")
             printerr("[GDScript][stderr] Entering create_scene function.")
@@ -95,20 +123,40 @@ func _init():
             # *** END DEBUG LOGGING ***
             create_scene(params)
         "add_node":
-            add_node(params)
+             if not params.has("scene_path") or not params.has("node_type") or not params.has("node_name"):
+                 log_error("Missing required parameters for add_node (scene_path, node_type, node_name)")
+                 quit(1)
+             add_node(params)
         "load_sprite":
-            load_sprite(params)
+             if not params.has("scene_path") or not params.has("node_path") or not params.has("texture_path"):
+                 log_error("Missing required parameters for load_sprite (scene_path, node_path, texture_path)")
+                 quit(1)
+             load_sprite(params)
         "export_mesh_library":
-            export_mesh_library(params)
+             if not params.has("scene_path") or not params.has("mesh_item_names") or not params.has("output_path"):
+                 log_error("Missing required parameters for export_mesh_library (scene_path, mesh_item_names, output_path)")
+                 quit(1)
+             export_mesh_library(params)
         "save_scene":
-            save_scene(params)
+             if not params.has("scene_path"):
+                 log_error("Missing required parameter 'scene_path' for save_scene")
+                 quit(1)
+             save_scene(params)
         "get_uid":
-            get_uid(params)
+             if not params.has("file_path"):
+                 log_error("Missing required parameter 'file_path' for get_uid")
+                 quit(1)
+             get_uid(params)
         "resave_resources":
+            # No required params, call directly
             resave_resources(params)
         _:
             log_error("Unknown operation: " + operation)
             quit(1)
+
+    # Add a small delay before quitting to allow stdout/stderr buffers to flush, especially in headless mode
+    OS.delay_msec(100) # 100ms delay
+    log_debug("Quitting after delay.")
     
     quit()
 
