@@ -7,6 +7,10 @@ var debug_mode = false
 func _init():
     var args = OS.get_cmdline_args()
     
+    # *** START DEBUG LOGGING ***
+    print("[GDScript] Raw Command Line Args: ", args) 
+    # *** END DEBUG LOGGING ***
+
     # Check for debug flag
     debug_mode = "--debug-godot" in args
     
@@ -18,62 +22,141 @@ func _init():
     
     # The operation should be 2 positions after the script path (script_index + 1 is the script path itself)
     var operation_index = script_index + 2
-    # The params should be 3 positions after the script path
+    # The params should be 3 positions after the script path (optional)
     var params_index = script_index + 3
-    
-    if args.size() <= params_index:
-        log_error("Usage: godot --headless --script godot_operations.gd <operation> <json_params>")
-        log_error("Not enough command-line arguments provided.")
+
+    # Check if operation argument exists
+    if args.size() <= operation_index:
+        log_error("Usage: godot --headless --script godot_operations.gd <operation> [json_params]")
+        log_error("Operation argument missing.")
         quit(1)
-    
+
     # Log all arguments for debugging
     log_debug("All arguments: " + str(args))
     log_debug("Script index: " + str(script_index))
     log_debug("Operation index: " + str(operation_index))
-    log_debug("Params index: " + str(params_index))
-    
+    log_debug("Params index: " + str(params_index)) # Note: params_index might be out of bounds
+
     var operation = args[operation_index]
-    var params_json = args[params_index]
-    
-    log_info("Operation: " + operation)
-    log_debug("Params JSON: " + params_json)
-    
-    # Parse JSON using Godot 4.x API
-    var json = JSON.new()
-    var error = json.parse(params_json)
-    var params = null
-    
-    if error == OK:
-        params = json.get_data()
+    var params_json = "{}" # Default to empty JSON object
+    var params = {}      # Default to empty Dictionary
+
+    # Check if params argument exists and is not empty
+    if args.size() > params_index and not args[params_index].is_empty():
+        params_json = args[params_index]
+        log_debug("Params JSON provided: '" + params_json + "'")
     else:
-        log_error("Failed to parse JSON parameters: " + params_json)
-        log_error("JSON Error: " + json.get_error_message() + " at line " + str(json.get_error_line()))
-        quit(1)
-    
-    if not params:
-        log_error("Failed to parse JSON parameters: " + params_json)
-        quit(1)
-    
+        log_debug("No Params JSON provided or empty, defaulting to {}")
+
+    # *** START DEBUG LOGGING ***
+    print("[GDScript] Extracted Operation: ", operation)
+    print("[GDScript] Extracted Params JSON String: '", params_json, "'")
+    printerr("[GDScript][stderr] Extracted Params JSON String: '", params_json, "'") # Also print to stderr
+    # *** END DEBUG LOGGING ***
+
+    log_info("Operation: " + operation)
+    log_debug("Params JSON to be processed: " + params_json)
+
+    # Only parse if params_json is not the default empty object string.
+    # Parsing "{}" is safe and handles potential whitespace like "{ }".
+    if params_json != "{}":
+        var json = JSON.new()
+        log_debug("Attempting to parse JSON: '" + params_json + "'")
+        var error = json.parse(params_json)
+        # params remains {} unless parsing succeeds and returns non-null data
+
+        # *** START DEBUG LOGGING ***
+        print("[GDScript] JSON Parse Result Code: ", error, " (OK = ", OK, ")")
+        printerr("[GDScript][stderr] JSON Parse Result Code: ", error, " (OK = ", OK, ")") # Also print to stderr
+        # *** END DEBUG LOGGING ***
+
+        if error == OK:
+             # *** START MORE DEBUG LOGGING ***
+             print("[GDScript] JSON parse reported OK. Getting data...")
+             printerr("[GDScript][stderr] JSON parse reported OK. Getting data...")
+             var parsed_data = json.get_data()
+             print("[GDScript] Value returned by get_data(): ", parsed_data)
+             print("[GDScript] Type of value returned by get_data(): ", typeof(parsed_data))
+             printerr("[GDScript][stderr] Value returned by get_data(): ", parsed_data)
+             printerr("[GDScript][stderr] Type of value returned by get_data(): ", typeof(parsed_data))
+             # *** END MORE DEBUG LOGGING ***
+             if parsed_data != null: # Check if get_data() returned null despite OK
+                 params = parsed_data
+                 # *** START DEBUG LOGGING ***
+                 print("[GDScript] Parsed Params Dictionary: ", params)
+                 printerr("[GDScript][stderr] Parsed Params Dictionary: ", params) # Also print to stderr
+                 # *** END DEBUG LOGGING ***
+             else:
+                 # This case should ideally not happen if error is OK, but handle defensively
+                 log_error("JSON parsing returned OK but get_data() returned null. Using empty dictionary.")
+                 printerr("[GDScript][stderr] JSON parsing returned OK but get_data() returned null. Using empty dictionary.")
+                 params = {} # Fallback to empty dictionary
+        else:
+             log_error("Failed to parse JSON parameters: " + params_json)
+             log_error("JSON Error: " + json.get_error_message() + " at line " + str(json.get_error_line()))
+             quit(1)
+    else: # This 'else' corresponds to 'if params_json != "{}"'
+         log_debug("Using default empty dictionary for params.")
+         # params is already {}
+
+    # The problematic 'if not params:' check is removed.
+
     log_info("Executing operation: " + operation)
-    
+
+    # Add parameter validation within specific functions that require them
     match operation:
         "create_scene":
+            if not params.has("scene_path"):
+                 log_error("Missing required parameter 'scene_path' for create_scene")
+                 quit(1)
+            # *** START DEBUG LOGGING ***
+            print("[GDScript] Entering create_scene function.")
+            printerr("[GDScript][stderr] Entering create_scene function.")
+            print("[GDScript] Params type in create_scene: ", typeof(params))
+            printerr("[GDScript][stderr] Params type in create_scene: ", typeof(params))
+            if params == null:
+                print("[GDScript] Params is NULL right before accessing scene_path!")
+                printerr("[GDScript][stderr] Params is NULL right before accessing scene_path!")
+            else:
+                 print("[GDScript] Params content in create_scene: ", params)
+                 printerr("[GDScript][stderr] Params content in create_scene: ", params)
+            # *** END DEBUG LOGGING ***
             create_scene(params)
         "add_node":
-            add_node(params)
+             if not params.has("scene_path") or not params.has("node_type") or not params.has("node_name"):
+                 log_error("Missing required parameters for add_node (scene_path, node_type, node_name)")
+                 quit(1)
+             add_node(params)
         "load_sprite":
-            load_sprite(params)
+             if not params.has("scene_path") or not params.has("node_path") or not params.has("texture_path"):
+                 log_error("Missing required parameters for load_sprite (scene_path, node_path, texture_path)")
+                 quit(1)
+             load_sprite(params)
         "export_mesh_library":
-            export_mesh_library(params)
+             if not params.has("scene_path") or not params.has("mesh_item_names") or not params.has("output_path"):
+                 log_error("Missing required parameters for export_mesh_library (scene_path, mesh_item_names, output_path)")
+                 quit(1)
+             export_mesh_library(params)
         "save_scene":
-            save_scene(params)
+             if not params.has("scene_path"):
+                 log_error("Missing required parameter 'scene_path' for save_scene")
+                 quit(1)
+             save_scene(params)
         "get_uid":
-            get_uid(params)
+             if not params.has("file_path"):
+                 log_error("Missing required parameter 'file_path' for get_uid")
+                 quit(1)
+             get_uid(params)
         "resave_resources":
+            # No required params, call directly
             resave_resources(params)
         _:
             log_error("Unknown operation: " + operation)
             quit(1)
+
+    # Add a small delay before quitting to allow stdout/stderr buffers to flush, especially in headless mode
+    OS.delay_msec(100) # 100ms delay
+    log_debug("Quitting after delay.")
     
     quit()
 
@@ -256,9 +339,6 @@ func create_scene(params):
     scene_root.name = "root"
     if debug_mode:
         print("Root node created with name: " + scene_root.name)
-    
-    # Set the owner of the root node to itself (important for scene saving)
-    scene_root.owner = scene_root
     
     # Pack the scene
     var packed_scene = PackedScene.new()
@@ -462,7 +542,13 @@ func create_scene(params):
     else:
         printerr("Failed to pack scene: " + str(result))
         printerr("Error code: " + str(result))
-        quit(1)
+        quit(1) # Quit for pack error
+
+    # --- Final Cleanup for create_scene ---
+    if scene_root and is_instance_valid(scene_root):
+        if debug_mode: print("Freeing instantiated scene root node at end of create_scene")
+        scene_root.free()
+    # --- End Final Cleanup ---
 
 # Add a node to an existing scene
 func add_node(params):
@@ -540,26 +626,43 @@ func add_node(params):
     if debug_mode:
         print("Pack result: " + str(result) + " (OK=" + str(OK) + ")")
     
+    var save_error = ERR_CANT_CREATE # Initialize with an error state
+
     if result == OK:
+        absolute_scene_path = ProjectSettings.globalize_path(full_scene_path) # Ensure absolute path is defined here (Removed var)
         if debug_mode:
             print("Saving scene to: " + absolute_scene_path)
-        var save_error = ResourceSaver.save(packed_scene, absolute_scene_path)
+        save_error = ResourceSaver.save(packed_scene, absolute_scene_path) # Use absolute path for saving
         if debug_mode:
             print("Save result: " + str(save_error) + " (OK=" + str(OK) + ")")
+
         if save_error == OK:
+            # Simplified success message for clarity
+            print("Node '" + params.node_name + "' of type '" + params.node_type + "' added successfully")
+            # Add a small delay after successful save before cleanup
             if debug_mode:
-                var file_check_after = FileAccess.file_exists(absolute_scene_path)
-                print("File exists check after save: " + str(file_check_after))
-                if file_check_after:
-                    print("Node '" + params.node_name + "' of type '" + params.node_type + "' added successfully")
-                else:
-                    printerr("File reported as saved but does not exist at: " + absolute_scene_path)
-            else:
-                print("Node '" + params.node_name + "' of type '" + params.node_type + "' added successfully")
+                print("Waiting briefly after save...")
+            OS.delay_msec(100) # 100ms delay
         else:
             printerr("Failed to save scene: " + str(save_error))
+            # No quit here, proceed to cleanup
     else:
         printerr("Failed to pack scene: " + str(result))
+        # No quit here, proceed to cleanup
+
+    # --- Start Cleanup ---
+    # Removed packed_scene.free() as PackedScene is RefCounted
+    # Reinstate scene_root.free() to prevent RID leak
+    if scene_root and is_instance_valid(scene_root):
+        if debug_mode:
+            print("Freeing instantiated scene root node after delay")
+        scene_root.free() # Free the instantiated scene root
+    # --- End Cleanup ---
+
+    # Quit only if there was a critical error during packing or saving
+    if result != OK or save_error != OK:
+        quit(1) # Exit with error code if packing or saving failed
+    # Otherwise, the script will naturally exit after _init finishes
 
 # Load a sprite into a Sprite2D node
 func load_sprite(params):
@@ -692,6 +795,12 @@ func load_sprite(params):
             printerr("Failed to save scene: " + str(error))
     else:
         printerr("Failed to pack scene: " + str(result))
+
+    # --- Final Cleanup for load_sprite ---
+    if scene_root and is_instance_valid(scene_root):
+        if debug_mode: print("Freeing instantiated scene root node at end of load_sprite")
+        scene_root.free()
+    # --- End Final Cleanup ---
 
 # Export a scene as a MeshLibrary resource
 func export_mesh_library(params):
@@ -871,6 +980,12 @@ func export_mesh_library(params):
             printerr("Failed to save MeshLibrary: " + str(error))
     else:
         printerr("No valid meshes found in the scene")
+
+    # --- Final Cleanup for export_mesh_library ---
+    if scene_root and is_instance_valid(scene_root):
+        if debug_mode: print("Freeing instantiated scene root node at end of export_mesh_library")
+        scene_root.free()
+    # --- End Final Cleanup ---
 
 # Find files with a specific extension recursively
 func find_files(path, extension):
@@ -1190,3 +1305,9 @@ func save_scene(params):
             printerr("Failed to save scene: " + str(error))
     else:
         printerr("Failed to pack scene: " + str(result))
+
+    # --- Final Cleanup for save_scene ---
+    if scene_root and is_instance_valid(scene_root):
+        if debug_mode: print("Freeing instantiated scene root node at end of save_scene")
+        scene_root.free()
+    # --- End Final Cleanup ---

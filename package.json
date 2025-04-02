@@ -18,7 +18,8 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "0.6.0",
     "axios": "^1.7.9",
-    "fs-extra": "^11.2.0"
+    "fs-extra": "^11.2.0",
+    "godot-mcp": "file:"
   },
   "devDependencies": {
     "@types/node": "^20.11.24",
