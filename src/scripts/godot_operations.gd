@@ -494,7 +494,13 @@ func create_scene(params):
     else:
         printerr("Failed to pack scene: " + str(result))
         printerr("Error code: " + str(result))
-        quit(1)
+        quit(1) # Quit for pack error
+
+    # --- Final Cleanup for create_scene ---
+    if scene_root and is_instance_valid(scene_root):
+        if debug_mode: print("Freeing instantiated scene root node at end of create_scene")
+        scene_root.free()
+    # --- End Final Cleanup ---
 
 # Add a node to an existing scene
 func add_node(params):
@@ -572,26 +578,43 @@ func add_node(params):
     if debug_mode:
         print("Pack result: " + str(result) + " (OK=" + str(OK) + ")")
     
+    var save_error = ERR_CANT_CREATE # Initialize with an error state
+
     if result == OK:
+        absolute_scene_path = ProjectSettings.globalize_path(full_scene_path) # Ensure absolute path is defined here (Removed var)
         if debug_mode:
             print("Saving scene to: " + absolute_scene_path)
-        var save_error = ResourceSaver.save(packed_scene, absolute_scene_path)
+        save_error = ResourceSaver.save(packed_scene, absolute_scene_path) # Use absolute path for saving
         if debug_mode:
             print("Save result: " + str(save_error) + " (OK=" + str(OK) + ")")
+
         if save_error == OK:
+            # Simplified success message for clarity
+            print("Node '" + params.node_name + "' of type '" + params.node_type + "' added successfully")
+            # Add a small delay after successful save before cleanup
             if debug_mode:
-                var file_check_after = FileAccess.file_exists(absolute_scene_path)
-                print("File exists check after save: " + str(file_check_after))
-                if file_check_after:
-                    print("Node '" + params.node_name + "' of type '" + params.node_type + "' added successfully")
-                else:
-                    printerr("File reported as saved but does not exist at: " + absolute_scene_path)
-            else:
-                print("Node '" + params.node_name + "' of type '" + params.node_type + "' added successfully")
+                print("Waiting briefly after save...")
+            OS.delay_msec(100) # 100ms delay
         else:
             printerr("Failed to save scene: " + str(save_error))
+            # No quit here, proceed to cleanup
     else:
         printerr("Failed to pack scene: " + str(result))
+        # No quit here, proceed to cleanup
+
+    # --- Start Cleanup ---
+    # Removed packed_scene.free() as PackedScene is RefCounted
+    # Reinstate scene_root.free() to prevent RID leak
+    if scene_root and is_instance_valid(scene_root):
+        if debug_mode:
+            print("Freeing instantiated scene root node after delay")
+        scene_root.free() # Free the instantiated scene root
+    # --- End Cleanup ---
+
+    # Quit only if there was a critical error during packing or saving
+    if result != OK or save_error != OK:
+        quit(1) # Exit with error code if packing or saving failed
+    # Otherwise, the script will naturally exit after _init finishes
 
 # Load a sprite into a Sprite2D node
 func load_sprite(params):
@@ -724,6 +747,12 @@ func load_sprite(params):
             printerr("Failed to save scene: " + str(error))
     else:
         printerr("Failed to pack scene: " + str(result))
+
+    # --- Final Cleanup for load_sprite ---
+    if scene_root and is_instance_valid(scene_root):
+        if debug_mode: print("Freeing instantiated scene root node at end of load_sprite")
+        scene_root.free()
+    # --- End Final Cleanup ---
 
 # Export a scene as a MeshLibrary resource
 func export_mesh_library(params):
@@ -903,6 +932,12 @@ func export_mesh_library(params):
             printerr("Failed to save MeshLibrary: " + str(error))
     else:
         printerr("No valid meshes found in the scene")
+
+    # --- Final Cleanup for export_mesh_library ---
+    if scene_root and is_instance_valid(scene_root):
+        if debug_mode: print("Freeing instantiated scene root node at end of export_mesh_library")
+        scene_root.free()
+    # --- End Final Cleanup ---
 
 # Find files with a specific extension recursively
 func find_files(path, extension):
@@ -1222,3 +1257,9 @@ func save_scene(params):
             printerr("Failed to save scene: " + str(error))
     else:
         printerr("Failed to pack scene: " + str(result))
+
+    # --- Final Cleanup for save_scene ---
+    if scene_root and is_instance_valid(scene_root):
+        if debug_mode: print("Freeing instantiated scene root node at end of save_scene")
+        scene_root.free()
+    # --- End Final Cleanup ---
