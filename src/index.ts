@@ -497,6 +497,13 @@ class GodotServer {
       const paramsJson = JSON.stringify(snakeCaseParams);
       // Escape single quotes in the JSON string to prevent command injection
       const escapedParams = paramsJson.replace(/'/g, "'\\''");
+      // On Windows, cmd.exe does not strip single quotes, so we use
+      // double quotes and escape them to ensure the JSON is parsed
+      // correctly by Godot.
+      const isWindows = process.platform === 'win32';
+      const quotedParams = isWindows
+        ? `\"${paramsJson.replace(/\"/g, '\\"')}\"`
+        : `'${escapedParams}'`;
 
 
       // Add debug arguments if debug mode is enabled
@@ -511,7 +518,7 @@ class GodotServer {
         '--script',
         `"${this.operationsScriptPath}"`,
         operation,
-        `'${escapedParams}'`,  // Pass the JSON string as a single argument
+        quotedParams, // Pass the JSON string as a single argument
         ...debugArgs,
       ].join(' ');
 
