@@ -7,6 +7,10 @@ var debug_mode = false
 func _init():
     var args = OS.get_cmdline_args()
     
+    # *** START DEBUG LOGGING ***
+    print("[GDScript] Raw Command Line Args: ", args) 
+    # *** END DEBUG LOGGING ***
+
     # Check for debug flag
     debug_mode = "--debug-godot" in args
     
@@ -35,16 +39,32 @@ func _init():
     var operation = args[operation_index]
     var params_json = args[params_index]
     
+    # *** START DEBUG LOGGING ***
+    print("[GDScript] Extracted Operation: ", operation)
+    print("[GDScript] Extracted Params JSON String: '", params_json, "'")
+    printerr("[GDScript][stderr] Extracted Params JSON String: '", params_json, "'") # Also print to stderr
+    # *** END DEBUG LOGGING ***
+
     log_info("Operation: " + operation)
     log_debug("Params JSON: " + params_json)
     
     # Parse JSON using Godot 4.x API
     var json = JSON.new()
+    log_debug("Attempting to parse JSON: '" + params_json + "'")
     var error = json.parse(params_json)
     var params = null
     
+    # *** START DEBUG LOGGING ***
+    print("[GDScript] JSON Parse Result Code: ", error, " (OK = ", OK, ")")
+    printerr("[GDScript][stderr] JSON Parse Result Code: ", error, " (OK = ", OK, ")") # Also print to stderr
+    # *** END DEBUG LOGGING ***
+
     if error == OK:
         params = json.get_data()
+        # *** START DEBUG LOGGING ***
+        print("[GDScript] Parsed Params Dictionary: ", params)
+        printerr("[GDScript][stderr] Parsed Params Dictionary: ", params) # Also print to stderr
+        # *** END DEBUG LOGGING ***
     else:
         log_error("Failed to parse JSON parameters: " + params_json)
         log_error("JSON Error: " + json.get_error_message() + " at line " + str(json.get_error_line()))
@@ -52,12 +72,27 @@ func _init():
     
     if not params:
         log_error("Failed to parse JSON parameters: " + params_json)
-        quit(1)
+        # *** START DEBUG LOGGING ***
+        printerr("[GDScript][stderr] Params variable is null AFTER supposed successful parse or before function call.")
+        # *** END DEBUG LOGGING ***
+        quit(1) # Quit here if params is null
     
     log_info("Executing operation: " + operation)
     
     match operation:
         "create_scene":
+            # *** START DEBUG LOGGING ***
+            print("[GDScript] Entering create_scene function.")
+            printerr("[GDScript][stderr] Entering create_scene function.")
+            print("[GDScript] Params type in create_scene: ", typeof(params))
+            printerr("[GDScript][stderr] Params type in create_scene: ", typeof(params))
+            if params == null:
+                print("[GDScript] Params is NULL right before accessing scene_path!")
+                printerr("[GDScript][stderr] Params is NULL right before accessing scene_path!")
+            else:
+                 print("[GDScript] Params content in create_scene: ", params)
+                 printerr("[GDScript][stderr] Params content in create_scene: ", params)
+            # *** END DEBUG LOGGING ***
             create_scene(params)
         "add_node":
             add_node(params)
@@ -256,9 +291,6 @@ func create_scene(params):
     scene_root.name = "root"
     if debug_mode:
         print("Root node created with name: " + scene_root.name)
-    
-    # Set the owner of the root node to itself (important for scene saving)
-    scene_root.owner = scene_root
     
     # Pack the scene
     var packed_scene = PackedScene.new()
