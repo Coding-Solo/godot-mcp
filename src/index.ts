@@ -1072,10 +1072,10 @@ class GodotServer {
           throw new McpError(
             ErrorCode.MethodNotFound,
             `Unknown tool: ${request.params.name}`
-          );
-      }
-    });
-  }
+	  );
+	}
+      });
+    }
 
   /**
    * Handle the launch_editor tool
@@ -1420,8 +1420,9 @@ class GodotServer {
       const out = stdoutBuf.trim();
       const err = stderrBuf.trim();
 
-      // If process returned non-zero or stderr has content or typical failure wording, mark as failure
-      const isFailure = (exitCode !== null && exitCode !== 0) || /\b(ASSERT|FAIL|ERROR|E\()/.test(out) || err.length > 0;
+      // Determine failure strictly by process exit code.
+      // GUT returns non-zero on failures; engine warnings/noise may appear on stderr.
+      const isFailure = (exitCode === null) || (exitCode !== 0);
 
       if (isFailure) {
         return this.createErrorResponse(
