@@ -994,11 +994,11 @@ class GodotServer {
               },
               includeProperties: {
                 type: 'boolean',
-                description: 'Include node properties in the structure (default: false)',
+                description: 'Include node properties in the structure (default: true)',
               },
               includeConnections: {
                 type: 'boolean', 
-                description: 'Include signal connections in the structure (default: false)',
+                description: 'Include signal connections in the structure (default: true)',
               },
               maxDepth: {
                 type: 'integer',
