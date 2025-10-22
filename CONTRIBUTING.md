@@ -104,6 +104,12 @@ The following tools have been recently added:
   - Saves the screenshot to the specified path
   - Useful for visual debugging and feedback
 
+- **get_scene_structure**: Analyzes the hierarchical structure of a Godot scene
+  - Retrieves node hierarchy with detailed information
+  - Optional property analysis with type-aware serialization
+  - Optional signal connection mapping
+  - Configurable depth limiting for large scenes
+
 Example:
 
 ```typescript
