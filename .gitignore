@@ -26,3 +26,9 @@ Thumbs.db
 
 # Coverage directory
 coverage/
+
+# Bots
+.claude/
+
+# Test files (contain local paths)
+test-*.js

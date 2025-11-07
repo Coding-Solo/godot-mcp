@@ -23,6 +23,8 @@ import {
   McpError,
 } from '@modelcontextprotocol/sdk/types.js';
 
+import { GodotLSPClient } from './lsp-client.js';
+
 // Check if debug mode is enabled
 const DEBUG_MODE: boolean = process.env.DEBUG === 'true';
 const GODOT_DEBUG_MODE: boolean = true; // Always use GODOT DEBUG MODE
@@ -69,6 +71,7 @@ class GodotServer {
   private operationsScriptPath: string;
   private validatedPaths: Map<string, boolean> = new Map();
   private strictPathValidation: boolean = false;
+  private lspClient: GodotLSPClient | null = null;
 
   /**
    * Parameter name mappings between snake_case and camelCase
@@ -387,6 +390,11 @@ class GodotServer {
       this.logDebug('Killing active Godot process');
       this.activeProcess.process.kill();
       this.activeProcess = null;
+    }
+    if (this.lspClient) {
+      this.logDebug('Disconnecting LSP client');
+      this.lspClient.disconnect();
+      this.lspClient = null;
     }
     await this.server.close();
   }
@@ -924,6 +932,72 @@ class GodotServer {
             required: ['projectPath'],
           },
         },
+        {
+          name: 'get_file_diagnostics',
+          description: 'Get diagnostics (errors, warnings, hints) for GDScript files in the project using the Godot LSP server. Requires the Godot editor to be running with the project open. The LSP server automatically publishes diagnostics when files are opened or modified.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: {
+                type: 'string',
+                description: 'Path to the Godot project directory',
+              },
+              filePath: {
+                type: 'string',
+                description: 'Optional: Path to a specific GDScript file (relative to project or absolute). If not provided, returns diagnostics for all files.',
+              },
+            },
+            required: ['projectPath'],
+          },
+        },
+        {
+          name: 'get_godot_native_class',
+          description: 'Query a Godot native class by name (e.g., Node2D, Control, Sprite2D). Returns the class inheritance hierarchy. Requires the Godot editor to be running.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: {
+                type: 'string',
+                description: 'Path to the Godot project directory (used to connect to LSP server)',
+              },
+              className: {
+                type: 'string',
+                description: 'Name of the Godot native class to look up (e.g., "Node2D", "Control", "Sprite2D")',
+              },
+            },
+            required: ['projectPath', 'className'],
+          },
+        },
+        {
+          name: 'find_symbol_references',
+          description: 'Find all references to a symbol (variable, function, class, etc.) in a GDScript file. Returns locations where the symbol is used across the project. Requires the Godot editor to be running.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: {
+                type: 'string',
+                description: 'Path to the Godot project directory',
+              },
+              filePath: {
+                type: 'string',
+                description: 'Path to the GDScript file containing the symbol (relative to project or absolute)',
+              },
+              line: {
+                type: 'number',
+                description: 'Line number (0-indexed) where the symbol is located',
+              },
+              character: {
+                type: 'number',
+                description: 'Character position (0-indexed) within the line',
+              },
+              includeDeclaration: {
+                type: 'boolean',
+                description: 'Whether to include the declaration/definition in results (default: true)',
+              },
+            },
+            required: ['projectPath', 'filePath', 'line', 'character'],
+          },
+        },
       ],
     }));
 
@@ -959,6 +1033,12 @@ class GodotServer {
           return await this.handleGetUid(request.params.arguments);
         case 'update_project_uids':
           return await this.handleUpdateProjectUids(request.params.arguments);
+        case 'get_file_diagnostics':
+          return await this.handleGetFileDiagnostics(request.params.arguments);
+        case 'get_godot_native_class':
+          return await this.handleGetGodotNativeClass(request.params.arguments);
+        case 'find_symbol_references':
+          return await this.handleFindSymbolReferences(request.params.arguments);
         default:
           throw new McpError(
             ErrorCode.MethodNotFound,
@@ -2150,6 +2230,627 @@ class GodotServer {
           'Check if the GODOT_PATH environment variable is set correctly',
           'Verify the project path is accessible',
         ]
+      );
+    }
+  }
+
+  /**
+   * Handle the get_file_diagnostics tool
+   */
+  private async handleGetFileDiagnostics(args: any) {
+    // Normalize parameters to camelCase
+    args = this.normalizeParameters(args);
+
+    if (!args.projectPath) {
+      return this.createErrorResponse(
+        'Missing required parameter: projectPath',
+        ['Provide a valid path to a Godot project directory']
+      );
+    }
+
+    if (!this.validatePath(args.projectPath)) {
+      return this.createErrorResponse(
+        'Invalid project path',
+        ['Provide a valid path without ".." or other potentially unsafe characters']
+      );
+    }
+
+    if (args.filePath && !this.validatePath(args.filePath)) {
+      return this.createErrorResponse(
+        'Invalid file path',
+        ['Provide a valid path without ".." or other potentially unsafe characters']
+      );
+    }
+
+    try {
+      // Check if the project directory exists and contains a project.godot file
+      const projectFile = join(args.projectPath, 'project.godot');
+      if (!existsSync(projectFile)) {
+        return this.createErrorResponse(
+          `Not a valid Godot project: ${args.projectPath}`,
+          [
+            'Ensure the path points to a directory containing a project.godot file',
+            'Use list_projects to find valid Godot projects',
+          ]
+        );
+      }
+
+      // Initialize LSP client if not already done
+      if (!this.lspClient) {
+        this.lspClient = new GodotLSPClient();
+      }
+
+      // Connect and initialize if needed
+      if (!this.lspClient.isConnected()) {
+        this.logDebug('Connecting to Godot LSP server...');
+        await this.lspClient.connect();
+      }
+
+      if (!this.lspClient.isInitialized()) {
+        this.logDebug('Initializing LSP client...');
+        await this.lspClient.initialize(args.projectPath);
+      }
+
+      // Get diagnostics
+      if (args.filePath) {
+        // Get diagnostics for a specific file
+        let absolutePath = args.filePath;
+
+        // Normalize path separators
+        absolutePath = absolutePath.replace(/\\/g, '/');
+        const normalizedProjectPath = args.projectPath.replace(/\\/g, '/');
+
+        // If not an absolute path, make it absolute
+        if (!args.filePath.startsWith('file://') &&
+            !absolutePath.match(/^[a-zA-Z]:/) &&
+            !absolutePath.startsWith('/')) {
+          // Relative path - join with project path
+          absolutePath = join(normalizedProjectPath, absolutePath).replace(/\\/g, '/');
+        }
+
+        // Check if file exists (convert to local path for checking)
+        let filePathToCheck = absolutePath;
+        if (filePathToCheck.startsWith('file://')) {
+          filePathToCheck = filePathToCheck.replace(/^file:\/\/\//, '').replace(/^file:\/\//, '');
+          filePathToCheck = filePathToCheck.replace(/%3A/g, ':');
+        }
+        // Convert to platform-specific path for existence check
+        if (process.platform === 'win32') {
+          filePathToCheck = filePathToCheck.replace(/\//g, '\\');
+        }
+
+        if (!existsSync(filePathToCheck)) {
+          return this.createErrorResponse(
+            `File does not exist: ${args.filePath}`,
+            [
+              'Verify the file path is correct',
+              'Use relative path from project root or absolute path',
+              `Resolved to: ${filePathToCheck}`
+            ]
+          );
+        }
+
+        // Open the document to trigger analysis and diagnostics
+        // The LSP client will normalize this internally
+        this.logDebug(`Opening document for analysis: ${absolutePath}`);
+        await this.lspClient.openDocument(absolutePath);
+
+        // Wait for diagnostics to be published
+        this.logDebug('Waiting for diagnostics...');
+        await new Promise(resolve => setTimeout(resolve, 1000));
+
+        const diagnostics = this.lspClient.getDiagnostics(absolutePath);
+
+        // Close the document after getting diagnostics
+        await this.lspClient.closeDocument(absolutePath);
+
+        return this.formatDiagnosticsResponse(args.filePath, diagnostics, true);
+      } else {
+        // Get diagnostics for all files - just return what's already cached
+        // Note: This returns only files that have been previously opened
+        const allDiagnostics = this.lspClient.getAllDiagnostics();
+
+        if (allDiagnostics.size === 0) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: 'No diagnostics available. To get diagnostics for a specific file, provide the filePath parameter. The LSP server only analyzes files that are explicitly opened.',
+              },
+            ],
+          };
+        }
+
+        return this.formatAllDiagnosticsResponse(allDiagnostics);
+      }
+    } catch (error: any) {
+      // Provide helpful error messages
+      let errorMessage = error?.message || 'Unknown error';
+      const solutions = [
+        'Ensure the Godot editor is running with the project open',
+        'Verify that the LSP server is running on port 6005',
+        'Wait a moment for the LSP server to analyze the project',
+      ];
+
+      if (errorMessage.includes('ECONNREFUSED')) {
+        errorMessage = 'Could not connect to Godot LSP server. Is the Godot editor running?';
+      } else if (errorMessage.includes('timeout')) {
+        errorMessage = 'Connection to LSP server timed out';
+        solutions.push('The Godot editor may be busy or unresponsive');
+      }
+
+      return this.createErrorResponse(
+        `Failed to get diagnostics: ${errorMessage}`,
+        solutions
+      );
+    }
+  }
+
+  /**
+   * Format diagnostics response for a single file
+   */
+  private formatDiagnosticsResponse(filePath: string, diagnostics: any[], isSingleFile: boolean): any {
+    if (diagnostics.length === 0) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: isSingleFile
+              ? `No diagnostics found for ${filePath}. The file has no errors, warnings, or hints.`
+              : 'No diagnostics found for any files in the project.',
+          },
+        ],
+      };
+    }
+
+    const severityNames = ['', 'Error', 'Warning', 'Information', 'Hint'];
+    let output = isSingleFile
+      ? `Diagnostics for ${filePath}:\n\n`
+      : `Found ${diagnostics.length} diagnostic(s):\n\n`;
+
+    const errors = diagnostics.filter(d => d.severity === 1).length;
+    const warnings = diagnostics.filter(d => d.severity === 2).length;
+    const info = diagnostics.filter(d => d.severity === 3).length;
+    const hints = diagnostics.filter(d => d.severity === 4).length;
+
+    output += `Summary:\n`;
+    if (errors > 0) output += `  ❌ ${errors} error(s)\n`;
+    if (warnings > 0) output += `  ⚠️  ${warnings} warning(s)\n`;
+    if (info > 0) output += `  ℹ️  ${info} info message(s)\n`;
+    if (hints > 0) output += `  💡 ${hints} hint(s)\n`;
+    output += '\n';
+
+    diagnostics.forEach((diagnostic, index) => {
+      const severity = severityNames[diagnostic.severity || 1];
+      const line = diagnostic.range.start.line + 1; // Convert to 1-indexed for display
+      const char = diagnostic.range.start.character;
+
+      output += `${index + 1}. [${severity}] Line ${line}:${char}\n`;
+      output += `   ${diagnostic.message}\n`;
+      if (diagnostic.code) {
+        output += `   Code: ${diagnostic.code}\n`;
+      }
+      output += '\n';
+    });
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: output.trim(),
+        },
+      ],
+    };
+  }
+
+  /**
+   * Format diagnostics response for all files
+   */
+  private formatAllDiagnosticsResponse(allDiagnostics: Map<string, any[]>): any {
+    if (allDiagnostics.size === 0) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: 'No diagnostics available. The LSP server has not reported any issues for any files.',
+          },
+        ],
+      };
+    }
+
+    let totalErrors = 0;
+    let totalWarnings = 0;
+    let totalInfo = 0;
+    let totalHints = 0;
+    let output = `Diagnostics for all files in project:\n\n`;
+
+    const filesWithIssues: Array<{ uri: string; diagnostics: any[] }> = [];
+
+    allDiagnostics.forEach((diagnostics, uri) => {
+      if (diagnostics.length > 0) {
+        filesWithIssues.push({ uri, diagnostics });
+        diagnostics.forEach(d => {
+          if (d.severity === 1) totalErrors++;
+          else if (d.severity === 2) totalWarnings++;
+          else if (d.severity === 3) totalInfo++;
+          else if (d.severity === 4) totalHints++;
+        });
+      }
+    });
+
+    output += `Overall Summary:\n`;
+    output += `  📁 ${filesWithIssues.length} file(s) with issues\n`;
+    if (totalErrors > 0) output += `  ❌ ${totalErrors} error(s)\n`;
+    if (totalWarnings > 0) output += `  ⚠️  ${totalWarnings} warning(s)\n`;
+    if (totalInfo > 0) output += `  ℹ️  ${totalInfo} info message(s)\n`;
+    if (totalHints > 0) output += `  💡 ${totalHints} hint(s)\n`;
+    output += '\n';
+
+    const severityNames = ['', 'Error', 'Warning', 'Information', 'Hint'];
+
+    filesWithIssues.forEach(({ uri, diagnostics }) => {
+      // Extract file name from URI
+      const fileName = uri.replace(/^file:\/\/\//, '').replace(/%3A/g, ':');
+      output += `\n📄 ${fileName} (${diagnostics.length} issue(s)):\n`;
+
+      diagnostics.forEach((diagnostic, index) => {
+        const severity = severityNames[diagnostic.severity || 1];
+        const line = diagnostic.range.start.line + 1;
+        const char = diagnostic.range.start.character;
+
+        output += `  ${index + 1}. [${severity}] Line ${line}:${char} - ${diagnostic.message}\n`;
+      });
+    });
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: output.trim(),
+        },
+      ],
+    };
+  }
+
+  /**
+   * Handle the find_symbol_references tool
+   */
+  private async handleFindSymbolReferences(args: any) {
+    // Normalize parameters to camelCase
+    args = this.normalizeParameters(args);
+
+    if (!args.projectPath || !args.filePath || args.line === undefined || args.character === undefined) {
+      return this.createErrorResponse(
+        'Missing required parameters',
+        ['Provide projectPath, filePath, line, and character']
+      );
+    }
+
+    if (!this.validatePath(args.projectPath) || !this.validatePath(args.filePath)) {
+      return this.createErrorResponse(
+        'Invalid path',
+        ['Provide valid paths without ".." or other potentially unsafe characters']
+      );
+    }
+
+    try {
+      // Check if the project directory exists
+      const projectFile = join(args.projectPath, 'project.godot');
+      if (!existsSync(projectFile)) {
+        return this.createErrorResponse(
+          `Not a valid Godot project: ${args.projectPath}`,
+          [
+            'Ensure the path points to a directory containing a project.godot file',
+            'Use list_projects to find valid Godot projects',
+          ]
+        );
+      }
+
+      // Resolve file path
+      let absolutePath = args.filePath;
+      absolutePath = absolutePath.replace(/\\/g, '/');
+      const normalizedProjectPath = args.projectPath.replace(/\\/g, '/');
+
+      if (!args.filePath.startsWith('file://') &&
+          !absolutePath.match(/^[a-zA-Z]:/) &&
+          !absolutePath.startsWith('/')) {
+        absolutePath = join(normalizedProjectPath, absolutePath).replace(/\\/g, '/');
+      }
+
+      // Check if file exists
+      let filePathToCheck = absolutePath;
+      if (filePathToCheck.startsWith('file://')) {
+        filePathToCheck = filePathToCheck.replace(/^file:\/\/\//, '').replace(/^file:\/\//, '');
+        filePathToCheck = filePathToCheck.replace(/%3A/g, ':');
+      }
+      if (process.platform === 'win32') {
+        filePathToCheck = filePathToCheck.replace(/\//g, '\\');
+      }
+
+      if (!existsSync(filePathToCheck)) {
+        return this.createErrorResponse(
+          `File does not exist: ${args.filePath}`,
+          [
+            'Verify the file path is correct',
+            'Use relative path from project root or absolute path',
+            `Resolved to: ${filePathToCheck}`
+          ]
+        );
+      }
+
+      // Initialize LSP client if not already done
+      if (!this.lspClient) {
+        this.lspClient = new GodotLSPClient();
+      }
+
+      // Connect and initialize if needed
+      if (!this.lspClient.isConnected()) {
+        this.logDebug('Connecting to Godot LSP server...');
+        await this.lspClient.connect();
+      }
+
+      if (!this.lspClient.isInitialized()) {
+        this.logDebug('Initializing LSP client...');
+        await this.lspClient.initialize(args.projectPath);
+      }
+
+      // Open the document
+      this.logDebug(`Opening document: ${absolutePath}`);
+      await this.lspClient.openDocument(absolutePath);
+
+      // Wait for the document to be processed
+      await new Promise(resolve => setTimeout(resolve, 500));
+
+      // Find references
+      const includeDeclaration = args.includeDeclaration !== undefined ? args.includeDeclaration : true;
+      this.logDebug(`Finding references at ${args.line}:${args.character}`);
+      const references = await this.lspClient.findReferences(
+        absolutePath,
+        args.line,
+        args.character,
+        includeDeclaration
+      );
+
+      // Close the document
+      await this.lspClient.closeDocument(absolutePath);
+
+      // Format the response
+      if (!references || references.length === 0) {
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `No references found for the symbol at line ${args.line}, character ${args.character} in ${args.filePath}.`,
+            },
+          ],
+        };
+      }
+
+      // Group references by file
+      const referencesByFile = new Map<string, any[]>();
+      references.forEach(ref => {
+        const uri = ref.uri;
+        if (!referencesByFile.has(uri)) {
+          referencesByFile.set(uri, []);
+        }
+        referencesByFile.get(uri)!.push(ref);
+      });
+
+      // Format output
+      let output = `Found ${references.length} reference(s) for symbol at ${args.filePath}:${args.line}:${args.character}\n\n`;
+
+      referencesByFile.forEach((refs, uri) => {
+        // Convert URI to readable path
+        const filePath = uri.replace(/^file:\/\/\//, '').replace(/%3A/g, ':').replace(/\//g, '\\');
+        output += `📄 ${filePath} (${refs.length} reference(s)):\n`;
+
+        refs.forEach((ref, idx) => {
+          const line = ref.range.start.line + 1; // Convert to 1-indexed
+          const char = ref.range.start.character;
+          output += `  ${idx + 1}. Line ${line}:${char}\n`;
+        });
+        output += '\n';
+      });
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: output.trim(),
+          },
+        ],
+      };
+    } catch (error: any) {
+      let errorMessage = error?.message || 'Unknown error';
+      const solutions = [
+        'Ensure the Godot editor is running with the project open',
+        'Verify that the LSP server is running on port 6005',
+        'Check that the file path and position are correct',
+        'Make sure the symbol exists at the specified position',
+      ];
+
+      if (errorMessage.includes('ECONNREFUSED')) {
+        errorMessage = 'Could not connect to Godot LSP server. Is the Godot editor running?';
+      } else if (errorMessage.includes('timeout')) {
+        errorMessage = 'Connection to LSP server timed out';
+        solutions.push('The Godot editor may be busy or unresponsive');
+      }
+
+      return this.createErrorResponse(
+        `Failed to find symbol references: ${errorMessage}`,
+        solutions
+      );
+    }
+  }
+
+  /**
+   * Handle the get_godot_native_class tool
+   */
+  private async handleGetGodotNativeClass(args: any) {
+    // Normalize parameters to camelCase
+    args = this.normalizeParameters(args);
+
+    if (!args.projectPath || !args.className) {
+      return this.createErrorResponse(
+        'Missing required parameters',
+        ['Provide projectPath and className']
+      );
+    }
+
+    if (!this.validatePath(args.projectPath)) {
+      return this.createErrorResponse(
+        'Invalid project path',
+        ['Provide a valid path without ".." or other potentially unsafe characters']
+      );
+    }
+
+    try {
+      // Check if the project directory exists
+      const projectFile = join(args.projectPath, 'project.godot');
+      if (!existsSync(projectFile)) {
+        return this.createErrorResponse(
+          `Not a valid Godot project: ${args.projectPath}`,
+          [
+            'Ensure the path points to a directory containing a project.godot file',
+            'Use list_projects to find valid Godot projects',
+          ]
+        );
+      }
+
+      // Initialize LSP client if not already done
+      if (!this.lspClient) {
+        this.lspClient = new GodotLSPClient();
+      }
+
+      // Connect and initialize if needed
+      if (!this.lspClient.isConnected()) {
+        this.logDebug('Connecting to Godot LSP server...');
+        await this.lspClient.connect();
+      }
+
+      if (!this.lspClient.isInitialized()) {
+        this.logDebug('Initializing LSP client...');
+        await this.lspClient.initialize(args.projectPath);
+      }
+
+      // Wait for native classes to be received
+      await new Promise(resolve => setTimeout(resolve, 500));
+
+      // Look up the class
+      const classInfo = this.lspClient.getNativeClass(args.className);
+
+      if (!classInfo) {
+        // Try to search for similar classes
+        const similarClasses = this.lspClient.searchNativeClasses(args.className);
+
+        if (similarClasses.length === 0) {
+          return this.createErrorResponse(
+            `Godot class not found: ${args.className}`,
+            ['Check the class name spelling', 'Try a partial match (e.g., "Node" to find all Node classes)']
+          );
+        }
+
+        let suggestions = 'Did you mean one of these?\n\n';
+        similarClasses.slice(0, 10).forEach((cls, idx) => {
+          suggestions += `${idx + 1}. ${cls.name}\n`;
+        });
+
+        return {
+          content: [
+            {
+              type: 'text',
+              text: suggestions,
+            },
+          ],
+        };
+      }
+
+      // Format the class information
+      let output = `Godot Class: ${classInfo.name}\n\n`;
+
+      if (classInfo.base_class) {
+        output += `Base Class: ${classInfo.base_class}\n`;
+      }
+
+      if (classInfo.description) {
+        output += `\nDescription:\n${classInfo.description}\n`;
+      }
+
+      // Add properties/members if available
+      if (classInfo.properties && classInfo.properties.length > 0) {
+        output += `\nProperties (${classInfo.properties.length}):\n`;
+        classInfo.properties.slice(0, 15).forEach((prop: any, idx: number) => {
+          const type = prop.type || 'unknown';
+          const name = prop.name || 'unnamed';
+          output += `  ${idx + 1}. ${name}: ${type}`;
+          if (prop.description) {
+            output += ` - ${prop.description}`;
+          }
+          output += '\n';
+        });
+        if (classInfo.properties.length > 15) {
+          output += `  ... and ${classInfo.properties.length - 15} more properties\n`;
+        }
+      }
+
+      // Add methods if available
+      if (classInfo.methods && classInfo.methods.length > 0) {
+        output += `\nMethods (${classInfo.methods.length}):\n`;
+        classInfo.methods.slice(0, 15).forEach((method: any, idx: number) => {
+          const name = method.name || 'unnamed';
+          const returnType = method.return_type || 'void';
+          output += `  ${idx + 1}. ${name}(): ${returnType}`;
+          if (method.description) {
+            output += ` - ${method.description}`;
+          }
+          output += '\n';
+        });
+        if (classInfo.methods.length > 15) {
+          output += `  ... and ${classInfo.methods.length - 15} more methods\n`;
+        }
+      }
+
+      // Add signals if available
+      if (classInfo.signals && classInfo.signals.length > 0) {
+        output += `\nSignals (${classInfo.signals.length}):\n`;
+        classInfo.signals.slice(0, 10).forEach((signal: any, idx: number) => {
+          const name = signal.name || 'unnamed';
+          output += `  ${idx + 1}. ${name}`;
+          if (signal.description) {
+            output += ` - ${signal.description}`;
+          }
+          output += '\n';
+        });
+        if (classInfo.signals.length > 10) {
+          output += `  ... and ${classInfo.signals.length - 10} more signals\n`;
+        }
+      }
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: output.trim(),
+          },
+        ],
+      };
+    } catch (error: any) {
+      let errorMessage = error?.message || 'Unknown error';
+      const solutions = [
+        'Ensure the Godot editor is running with the project open',
+        'Verify that the LSP server is running on port 6005',
+      ];
+
+      if (errorMessage.includes('ECONNREFUSED')) {
+        errorMessage = 'Could not connect to Godot LSP server. Is the Godot editor running?';
+      } else if (errorMessage.includes('timeout')) {
+        errorMessage = 'Connection to LSP server timed out';
+        solutions.push('The Godot editor may be busy or unresponsive');
+      }
+
+      return this.createErrorResponse(
+        `Failed to get Godot class description: ${errorMessage}`,
+        solutions
       );
     }
   }
