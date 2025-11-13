@@ -746,6 +746,32 @@ class GodotServer {
           },
         },
         {
+          name: 'run_tests',
+          description: 'Run Godot tests using GUT (Godot Unit Test) framework',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: {
+                type: 'string',
+                description: 'Path to the Godot project directory',
+              },
+              gdir: {
+                type: 'string',
+                description: 'Optional: Directory containing tests (default: res://tests/unit)',
+              },
+              maxLines: {
+                type: 'number',
+                description: 'Optional: Maximum number of log lines to capture (default: 200)',
+              },
+              timeout: {
+                type: 'number',
+                description: 'Optional: How long to run tests before stopping (in milliseconds, default: 10000)',
+              }
+            },
+            required: ['projectPath'],
+          },
+        },
+        {
           name: 'list_projects',
           description: 'List Godot projects in a directory',
           inputSchema: {
@@ -1027,6 +1053,8 @@ class GodotServer {
           return await this.handleGetGodotVersion();
         case 'run_project_and_get_output':
           return await this.handleRunProjectAndGetOutput(request.params.arguments);
+        case 'run_tests':
+          return await this.handleRunTests(request.params.arguments);
         case 'list_projects':
           return await this.handleListProjects(request.params.arguments);
         case 'get_project_info':
@@ -1327,6 +1355,137 @@ class GodotServer {
         [
           'Ensure Godot is installed correctly',
           'Check if the project path is accessible',
+          'Try increasing the timeout value',
+        ]
+      );
+    }
+  }
+
+  /**
+   * Handle the run_tests tool
+   * This runs Godot tests using GUT framework, captures output, and automatically stops
+   * @param args Tool arguments
+   */
+  private async handleRunTests(args: any) {
+    // Normalize parameters to camelCase
+    args = this.normalizeParameters(args);
+
+    if (!args.projectPath) {
+      return this.createErrorResponse(
+        'Project path is required',
+        ['Provide a valid path to a Godot project directory']
+      );
+    }
+
+    if (!this.validatePath(args.projectPath)) {
+      return this.createErrorResponse(
+        'Invalid project path',
+        ['Provide a valid path without ".." or other potentially unsafe characters']
+      );
+    }
+
+    // Set defaults for optional parameters
+    const gdir = args.gdir || 'res://tests/unit';
+    const maxLines = args.maxLines || 200;
+    const timeout = args.timeout || 10000;
+
+    try {
+      // Ensure godotPath is set
+      if (!this.godotPath) {
+        await this.detectGodotPath();
+        if (!this.godotPath) {
+          return this.createErrorResponse(
+            'Godot path not set',
+            ['Set the Godot path using the set_godot_path tool']
+          );
+        }
+      }
+
+      // Check if the project directory exists and contains a project.godot file
+      const projectFile = join(args.projectPath, 'project.godot');
+      if (!existsSync(projectFile)) {
+        return this.createErrorResponse(
+          `Not a valid Godot project: ${args.projectPath}`,
+          [
+            'Ensure the path points to a directory containing a project.godot file',
+            'Use list_projects to find valid Godot projects',
+          ]
+        );
+      }
+
+      // Build the command to run tests
+      const godotArgs = [
+        '--headless',
+        '-s',
+        '--path',
+        args.projectPath,
+        'addons/gut/gut_cmdln.gd',
+        `-gdir=${gdir}`
+      ];
+
+      this.logDebug(`Running Godot tests: ${args.projectPath} with gdir=${gdir}`);
+
+      // Spawn the Godot process
+      const process = spawn(this.godotPath, godotArgs, { stdio: 'pipe' });
+      const output: string[] = [];
+      const errors: string[] = [];
+
+      process.stdout?.on('data', (data: Buffer) => {
+        const lines = data.toString().split('\n').filter(line => line.trim() !== '');
+        output.push(...lines);
+      });
+
+      process.stderr?.on('data', (data: Buffer) => {
+        const lines = data.toString().split('\n').filter(line => line.trim() !== '');
+        errors.push(...lines);
+      });
+
+      // Wait for the specified timeout
+      await new Promise(resolve => setTimeout(resolve, timeout));
+
+      // Stop the process
+      if (process && !process.killed) {
+        process.kill('SIGTERM');
+        // Give it a moment to terminate gracefully
+        await new Promise(resolve => setTimeout(resolve, 500));
+        if (process && !process.killed) {
+          process.kill('SIGKILL');
+        }
+      }
+
+      // Truncate output and errors to the specified maximum lines
+      const truncatedOutput = output.slice(-maxLines).join('\n');
+      const truncatedErrors = errors.slice(-maxLines).join('\n');
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(
+              {
+                success: true,
+                message: 'Godot tests completed',
+                output: truncatedOutput,
+                errors: truncatedErrors,
+                truncated: output.length > maxLines || errors.length > maxLines,
+                originalOutputLines: output.length,
+                originalErrorLines: errors.length,
+                testDirectory: gdir,
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    } catch (error: unknown) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      return this.createErrorResponse(
+        `Failed to run Godot tests: ${errorMessage}`,
+        [
+          'Ensure Godot is installed correctly',
+          'Check if the project path is accessible',
+          'Ensure GUT is installed in addons/gut/',
           'Try increasing the timeout value',
         ]
       );
