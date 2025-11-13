@@ -130,47 +130,22 @@ interface LSPResponse {
   };
 }
 
-/**
- * Normalize a file path to use forward slashes and convert to file URI
- */
-function normalizeToFileUri(path: string): string {
-  // If already a file URI, parse it first
-  if (path.startsWith('file://')) {
-    path = path.replace(/^file:\/\/\//, '').replace(/^file:\/\//, '');
-    path = path.replace(/%3A/g, ':');
-  }
-
-  // Normalize path separators to forward slashes
-  path = path.replace(/\\/g, '/');
-
-  // Remove any duplicate slashes
-  path = path.replace(/\/+/g, '/');
-
-  // Ensure proper file URI format
-  // For absolute paths on Windows (C:/...) or Unix (/...)
-  if (!path.startsWith('file://')) {
-    // Windows absolute path (C:/...)
-    if (path.match(/^[a-zA-Z]:/)) {
-      path = 'file://' + path;
-    }
-    // Unix absolute path (/...)
-    else if (path.startsWith('/')) {
-      path = 'file://' + path;
-    }
-    // Relative path - this shouldn't happen, but handle it
-    else {
-      path = 'file://' + path;
-    }
-  }
-
-  return path;
-}
-
+// The fileUriToPath function begins below
 /**
  * Parse a file URI to a local file path
  */
 function fileUriToPath(fileUri: string): string {
   let path = fileUri;
+
+  // Handle res:// protocol
+  if (path.startsWith('res://')) {
+    // Get instance project root (should be initialized by now)
+    const projectRoot = GodotLSPClient.instance?.projectRoot;
+    if (projectRoot) {
+      const relativePath = path.substring(6); // Remove 'res://'
+      return projectRoot.replace(/\\/g, '/') + '/' + relativePath;
+    }
+  }
 
   // Remove file:// prefix
   if (path.startsWith('file://')) {
@@ -196,6 +171,9 @@ function fileUriToPath(fileUri: string): string {
  * Godot LSP Client
  */
 export class GodotLSPClient {
+  // Static instance for singleton access
+  private static _instance: GodotLSPClient | null = null;
+
   private socket: Socket | null = null;
   private connected: boolean = false;
   private initialized: boolean = false;
@@ -207,14 +185,64 @@ export class GodotLSPClient {
   private diagnosticsMap: Map<string, LSPDiagnostic[]> = new Map();
   private lastOpenedDocument: string | null = null;
   private nativeClasses: any[] = [];
+  public projectRoot: string = '';
+
+  public static get instance(): GodotLSPClient | null {
+    return GodotLSPClient._instance;
+  }
+
+  /**
+   * Normalize a file path for use with Godot's LSP server
+   *
+   * If the path is within the project scope, it will be converted to res:// protocol
+   * Otherwise, it will be normalized to a proper file:// URI
+   */
+  private normalizeToFileUri(path: string): string {
+    // First normalize slashes and remove any URI prefix
+    if (path.startsWith('file://')) {
+      path = path.replace(/^file:\/\/\//, '').replace(/^file:\/\//, '');
+      path = path.replace(/%3A/g, ':');
+    }
+
+    // Normalize path separators to forward slashes
+    path = path.replace(/\\/g, '/');
+
+    // Remove any duplicate slashes
+    path = path.replace(/\/+/g, '/');
+
+    // Check if path is inside the project root
+    const normalizedProjectRoot = this.projectRoot.replace(/\\/g, '/');
+
+    if (path.startsWith(normalizedProjectRoot)) {
+      // Convert to res:// protocol for files within project
+      const relativePath = path.substring(normalizedProjectRoot.length).replace(/^\/+/, '');
+      return `res://${relativePath}`;
+    } else {
+      // Use file:// protocol for files outside project
+      // Windows absolute path (C:/...)
+      if (path.match(/^[a-zA-Z]:/)) {
+        return 'file:///' + path;
+      }
+      // Unix absolute path (/...)
+      else if (path.startsWith('/')) {
+        return 'file://' + path;
+      }
+      // Relative path - should be relative to project root
+      else {
+        return 'res://' + path;
+      }
+    }
+  }
 
   constructor(host: string = 'localhost', port: number = 6005) {
     this.host = host;
     this.port = port;
+    // Set the singleton instance
+    GodotLSPClient._instance = this;
   }
 
   /**
-   * Connect to the Godot LSP server
+   * Connect to the LSP server
    */
   async connect(): Promise<void> {
     return new Promise((resolve, reject) => {
@@ -402,10 +430,11 @@ export class GodotLSPClient {
    * Initialize the LSP connection
    */
   async initialize(rootPath?: string): Promise<any> {
+    this.projectRoot = rootPath || process.cwd();
     const params = {
       processId: process.pid,
-      rootPath: rootPath || process.cwd(),
-      rootUri: rootPath ? `file://${rootPath}` : `file://${process.cwd()}`,
+      rootPath: this.projectRoot,
+      rootUri: `file:///${this.projectRoot.replace(/\\/g, '/')}`,
       capabilities: {
         textDocument: {
           hover: {
@@ -464,7 +493,7 @@ export class GodotLSPClient {
     }
 
     // Normalize the file URI
-    const normalizedUri = normalizeToFileUri(fileUri);
+    const normalizedUri = this.normalizeToFileUri(fileUri);
 
     // If no content provided, try to read the file
     if (!fileContent) {
@@ -501,7 +530,7 @@ export class GodotLSPClient {
     }
 
     // Normalize the file URI
-    const normalizedUri = normalizeToFileUri(fileUri);
+    const normalizedUri = this.normalizeToFileUri(fileUri);
 
     const params = {
       textDocument: {
@@ -530,7 +559,7 @@ export class GodotLSPClient {
     }
 
     // Normalize the file URI
-    const normalizedUri = normalizeToFileUri(fileUri);
+    const normalizedUri = this.normalizeToFileUri(fileUri);
 
     const params: LSPReferenceParams = {
       textDocument: {
@@ -578,7 +607,7 @@ export class GodotLSPClient {
    */
   getDiagnostics(fileUri: string): LSPDiagnostic[] {
     // Normalize the URI before lookup
-    const normalizedUri = normalizeToFileUri(fileUri);
+    const normalizedUri = this.normalizeToFileUri(fileUri);
     return this.diagnosticsMap.get(normalizedUri) || [];
   }
 
@@ -594,7 +623,7 @@ export class GodotLSPClient {
    */
   clearDiagnostics(fileUri: string): void {
     // Normalize the URI before deletion
-    const normalizedUri = normalizeToFileUri(fileUri);
+    const normalizedUri = this.normalizeToFileUri(fileUri);
     this.diagnosticsMap.delete(normalizedUri);
   }
 
