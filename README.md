@@ -167,6 +167,25 @@ Create a file at `.cursor/mcp.json` in your project directory with the following
 }
 ```
 
+#### Option C: Configure with Windsurf
+
+Add to your Windsurf MCP config file mcp_config.json:
+
+```json
+{
+  "mcpServers": {
+    "godot": {
+      "command": "node",
+      "args": ["/absolute/path/to/godot-mcp/build/index.js"],
+      "env": {
+        "DEBUG": "true"
+      }
+    }
+  }
+}
+```
+
+
 ### Step 3: Optional Environment Variables
 
 You can customize the server behavior with these environment variables:
