@@ -90,6 +90,9 @@ class GodotServer {
     'directory': 'directory',
     'recursive': 'recursive',
     'scene': 'scene',
+    'include_properties': 'includeProperties',
+    'include_connections': 'includeConnections',
+    'max_depth': 'maxDepth',
   };
 
   /**
@@ -579,6 +582,57 @@ class GodotServer {
   }
 
   /**
+   * Extract JSON from potentially contaminated output (with Godot startup messages)
+   * @param output The raw output from Godot
+   * @returns Clean JSON string
+   */
+  private extractJsonFromOutput(output: string): string {
+    // Remove common Godot startup messages and warnings
+    const lines = output.split('\n');
+    let jsonStartIndex = -1;
+    let jsonEndIndex = -1;
+    let braceCount = 0;
+    let inJson = false;
+    
+    // Look for the first line that starts with '{' (start of JSON)
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i].trim();
+      
+      if (!inJson && line.startsWith('{')) {
+        jsonStartIndex = i;
+        inJson = true;
+        braceCount = 0;
+      }
+      
+      if (inJson) {
+        // Count braces to find the end of JSON
+        for (const char of line) {
+          if (char === '{') braceCount++;
+          if (char === '}') braceCount--;
+        }
+        
+        // If braces are balanced, we've found the end of JSON
+        if (braceCount === 0) {
+          jsonEndIndex = i;
+          break;
+        }
+      }
+    }
+    
+    if (jsonStartIndex === -1) {
+      throw new Error('No JSON found in output');
+    }
+    
+    if (jsonEndIndex === -1) {
+      throw new Error('Incomplete JSON found in output');
+    }
+    
+    // Extract only the JSON portion
+    const jsonLines = lines.slice(jsonStartIndex, jsonEndIndex + 1);
+    return jsonLines.join('\n').trim();
+  }
+
+  /**
    * Get the structure of a Godot project
    * @param projectPath Path to the Godot project
    * @returns Object representing the project structure
@@ -961,6 +1015,37 @@ class GodotServer {
             required: ['projectPath'],
           },
         },
+        {
+          name: 'get_scene_structure',
+          description: 'Retrieve the hierarchical structure of a Godot scene file with optional property and connection information',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: {
+                type: 'string',
+                description: 'Path to the Godot project directory',
+              },
+              scenePath: {
+                type: 'string',
+                description: 'Path to the scene file (relative to project)',
+              },
+              includeProperties: {
+                type: 'boolean',
+                description: 'Include node properties in the structure (default: true)',
+              },
+              includeConnections: {
+                type: 'boolean', 
+                description: 'Include signal connections in the structure (default: true)',
+              },
+              maxDepth: {
+                type: 'integer',
+                description: 'Maximum depth to traverse the scene tree (default: unlimited)',
+                minimum: 1,
+              },
+            },
+            required: ['projectPath', 'scenePath'],
+          },
+        },
       ],
     }));
 
@@ -996,6 +1081,8 @@ class GodotServer {
           return await this.handleGetUid(request.params.arguments);
         case 'update_project_uids':
           return await this.handleUpdateProjectUids(request.params.arguments);
+        case 'get_scene_structure':
+          return await this.handleGetSceneStructure(request.params.arguments);
         default:
           throw new McpError(
             ErrorCode.MethodNotFound,
@@ -2186,6 +2273,139 @@ class GodotServer {
           'Ensure Godot is installed correctly',
           'Check if the GODOT_PATH environment variable is set correctly',
           'Verify the project path is accessible',
+        ]
+      );
+    }
+  }
+
+  /**
+   * Handle the get_scene_structure tool
+   */
+  private async handleGetSceneStructure(args: any) {
+    // Normalize parameters to camelCase
+    args = this.normalizeParameters(args);
+    
+    if (!args.projectPath || !args.scenePath) {
+      return this.createErrorResponse(
+        'Project path and scene path are required',
+        ['Provide valid paths for both the project and the scene file']
+      );
+    }
+
+    if (!this.validatePath(args.projectPath) || !this.validatePath(args.scenePath)) {
+      return this.createErrorResponse(
+        'Invalid path',
+        ['Provide valid paths without ".." or other potentially unsafe characters']
+      );
+    }
+
+    try {
+      // Ensure godotPath is set
+      if (!this.godotPath) {
+        await this.detectGodotPath();
+        if (!this.godotPath) {
+          return this.createErrorResponse(
+            'Could not find a valid Godot executable path',
+            [
+              'Ensure Godot is installed correctly',
+              'Set GODOT_PATH environment variable to specify the correct path',
+            ]
+          );
+        }
+      }
+
+      // Check if the project directory exists and contains a project.godot file
+      const projectFile = join(args.projectPath, 'project.godot');
+      if (!existsSync(projectFile)) {
+        return this.createErrorResponse(
+          `Not a valid Godot project: ${args.projectPath}`,
+          [
+            'Ensure the path points to a directory containing a project.godot file',
+            'Use list_projects to find valid Godot projects',
+          ]
+        );
+      }
+
+      // Check if the scene file exists
+      const sceneFile = join(args.projectPath, args.scenePath);
+      if (!existsSync(sceneFile)) {
+        return this.createErrorResponse(
+          `Scene file not found: ${args.scenePath}`,
+          [
+            'Ensure the scene path is correct and relative to the project',
+            'Use create_scene to create a new scene if needed',
+          ]
+        );
+      }
+
+      // Check if it's a valid .tscn file
+      if (!args.scenePath.endsWith('.tscn')) {
+        return this.createErrorResponse(
+          `Invalid scene file format: ${args.scenePath}`,
+          [
+            'Only .tscn scene files are supported',
+            'Provide a path to a valid Godot scene file',
+          ]
+        );
+      }
+
+      // Prepare parameters for the operation (already in camelCase)
+      const params = {
+        scenePath: args.scenePath,
+        includeProperties: args.includeProperties || false,
+        includeConnections: args.includeConnections || false,
+        maxDepth: args.maxDepth || null,
+      };
+
+      this.logDebug(`Getting scene structure for: ${args.scenePath}`);
+
+      // Execute the operation
+      const { stdout, stderr } = await this.executeOperation('get_scene_structure', params, args.projectPath);
+
+      if (stderr && stderr.includes('Failed to')) {
+        return this.createErrorResponse(
+          `Failed to get scene structure: ${stderr}`,
+          [
+            'Check if the scene file is valid',
+            'Ensure the scene file is not corrupted',
+            'Try opening the scene in Godot editor to verify it loads correctly',
+          ]
+        );
+      }
+
+      // Parse the JSON output, extracting only the JSON part from potentially contaminated output
+      let structureData;
+      try {
+        const cleanJson = this.extractJsonFromOutput(stdout);
+        structureData = JSON.parse(cleanJson);
+      } catch (parseError) {
+        return this.createErrorResponse(
+          `Failed to parse scene structure data: ${parseError}`,
+          [
+            'The scene structure output may be malformed',
+            'Try the operation again',
+            'Check if the scene file is valid',
+            'Raw output: ' + stdout.substring(0, 200) + (stdout.length > 200 ? '...' : ''),
+          ]
+        );
+      }
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `Scene structure retrieved successfully for: ${args.scenePath}\n\n${JSON.stringify(structureData, null, 2)}`,
+          },
+        ],
+      };
+    } catch (error: any) {
+      return this.createErrorResponse(
+        `Failed to get scene structure: ${error?.message || 'Unknown error'}`,
+        [
+          'Ensure Godot is installed correctly',
+          'Check if the GODOT_PATH environment variable is set correctly',
+          'Verify the project and scene paths are accessible',
+          'Ensure the scene file is a valid .tscn file',
         ]
       );
     }
