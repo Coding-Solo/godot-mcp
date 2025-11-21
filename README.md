@@ -76,6 +76,7 @@ This direct feedback loop helps AI assistants like Claude understand what works 
   - Load sprites and textures into Sprite2D nodes
   - Export 3D scenes as MeshLibrary resources for GridMap
   - Save scenes with options for creating variants
+  - Analyze scene structure with hierarchical node information, properties, and signal connections
 - **UID Management** (for Godot 4.4+):
   - Get UID for specific files
   - Update UID references by resaving resources
@@ -129,7 +130,8 @@ Add to your Cline MCP settings file (`~/Library/Application Support/Code/User/gl
         "export_mesh_library",
         "save_scene",
         "get_uid",
-        "update_project_uids"
+        "update_project_uids",
+        "get_scene_structure"
       ]
     }
   }
@@ -167,6 +169,25 @@ Create a file at `.cursor/mcp.json` in your project directory with the following
 }
 ```
 
+#### Option C: Configure with Windsurf
+
+Add to your Windsurf MCP config file mcp_config.json:
+
+```json
+{
+  "mcpServers": {
+    "godot": {
+      "command": "node",
+      "args": ["/absolute/path/to/godot-mcp/build/index.js"],
+      "env": {
+        "DEBUG": "true"
+      }
+    }
+  }
+}
+```
+
+
 ### Step 3: Optional Environment Variables
 
 You can customize the server behavior with these environment variables:
@@ -202,6 +223,8 @@ Once configured, your AI assistant will automatically run the MCP server when ne
 "Get the UID for a specific script file in my Godot 4.4 project"
 
 "Update UID references in my Godot project after upgrading to 4.4"
+
+"Review the scene structure of Main.tscn and trace why the player's health_changed signal isn't reaching the HealthBar UI element"
 ```
 
 ## Implementation Details

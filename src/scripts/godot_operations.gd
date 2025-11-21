@@ -71,6 +71,8 @@ func _init():
             get_uid(params)
         "resave_resources":
             resave_resources(params)
+        "get_scene_structure":
+            get_scene_structure(params)
         _:
             log_error("Unknown operation: " + operation)
             quit(1)
@@ -1190,3 +1192,809 @@ func save_scene(params):
             printerr("Failed to save scene: " + str(error))
     else:
         printerr("Failed to pack scene: " + str(result))
+
+# Get scene structure operation
+func get_scene_structure(params):
+    # Note: No logging to avoid contaminating JSON output
+    
+    var scene_path = params.get("scene_path", "")
+    var include_properties = params.get("include_properties", true)
+    var include_connections = params.get("include_connections", true)
+    var max_depth = params.get("max_depth", null)
+    
+    if debug_mode:
+        print("Getting scene structure for: " + scene_path)
+    
+    if scene_path.is_empty():
+        # Return error in JSON format instead of logging
+        var error_result = {
+            "scene_path": "",
+            "structure": null,
+            "error": "Scene path is required",
+            "analysis_options": {}
+        }
+        print(JSON.stringify(error_result))
+        quit(1)
+    
+    # Validate max_depth
+    if max_depth != null and max_depth < 1:
+        max_depth = 1
+    elif max_depth != null and max_depth > 20:
+        # No logging to avoid contaminating output
+        max_depth = 20
+    
+    # Use text-based parsing to avoid script compilation issues
+    var structure = null
+    var error_info = null
+    
+    # Parse scene file as text to extract structure without loading scripts
+    structure = parse_tscn_file(scene_path, include_properties, include_connections, max_depth)
+    if structure == null:
+        error_info = "Failed to parse scene file as text"
+    
+    # Output the result as JSON
+    var result = {
+        "scene_path": scene_path,
+        "structure": structure,
+        "error": error_info,
+        "analysis_options": {
+            "include_properties": include_properties,
+            "include_connections": include_connections,
+            "max_depth": max_depth
+        }
+    }
+    
+    var json_string = JSON.stringify(result)
+    print(json_string)
+
+# Parse .tscn file as text to extract structure without triggering script compilation
+func parse_tscn_file(scene_path: String, include_properties: bool, _include_connections: bool, max_depth) -> Dictionary:
+    if debug_mode:
+        print("Parsing TSCN file: " + scene_path)
+    return parse_tscn_file_recursive(scene_path, include_properties, _include_connections, max_depth, 0, {})
+
+# Recursive version that handles nested scenes and prevents infinite loops
+func parse_tscn_file_recursive(scene_path: String, include_properties: bool, _include_connections: bool, max_depth, current_depth: int, visited_scenes: Dictionary) -> Dictionary:
+    # Prevent infinite recursion
+    if current_depth > 10:
+        return {"error": "Max recursion depth exceeded"}
+    
+    # Prevent circular scene references
+    if visited_scenes.has(scene_path):
+        return {"error": "Circular scene reference detected: " + scene_path}
+    
+    visited_scenes[scene_path] = true
+    
+    var file = FileAccess.open(scene_path, FileAccess.READ)
+    if not file:
+        return {"error": "Failed to open scene file: " + scene_path}
+    
+    var content = file.get_as_text()
+    file.close()
+    
+    # Parse the TSCN format
+    var lines = content.split("\n")
+    var nodes = []
+    var connections = []
+    var current_node = null
+    var external_resources = {}
+    var sub_scenes = {}
+    
+    # Parse external resources first
+    for line in lines:
+        line = line.strip_edges()
+        if line.begins_with("[ext_resource"):
+            var ext_resource = parse_ext_resource_line(line)
+            if ext_resource:
+                external_resources[ext_resource.id] = ext_resource
+                # Track scene resources for recursive loading - check multiple possible types
+                var resource_type = ext_resource.get("type", "")
+                var resource_path = ext_resource.get("path", "")
+                if resource_type == "PackedScene" or resource_type == "Scene" or resource_path.ends_with(".tscn"):
+                    sub_scenes[ext_resource.id] = resource_path
+                    if debug_mode:
+                        print("Found scene resource: " + ext_resource.id + " -> " + resource_path)
+        elif line.begins_with("[connection") and _include_connections:
+            var connection = parse_connection_line(line)
+            if connection and not connection.is_empty():
+                connections.append(connection)
+    
+    # Parse nodes
+    for i in range(lines.size()):
+        var line = lines[i].strip_edges()
+        
+        if line.begins_with("[node"):
+            # Parse node definition
+            current_node = parse_node_line(line)
+            
+            if current_node:
+                # Look ahead for properties
+                for j in range(i + 1, lines.size()):
+                    var prop_line = lines[j].strip_edges()
+                    if prop_line.is_empty() or prop_line.begins_with("["):
+                        break
+                    if include_properties:
+                        parse_node_property(current_node, prop_line, external_resources)
+                    
+                    # Check for instance property (sub-scene) in properties - enhanced detection
+                    if "instance" in prop_line and "ExtResource" in prop_line:
+                        var instance_id = extract_resource_id(prop_line)
+                        
+                        current_node["is_instance"] = true
+                        current_node["instance_resource_id"] = instance_id
+                        
+                        if debug_mode:
+                            print("Found instance property: " + current_node.get("name", "Unknown") + " -> " + instance_id)
+                        
+                        # Try to resolve the scene path
+                        if sub_scenes.has(instance_id):
+                            current_node["instance_scene"] = sub_scenes[instance_id]
+                        elif external_resources.has(instance_id):
+                            var resource = external_resources[instance_id]
+                            if resource.get("type", "") == "PackedScene":
+                                current_node["instance_scene"] = resource.get("path", "")
+                                # Also add to sub_scenes for future reference
+                                sub_scenes[instance_id] = resource.get("path", "")
+                
+                # Check for instance in node definition line (already parsed)
+                if current_node.get("is_instance", false) and current_node.has("instance_resource_id"):
+                    var instance_id = current_node["instance_resource_id"]
+                    
+                    # Enhanced resource resolution with multiple fallbacks
+                    if not current_node.has("instance_scene") or current_node.get("instance_scene", "").is_empty():
+                        if sub_scenes.has(instance_id):
+                            current_node["instance_scene"] = sub_scenes[instance_id]
+                        elif external_resources.has(instance_id):
+                            var resource = external_resources[instance_id]
+                            # Check both PackedScene and Scene types (some .tscn files use different type names)
+                            var resource_type = resource.get("type", "")
+                            if resource_type == "PackedScene" or resource_type == "Scene" or resource.get("path", "").ends_with(".tscn"):
+                                var resource_scene_path = resource.get("path", "")
+                                current_node["instance_scene"] = resource_scene_path
+                                # Also add to sub_scenes for future reference
+                                if not resource_scene_path.is_empty():
+                                    sub_scenes[instance_id] = resource_scene_path
+                
+                nodes.append(current_node)
+    
+    # Build hierarchy with recursive scene loading
+    if nodes.size() > 0:
+        if debug_mode:
+            print("Building hierarchy with " + str(nodes.size()) + " nodes")
+        var hierarchy = build_node_hierarchy_recursive(nodes, max_depth, current_depth, visited_scenes, include_properties, _include_connections)
+        
+        # Add connections to the result if requested
+        if _include_connections and connections.size() > 0:
+            hierarchy["connections"] = connections
+            if debug_mode:
+                print("Added " + str(connections.size()) + " connections")
+        
+        # Remove the scene from visited set after processing (for other branches)
+        visited_scenes.erase(scene_path)
+        return hierarchy
+    
+    visited_scenes.erase(scene_path)
+    return {"error": "No nodes found in scene file"}
+
+# Parse external resource line
+func parse_ext_resource_line(line: String) -> Dictionary:
+    # [ext_resource type="Script" path="res://scripts/Player.gd" id="1_abcd"]
+    var result = {}
+    
+    # Extract id
+    var id_match = line.find('id="')
+    if id_match > -1:
+        var id_start = id_match + 4
+        var id_end = line.find('"', id_start)
+        if id_end > -1:
+            result["id"] = line.substr(id_start, id_end - id_start)
+    
+    # Extract type
+    var type_match = line.find('type="')
+    if type_match > -1:
+        var type_start = type_match + 6
+        var type_end = line.find('"', type_start)
+        if type_end > -1:
+            result["type"] = line.substr(type_start, type_end - type_start)
+    
+    # Extract path
+    var path_match = line.find('path="')
+    if path_match > -1:
+        var path_start = path_match + 6
+        var path_end = line.find('"', path_start)
+        if path_end > -1:
+            result["path"] = line.substr(path_start, path_end - path_start)
+    
+    if debug_mode and result.has("id"):
+        print("Extracted resource - ID: " + result.get("id", "") + ", Type: " + result.get("type", "") + ", Path: " + result.get("path", ""))
+    
+    return result if result.has("id") else {}
+
+# Parse connection line from scene file
+func parse_connection_line(line: String) -> Dictionary:
+    # [connection signal="pressed" from="Button" to="." method="handle_press"]
+    var result = {}
+    
+    # Extract signal
+    var signal_match = line.find('signal="')
+    if signal_match > -1:
+        var signal_start = signal_match + 8
+        var signal_end = line.find('"', signal_start)
+        if signal_end > -1:
+            result["signal"] = line.substr(signal_start, signal_end - signal_start)
+    
+    # Extract from
+    var from_match = line.find('from="')
+    if from_match > -1:
+        var from_start = from_match + 6
+        var from_end = line.find('"', from_start)
+        if from_end > -1:
+            result["from"] = line.substr(from_start, from_end - from_start)
+    
+    # Extract to
+    var to_match = line.find('to="')
+    if to_match > -1:
+        var to_start = to_match + 4
+        var to_end = line.find('"', to_start)
+        if to_end > -1:
+            result["to"] = line.substr(to_start, to_end - to_start)
+    
+    # Extract method
+    var method_match = line.find('method="')
+    if method_match > -1:
+        var method_start = method_match + 8
+        var method_end = line.find('"', method_start)
+        if method_end > -1:
+            result["method"] = line.substr(method_start, method_end - method_start)
+    
+    if debug_mode and result.size() > 0:
+        print("Extracted connection - Signal: " + result.get("signal", "") + ", From: " + result.get("from", "") + ", To: " + result.get("to", "") + ", Method: " + result.get("method", ""))
+    
+    return result
+
+# Extract resource ID from a property line like "instance = ExtResource("1_abc123")"
+func extract_resource_id(line: String) -> String:
+    # Handle both "ExtResource(" and "ExtResource (" formats (with or without space)
+    var patterns = ['ExtResource("', 'ExtResource ("']
+    
+    for pattern in patterns:
+        var start_pos = line.find(pattern)
+        if start_pos != -1:
+            start_pos += pattern.length()
+            var end_pos = line.find('"', start_pos)
+            if end_pos != -1:
+                return line.substr(start_pos, end_pos - start_pos)
+    
+    return ""
+
+# Parse node definition line
+func parse_node_line(line: String) -> Dictionary:
+    # [node name="Player" type="CharacterBody2D" parent="." script=ExtResource("1_abcd")]
+    var result = {
+        "properties": {},
+        "children": [],
+        "raw_line": line
+    }
+    
+    # Extract name
+    var name_match = line.find('name="')
+    if name_match > -1:
+        var name_start = name_match + 6
+        var name_end = line.find('"', name_start)
+        if name_end > -1:
+            result["name"] = line.substr(name_start, name_end - name_start)
+    
+    # Extract type
+    var type_match = line.find('type="')
+    if type_match > -1:
+        var type_start = type_match + 6
+        var type_end = line.find('"', type_start)
+        if type_end > -1:
+            result["type"] = line.substr(type_start, type_end - type_start)
+    
+    # Extract parent
+    var parent_match = line.find('parent="')
+    if parent_match > -1:
+        var parent_start = parent_match + 8
+        var parent_end = line.find('"', parent_start)
+        if parent_end > -1:
+            result["parent"] = line.substr(parent_start, parent_end - parent_start)
+    
+    # Extract script reference from node line
+    var script_match = line.find('script=')
+    if script_match > -1:
+        result["has_script"] = true
+        # Try to extract script reference ID from ExtResource
+        var ext_ref_id = extract_resource_id(line.substr(script_match))
+        if not ext_ref_id.is_empty():
+            result["script_resource_id"] = ext_ref_id
+    
+    # Extract instance reference from node line
+    var instance_match = line.find('instance=')
+    if instance_match > -1:
+        result["is_instance"] = true
+        # Try to extract instance reference ID from ExtResource
+        var ext_ref_id = extract_resource_id(line.substr(instance_match))
+        if not ext_ref_id.is_empty():
+            result["instance_resource_id"] = ext_ref_id
+        # If this is an instance, set a placeholder type that will be resolved later
+        if result.get("type", "Unknown") == "Unknown":
+            result["type"] = "SceneInstance"
+        if debug_mode:
+            print("Found instance node: " + result.get("name", "Unknown"))
+    
+    if debug_mode:
+        print("Parsed node - Name: " + result.get("name", "Unknown") + ", Type: " + result.get("type", "Unknown") + ", Parent: " + result.get("parent", "Unknown") + ", Has Script: " + str(result.get("has_script", false)) + ", Is Instance: " + str(result.get("is_instance", false)))
+    
+    return result
+
+# Parse a property line for a node
+func parse_node_property(node: Dictionary, line: String, _external_resources: Dictionary):
+    if not line.contains("="):
+        return
+    
+    var parts = line.split("=", false, 1)
+    if parts.size() != 2:
+        return
+    
+    var key = parts[0].strip_edges()
+    var value = parts[1].strip_edges()
+    
+    # Check for script property
+    if key == "script":
+        node["has_script"] = true
+        var ext_ref_id = extract_resource_id(value)
+        if not ext_ref_id.is_empty():
+            node["script_resource_id"] = ext_ref_id
+        if debug_mode:
+            print("Found script property for node " + node.get("name", "Unknown") + " with resource ID: " + ext_ref_id)
+    
+    # Check for instance property (for custom scene instances)
+    if key == "instance":
+        node["is_instance"] = true
+        var ext_ref_id = extract_resource_id(value)
+        if not ext_ref_id.is_empty():
+            node["instance_resource_id"] = ext_ref_id
+        if debug_mode:
+            print("Found instance property for node " + node.get("name", "Unknown") + " with resource ID: " + ext_ref_id)
+    
+    # Store raw property value
+    node.properties[key] = {
+        "type": "raw",
+        "value": value
+    }
+
+# Build hierarchical structure from flat node list
+func build_node_hierarchy(nodes: Array, max_depth) -> Dictionary:
+    if debug_mode:
+        print("Building node hierarchy from " + str(nodes.size()) + " nodes with max_depth: " + str(max_depth))
+    
+    if nodes.size() == 0:
+        if debug_mode:
+            print("No nodes to build hierarchy from")
+        return {}
+    
+    # Find all root nodes (parent = ".")
+    var root_nodes = []
+    for node in nodes:
+        if node.get("parent", "") == ".":
+            root_nodes.append(node)
+    
+    if debug_mode:
+        print("Found " + str(root_nodes.size()) + " root nodes")
+    
+    if root_nodes.size() == 0:
+        # If no explicit root, use first node
+        if debug_mode:
+            print("No explicit root nodes, using first node as root")
+        return build_tree_recursive(nodes[0], nodes, "", 0, max_depth)
+    elif root_nodes.size() == 1:
+        # Single root node - return it directly
+        if debug_mode:
+            print("Single root node found: " + root_nodes[0].get("name", "Unknown"))
+        return build_tree_recursive(root_nodes[0], nodes, "", 0, max_depth)
+    else:
+        # Multiple root nodes - create a virtual container
+        if debug_mode:
+            print("Multiple root nodes found, creating virtual container")
+        var virtual_root = {
+            "name": "Scene Root",
+            "type": "Scene",
+            "path": "",
+            "has_script": false,
+            "children": []
+        }
+        
+        # Build each root node and add to virtual root
+        for root_node in root_nodes:
+            var root_result = build_tree_recursive(root_node, nodes, "", 0, max_depth)
+            if not root_result.is_empty():
+                virtual_root.children.append(root_result)
+        
+        return virtual_root
+
+# Build hierarchical structure from flat node list with recursive scene loading
+func build_node_hierarchy_recursive(nodes: Array, max_depth, current_depth: int, visited_scenes: Dictionary, include_properties: bool, include_connections: bool) -> Dictionary:
+    if nodes.size() == 0:
+        return {}
+    
+    # Find all root nodes (parent = ".")
+    var root_nodes = []
+    for node in nodes:
+        if node.get("parent", "") == ".":
+            root_nodes.append(node)
+    
+    if root_nodes.size() == 0:
+        # If no explicit root, use first node
+        return build_tree_recursive_with_scenes(nodes[0], nodes, "", 0, max_depth, current_depth, visited_scenes, include_properties, include_connections)
+    elif root_nodes.size() == 1:
+        # Single root node - return it directly
+        return build_tree_recursive_with_scenes(root_nodes[0], nodes, "", 0, max_depth, current_depth, visited_scenes, include_properties, include_connections)
+    else:
+        # Multiple root nodes - create a virtual container
+        var virtual_root = {
+            "name": "Scene Root",
+            "type": "Scene",
+            "path": "",
+            "has_script": false,
+            "is_instance": false,
+            "children": []
+        }
+        
+        # Build each root node and add to virtual root
+        for root_node in root_nodes:
+            var root_result = build_tree_recursive_with_scenes(root_node, nodes, "", 0, max_depth, current_depth, visited_scenes, include_properties, include_connections)
+            if not root_result.is_empty():
+                virtual_root.children.append(root_result)
+        
+        return virtual_root
+
+# Recursively build tree structure
+func build_tree_recursive(node: Dictionary, all_nodes: Array, node_path: String, depth: int, max_depth) -> Dictionary:
+    if max_depth != null and depth >= max_depth:
+        if debug_mode:
+            print("Reached max depth " + str(max_depth) + ", stopping recursion")
+        return {}
+    
+    var current_path = node_path
+    if current_path.is_empty():
+        current_path = node.get("name", "Unknown")
+    else:
+        current_path = current_path + "/" + node.get("name", "Unknown")
+    
+    var result = {
+        "name": node.get("name", "Unknown"),
+        "type": node.get("type", "Unknown"),
+        "path": current_path,
+        "has_script": node.get("has_script", false),
+        "children": []
+    }
+    
+    if node.has("properties"):
+        result["properties"] = node.properties
+    
+    # Find children
+    var node_name = node.get("name", "")
+    for child_node in all_nodes:
+        var child_parent = child_node.get("parent", "")
+        if child_parent == node_name or child_parent == "./" + node_name:
+            var child_result = build_tree_recursive(child_node, all_nodes, current_path, depth + 1, max_depth)
+            if not child_result.is_empty():
+                result.children.append(child_result)
+    
+    return result
+
+# Recursively build tree structure with sub-scene loading
+func build_tree_recursive_with_scenes(node: Dictionary, all_nodes: Array, node_path: String, depth: int, max_depth, scene_depth: int, visited_scenes: Dictionary, include_properties: bool, include_connections: bool) -> Dictionary:
+    if max_depth != null and depth >= max_depth:
+        return {}
+    
+    if scene_depth > 5:  # Prevent deep scene recursion
+        if debug_mode:
+            print("Reached max scene depth 5, stopping scene recursion")
+        return {}
+    
+    var current_path = node_path
+    if current_path.is_empty():
+        current_path = node.get("name", "Unknown")
+    else:
+        current_path = current_path + "/" + node.get("name", "Unknown")
+    
+    # Determine the display type for instanced scenes
+    var node_type = node.get("type", "Unknown")
+    var display_type = node_type
+    if node.get("is_instance", false):
+        var instance_scene = node.get("instance_scene", "")
+        if not instance_scene.is_empty():
+            var scene_name = instance_scene.get_file().get_basename()
+            display_type = scene_name + " (Scene Instance)"
+            # Update the base type for scene instances
+            node_type = "SceneInstance"
+            if debug_mode:
+                print("Node " + node.get("name", "Unknown") + " is instance of scene: " + instance_scene)
+        else:
+            # Instance detected but no scene path resolved
+            # Use the node name as a fallback for better identification
+            var instance_node_name = node.get("name", "Unknown")
+            display_type = instance_node_name + " (Scene Instance)"
+            node_type = "SceneInstance"
+            if debug_mode:
+                print("Node " + node.get("name", "Unknown") + " is instance but scene path not resolved")
+    
+    var result = {
+        "name": node.get("name", "Unknown"),
+        "type": display_type,
+        "base_type": node_type,
+        "path": current_path,
+        "has_script": node.get("has_script", false),
+        "is_instance": node.get("is_instance", false),
+        "children": []
+    }
+    
+    # Add instance information if available
+    if node.get("is_instance", false):
+        result["instance_scene"] = node.get("instance_scene", "")
+    
+    if node.has("properties"):
+        result["properties"] = node.properties
+    
+    # If this node is an instance of another scene, load that scene recursively
+    if node.get("is_instance", false) and node.has("instance_scene"):
+        var instance_scene_path = node.get("instance_scene", "")
+        if not instance_scene_path.is_empty():
+            if debug_mode:
+                print("Loading sub-scene structure for: " + instance_scene_path)
+            var sub_scene_structure = parse_tscn_file_recursive(instance_scene_path, include_properties, include_connections, max_depth, scene_depth + 1, visited_scenes)
+            if sub_scene_structure.has("structure") and sub_scene_structure.structure != null:
+                result["instance_structure"] = sub_scene_structure.structure
+            elif not sub_scene_structure.has("error"):
+                result["instance_structure"] = sub_scene_structure
+            elif debug_mode:
+                print("Failed to load sub-scene structure for: " + instance_scene_path + " - " + str(sub_scene_structure.get("error", "Unknown error")))
+    
+    # Find children in current scene
+    var node_name = node.get("name", "")
+    for child_node in all_nodes:
+        var child_parent = child_node.get("parent", "")
+        if child_parent == node_name or child_parent == "./" + node_name:
+            var child_result = build_tree_recursive_with_scenes(child_node, all_nodes, current_path, depth + 1, max_depth, scene_depth, visited_scenes, include_properties, include_connections)
+            if not child_result.is_empty():
+                result.children.append(child_result)
+    
+    return result
+
+# Recursive node analysis with comprehensive error handling
+func analyze_node_structure(node: Node, parent_path: String, include_properties: bool, include_connections: bool, max_depth, current_depth: int) -> Dictionary:
+    if debug_mode:
+        print("Analyzing node structure for: " + str(node.name) + " (" + node.get_class() + ") at depth " + str(current_depth))
+    
+    # Safety check for runaway recursion
+    if current_depth > 50:
+        if debug_mode:
+            print("Max recursion depth exceeded at node: " + str(node.name))
+        # Return error silently to avoid contaminating JSON output
+        return {"error": "max_recursion_exceeded"}
+    
+    # Construct the node path manually to avoid scene tree issues
+    var node_path = parent_path
+    if node_path.is_empty():
+        node_path = node.name
+    else:
+        node_path = parent_path + "/" + node.name
+    
+    var structure = {
+        "name": str(node.name),
+        "type": node.get_class(),
+        "path": node_path,
+        "children": [],
+        "script_path": "",
+        "has_script": false
+    }
+    
+    # Safely check for script
+    var node_script = node.get_script()
+    if node_script != null:
+        structure["has_script"] = true
+        if node_script.resource_path != "":
+            structure["script_path"] = node_script.resource_path
+        if debug_mode:
+            print("Node " + str(node.name) + " has script: " + node_script.resource_path)
+    
+    # Add properties if requested and safe to access
+    if include_properties:
+        if debug_mode:
+            print("Getting properties for node: " + str(node.name))
+        structure["properties"] = get_node_properties(node)
+    
+    # Add connections if requested and safe to access
+    if include_connections:
+        if debug_mode:
+            print("Getting connections for node: " + str(node.name))
+        structure["connections"] = get_node_connections(node)
+    
+    # Add children if we haven't reached max depth
+    if max_depth == null or current_depth < max_depth:
+        var child_count = node.get_child_count()
+        if debug_mode:
+            print("Node " + str(node.name) + " has " + str(child_count) + " children")
+        for i in range(child_count):
+            var child = node.get_child(i)
+            if child != null:
+                var child_structure = analyze_node_structure(child, node_path, include_properties, include_connections, max_depth, current_depth + 1)
+                if child_structure != null:
+                    structure["children"].append(child_structure)
+    elif debug_mode:
+        print("Reached max depth " + str(max_depth) + ", not analyzing children of: " + str(node.name))
+    
+    return structure
+
+# Property access that handles script compilation errors
+func get_node_properties(node: Node) -> Dictionary:
+    var properties = {}
+    
+    if debug_mode:
+        print("Getting properties for node: " + node.name + " (type: " + node.get_class() + ")")
+    
+    # Use Godot's built-in property reflection to get ALL properties
+    # This is much cleaner than manually checking each property type
+    var property_list = node.get_property_list()
+    
+    for property_info in property_list:
+        var property_name = property_info["name"]
+        var property_type = property_info["type"]
+        var property_usage = property_info.get("usage", 0)
+        
+        # Skip internal/private properties (those starting with _)
+        if property_name.begins_with("_"):
+            continue
+            
+        # Skip properties that are not meant to be serialized/edited
+        # PROPERTY_USAGE_STORAGE = 2, PROPERTY_USAGE_EDITOR = 4
+        if (property_usage & 6) == 0:  # Not storage or editor visible
+            continue
+            
+        # Skip script-related properties to avoid compilation issues
+        if property_name == "script" or property_name.begins_with("script_"):
+            continue
+            
+        # Safely get the property value with error handling
+        var property_value = _safe_get_property(node, property_name, property_type)
+        if property_value != null:
+            properties[property_name] = property_value
+            
+    if debug_mode:
+        print("Found " + str(properties.size()) + " properties for " + node.name)
+    
+    return properties
+
+# Safely get a property value with type conversion and error handling
+func _safe_get_property(node: Node, property_name: String, property_type: int):
+    if debug_mode:
+        print("Getting property '" + property_name + "' of type " + type_string(property_type) + " from node " + node.name)
+    
+    # Try to get the property value safely
+    var value = null
+    var type_name = "unknown"
+    
+    # Use a try-catch equivalent by checking if the property exists
+    if not node.has_method("get") and not (property_name in node):
+        if debug_mode:
+            print("Property '" + property_name + "' not accessible on node " + node.name)
+        return null
+        
+    # Get the value with error protection
+    if node.has_method("get"):
+        value = node.get(property_name)
+    else:
+        # Fallback for direct property access
+        value = node.get(property_name) if property_name in node else null
+    
+    if value == null:
+        if debug_mode:
+            print("Property '" + property_name + "' is null on node " + node.name)
+        return null
+    
+    # Use Godot's built-in type name function, with custom serialization for complex types
+    type_name = type_string(property_type)
+    
+    if debug_mode:
+        print("Property '" + property_name + "' has value of type: " + type_name)
+    
+    # Handle complex types that need special serialization for JSON output
+    match property_type:
+        TYPE_VECTOR2, TYPE_VECTOR2I:
+            value = {"x": value.x, "y": value.y}
+        TYPE_VECTOR3, TYPE_VECTOR3I:
+            value = {"x": value.x, "y": value.y, "z": value.z}
+        TYPE_VECTOR4, TYPE_VECTOR4I:
+            value = {"x": value.x, "y": value.y, "z": value.z, "w": value.w}
+        TYPE_RECT2:
+            value = {"position": {"x": value.position.x, "y": value.position.y}, "size": {"x": value.size.x, "y": value.size.y}}
+        TYPE_PLANE:
+            value = {"normal": {"x": value.normal.x, "y": value.normal.y, "z": value.normal.z}, "d": value.d}
+        TYPE_QUATERNION:
+            value = {"x": value.x, "y": value.y, "z": value.z, "w": value.w}
+        TYPE_COLOR:
+            value = {"r": value.r, "g": value.g, "b": value.b, "a": value.a}
+        TYPE_AABB:
+            value = {"position": {"x": value.position.x, "y": value.position.y, "z": value.position.z}, "size": {"x": value.size.x, "y": value.size.y, "z": value.size.z}}
+        TYPE_TRANSFORM2D:
+            value = {"origin": {"x": value.origin.x, "y": value.origin.y}, "x": {"x": value.x.x, "y": value.x.y}, "y": {"x": value.y.x, "y": value.y.y}}
+        TYPE_BASIS:
+            value = {"x": {"x": value.x.x, "y": value.x.y, "z": value.x.z}, "y": {"x": value.y.x, "y": value.y.y, "z": value.y.z}, "z": {"x": value.z.x, "y": value.z.y, "z": value.z.z}}
+        TYPE_TRANSFORM3D:
+            value = {"basis": {"x": {"x": value.basis.x.x, "y": value.basis.x.y, "z": value.basis.x.z}, "y": {"x": value.basis.y.x, "y": value.basis.y.y, "z": value.basis.y.z}, "z": {"x": value.basis.z.x, "y": value.basis.z.y, "z": value.basis.z.z}}, "origin": {"x": value.origin.x, "y": value.origin.y, "z": value.origin.z}}
+        TYPE_OBJECT:
+            # For objects, try to get resource path or basic info
+            if value.has_method("get_class"):
+                var obj_class_name = value.get_class()
+                if value.has_method("get_path") and not str(value.get_path()).is_empty():
+                    value = {"class": obj_class_name, "path": str(value.get_path())}
+                elif value.has_method("resource_path") and not value.resource_path.is_empty():
+                    value = {"class": obj_class_name, "resource_path": value.resource_path}
+                else:
+                    value = {"class": obj_class_name, "id": value.get_instance_id()}
+            else:
+                value = str(value)
+        TYPE_STRING_NAME, TYPE_NODE_PATH, TYPE_RID, TYPE_CALLABLE, TYPE_SIGNAL, TYPE_PROJECTION:
+            value = str(value)
+        # TYPE_DICTIONARY and TYPE_ARRAY are already serializable, no conversion needed
+    
+    return {
+        "type": type_name,
+        "value": value
+    }
+
+# Connection analysis that avoids triggering script compilation
+func get_node_connections(node: Node) -> Array:
+    var connections = []
+    
+    if debug_mode:
+        print("Getting connections for node: " + node.name + " (" + node.get_class() + ")")
+    
+    # Only try to get connections if the node seems stable
+    # Skip connection analysis if it might cause script compilation issues
+    var signal_list = node.get_signal_list()
+    
+    if debug_mode:
+        print("Node " + node.name + " has " + str(signal_list.size()) + " signals")
+    
+    # Limit the number of signals we check to avoid performance issues
+    var signal_count = 0
+    for signal_info in signal_list:
+        if signal_count >= 10:  # Limit to first 10 signals
+            if debug_mode:
+                print("Reached signal limit of 10 for node " + node.name)
+            break
+            
+        var signal_name = signal_info["name"]
+        
+        # Skip signals that might cause issues
+        if signal_name.begins_with("_"):
+            continue
+            
+        var signal_connections = node.get_signal_connection_list(signal_name)
+        
+        if debug_mode and signal_connections.size() > 0:
+            print("Signal '" + signal_name + "' has " + str(signal_connections.size()) + " connections")
+        
+        for connection in signal_connections:
+            var target_info = "unknown"
+            if connection.has("target") and connection["target"]:
+                # Safely get target info without using get_path()
+                target_info = str(connection["target"].name) if "name" in connection["target"] else "unknown"
+            
+            var connection_info = {
+                "signal": signal_name,
+                "target": target_info,
+                "method": connection.get("method", "unknown"),
+                "flags": connection.get("flags", 0)
+            }
+            connections.append(connection_info)
+            
+        signal_count += 1
+    
+    if debug_mode:
+        print("Found " + str(connections.size()) + " total connections for node " + node.name)
+    
+    return connections

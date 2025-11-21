@@ -9,7 +9,7 @@
 
 import { fileURLToPath } from 'url';
 import { join, dirname, basename, normalize } from 'path';
-import { existsSync, readdirSync, mkdirSync } from 'fs';
+import { existsSync, readdirSync, mkdirSync, writeFileSync, readFileSync, unlinkSync } from 'fs';
 import { spawn } from 'child_process';
 import { promisify } from 'util';
 import { exec } from 'child_process';
@@ -33,6 +33,55 @@ const execAsync = promisify(exec);
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
+// Wrapper script template for screenshot functionality
+const WRAPPER_SCRIPT_TEMPLATE = `extends Node
+
+# The MCP server will replace this string with the actual main scene path
+const REAL_MAIN_SCENE = "REPLACE_WITH_MAIN_SCENE_PATH"
+const TRIGGER_FILE = "res://.mcp_screenshot_req"
+const OUTPUT_FILE = "res://.mcp_screenshot.png"
+
+func _ready():
+	print("[MCP] Wrapper loaded. Starting main scene: ", REAL_MAIN_SCENE)
+	
+	if ResourceLoader.exists(REAL_MAIN_SCENE):
+		var main_packed = load(REAL_MAIN_SCENE)
+		var main_inst = main_packed.instantiate()
+		
+		# Add the game scene to the root
+		get_tree().root.add_child.call_deferred(main_inst)
+		
+		# Set it as the current scene so game logic works as expected
+		get_tree().current_scene = main_inst
+	else:
+		printerr("[MCP] Error: Could not find main scene at ", REAL_MAIN_SCENE)
+
+func _process(_delta):
+	# Check if the server has requested a screenshot
+	if FileAccess.file_exists(TRIGGER_FILE):
+		_take_screenshot()
+		# Remove trigger to prevent loops
+		DirAccess.remove_absolute(TRIGGER_FILE)
+
+func _take_screenshot():
+	print("[MCP] Capturing screenshot...")
+	var image = get_viewport().get_texture().get_image()
+	var error = image.save_png(OUTPUT_FILE)
+	if error == OK:
+		print("[MCP] Screenshot saved to ", OUTPUT_FILE)
+	else:
+		printerr("[MCP] Failed to save screenshot. Error code: ", error)
+`;
+
+// Wrapper scene template (minimal .tscn file)
+const WRAPPER_SCENE_TEMPLATE = `[gd_scene load_steps=2 format=3 uid="uid://mcpwrapper"]
+
+[ext_resource type="Script" path="res://.mcp_wrapper.gd" id="1_mcp"]
+
+[node name="MCPWrapper" type="Node"]
+script = ExtResource("1_mcp")
+`;
+
 /**
  * Interface representing a running Godot process
  */
@@ -40,6 +89,7 @@ interface GodotProcess {
   process: any;
   output: string[];
   errors: string[];
+  projectPath: string;
 }
 
 /**
@@ -90,6 +140,9 @@ class GodotServer {
     'directory': 'directory',
     'recursive': 'recursive',
     'scene': 'scene',
+    'include_properties': 'includeProperties',
+    'include_connections': 'includeConnections',
+    'max_depth': 'maxDepth',
   };
 
   /**
@@ -134,7 +187,7 @@ class GodotServer {
 
     // Set the path to the operations script
     this.operationsScriptPath = join(__dirname, 'scripts', 'godot_operations.gd');
-    if (debugMode) console.debug(`[DEBUG] Operations script path: ${this.operationsScriptPath}`);
+    if (debugMode) console.error(`[DEBUG] Operations script path: ${this.operationsScriptPath}`);
 
     // Initialize the MCP server
     this.server = new Server(
@@ -167,7 +220,7 @@ class GodotServer {
    */
   private logDebug(message: string): void {
     if (DEBUG_MODE) {
-      console.debug(`[DEBUG] ${message}`);
+      console.error(`[DEBUG] ${message}`);
     }
   }
 
@@ -251,8 +304,11 @@ class GodotServer {
       }
 
       // Try to execute Godot with --version flag
-      const command = path === 'godot' ? 'godot --version' : `"${path}" --version`;
-      await execAsync(command);
+      if (path === 'godot') {
+        await this.spawnCommand('godot', ['--version']);
+      } else {
+        await this.spawnCommand(path, ['--version']);
+      }
 
       this.logDebug(`Valid Godot path: ${path}`);
       this.validatedPaths.set(path, true);
@@ -386,6 +442,25 @@ class GodotServer {
     if (this.activeProcess) {
       this.logDebug('Killing active Godot process');
       this.activeProcess.process.kill();
+      
+      // Clean up wrapper files
+      if (this.activeProcess.projectPath) {
+        try {
+          const projectPath = this.activeProcess.projectPath;
+          const wrapperScript = join(projectPath, '.mcp_wrapper.gd');
+          const wrapperScene = join(projectPath, '.mcp_wrapper.tscn');
+          const triggerFile = join(projectPath, '.mcp_screenshot_req');
+          const screenshotFile = join(projectPath, '.mcp_screenshot.png');
+
+          if (existsSync(wrapperScript)) unlinkSync(wrapperScript);
+          if (existsSync(wrapperScene)) unlinkSync(wrapperScene);
+          if (existsSync(triggerFile)) unlinkSync(triggerFile);
+          if (existsSync(screenshotFile)) unlinkSync(screenshotFile);
+        } catch (e) {
+          // Ignore errors during cleanup
+        }
+      }
+
       this.activeProcess = null;
     }
     await this.server.close();
@@ -495,36 +570,25 @@ class GodotServer {
     try {
       // Serialize the snake_case parameters to a valid JSON string
       const paramsJson = JSON.stringify(snakeCaseParams);
-      // Escape single quotes in the JSON string to prevent command injection
-      const escapedParams = paramsJson.replace(/'/g, "'\\''");
-      // On Windows, cmd.exe does not strip single quotes, so we use
-      // double quotes and escape them to ensure the JSON is parsed
-      // correctly by Godot.
-      const isWindows = process.platform === 'win32';
-      const quotedParams = isWindows
-        ? `\"${paramsJson.replace(/\"/g, '\\"')}\"`
-        : `'${escapedParams}'`;
-
 
       // Add debug arguments if debug mode is enabled
       const debugArgs = GODOT_DEBUG_MODE ? ['--debug-godot'] : [];
 
-      // Construct the command with the operation and JSON parameters
-      const cmd = [
-        `"${this.godotPath}"`,
+      // Construct the arguments for spawn
+      const args = [
         '--headless',
         '--path',
-        `"${projectPath}"`,
+        projectPath,
         '--script',
-        `"${this.operationsScriptPath}"`,
+        this.operationsScriptPath,
         operation,
-        quotedParams, // Pass the JSON string as a single argument
+        paramsJson, // Pass the JSON string as a single argument
         ...debugArgs,
-      ].join(' ');
+      ];
 
-      this.logDebug(`Command: ${cmd}`);
+      this.logDebug(`Executing operation: ${operation}`);
 
-      const { stdout, stderr } = await execAsync(cmd);
+      const { stdout, stderr } = await this.spawnCommand(this.godotPath!, args);
 
       return { stdout, stderr };
     } catch (error: unknown) {
@@ -539,6 +603,102 @@ class GodotServer {
 
       throw error;
     }
+  }
+
+  /**
+   * Execute a command using spawn instead of exec to avoid shell dependencies
+   */
+  private async spawnCommand(command: string, args: string[]): Promise<{ stdout: string, stderr: string }> {
+    return new Promise((resolve, reject) => {
+      this.logDebug(`Spawning command: ${command} ${args.join(' ')}`);
+      
+      // On Windows, we might need to handle the command path carefully if it has spaces
+      // But spawn usually handles it if passed as the first argument
+      
+      const childProcess = spawn(command, args, { shell: false });
+      
+      let stdout = '';
+      let stderr = '';
+
+      if (childProcess.stdout) {
+        childProcess.stdout.on('data', (data) => {
+          stdout += data.toString();
+        });
+      }
+
+      if (childProcess.stderr) {
+        childProcess.stderr.on('data', (data) => {
+          stderr += data.toString();
+        });
+      }
+
+      childProcess.on('error', (error) => {
+        reject(error);
+      });
+
+      childProcess.on('close', (code) => {
+        if (code === 0) {
+          resolve({ stdout, stderr });
+        } else {
+          const error = new Error(`Command failed with code ${code}`);
+          (error as any).stdout = stdout;
+          (error as any).stderr = stderr;
+          (error as any).code = code;
+          reject(error);
+        }
+      });
+    });
+  }
+
+  /**
+   * Extract JSON from potentially contaminated output (with Godot startup messages)
+   * @param output The raw output from Godot
+   * @returns Clean JSON string
+   */
+  private extractJsonFromOutput(output: string): string {
+    // Remove common Godot startup messages and warnings
+    const lines = output.split('\n');
+    let jsonStartIndex = -1;
+    let jsonEndIndex = -1;
+    let braceCount = 0;
+    let inJson = false;
+    
+    // Look for the first line that starts with '{' (start of JSON)
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i].trim();
+      
+      if (!inJson && line.startsWith('{')) {
+        jsonStartIndex = i;
+        inJson = true;
+        braceCount = 0;
+      }
+      
+      if (inJson) {
+        // Count braces to find the end of JSON
+        for (const char of line) {
+          if (char === '{') braceCount++;
+          if (char === '}') braceCount--;
+        }
+        
+        // If braces are balanced, we've found the end of JSON
+        if (braceCount === 0) {
+          jsonEndIndex = i;
+          break;
+        }
+      }
+    }
+    
+    if (jsonStartIndex === -1) {
+      throw new Error('No JSON found in output');
+    }
+    
+    if (jsonEndIndex === -1) {
+      throw new Error('Incomplete JSON found in output');
+    }
+    
+    // Extract only the JSON portion
+    const jsonLines = lines.slice(jsonStartIndex, jsonEndIndex + 1);
+    return jsonLines.join('\n').trim();
   }
 
   /**
@@ -665,266 +825,312 @@ class GodotServer {
   private setupToolHandlers() {
     // Define available tools
     this.server.setRequestHandler(ListToolsRequestSchema, async () => ({
-      tools: [
-        {
-          name: 'launch_editor',
-          description: 'Launch Godot editor for a specific project',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              projectPath: {
-                type: 'string',
-                description: 'Path to the Godot project directory',
-              },
-            },
-            required: ['projectPath'],
-          },
-        },
-        {
-          name: 'run_project',
-          description: 'Run the Godot project and capture output',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              projectPath: {
-                type: 'string',
-                description: 'Path to the Godot project directory',
-              },
-              scene: {
-                type: 'string',
-                description: 'Optional: Specific scene to run',
-              },
-            },
-            required: ['projectPath'],
-          },
-        },
-        {
-          name: 'get_debug_output',
-          description: 'Get the current debug output and errors',
-          inputSchema: {
-            type: 'object',
-            properties: {},
-            required: [],
-          },
-        },
-        {
-          name: 'stop_project',
-          description: 'Stop the currently running Godot project',
-          inputSchema: {
-            type: 'object',
-            properties: {},
-            required: [],
-          },
-        },
-        {
-          name: 'get_godot_version',
-          description: 'Get the installed Godot version',
-          inputSchema: {
-            type: 'object',
-            properties: {},
-            required: [],
-          },
-        },
-        {
-          name: 'list_projects',
-          description: 'List Godot projects in a directory',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              directory: {
-                type: 'string',
-                description: 'Directory to search for Godot projects',
-              },
-              recursive: {
-                type: 'boolean',
-                description: 'Whether to search recursively (default: false)',
-              },
-            },
-            required: ['directory'],
-          },
-        },
-        {
-          name: 'get_project_info',
-          description: 'Retrieve metadata about a Godot project',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              projectPath: {
-                type: 'string',
-                description: 'Path to the Godot project directory',
-              },
-            },
-            required: ['projectPath'],
-          },
-        },
-        {
-          name: 'create_scene',
-          description: 'Create a new Godot scene file',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              projectPath: {
-                type: 'string',
-                description: 'Path to the Godot project directory',
-              },
-              scenePath: {
-                type: 'string',
-                description: 'Path where the scene file will be saved (relative to project)',
-              },
-              rootNodeType: {
-                type: 'string',
-                description: 'Type of the root node (e.g., Node2D, Node3D)',
-                default: 'Node2D',
-              },
-            },
-            required: ['projectPath', 'scenePath'],
-          },
-        },
-        {
-          name: 'add_node',
-          description: 'Add a node to an existing scene',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              projectPath: {
-                type: 'string',
-                description: 'Path to the Godot project directory',
-              },
-              scenePath: {
-                type: 'string',
-                description: 'Path to the scene file (relative to project)',
-              },
-              parentNodePath: {
-                type: 'string',
-                description: 'Path to the parent node (e.g., "root" or "root/Player")',
-                default: 'root',
-              },
-              nodeType: {
-                type: 'string',
-                description: 'Type of node to add (e.g., Sprite2D, CollisionShape2D)',
-              },
-              nodeName: {
-                type: 'string',
-                description: 'Name for the new node',
-              },
+      tools:
+        [
+          {
+            name: 'launch_editor',
+            description: 'Launch Godot editor for a specific project',
+            inputSchema: {
+              type: 'object',
               properties: {
-                type: 'object',
-                description: 'Optional properties to set on the node',
-              },
-            },
-            required: ['projectPath', 'scenePath', 'nodeType', 'nodeName'],
-          },
-        },
-        {
-          name: 'load_sprite',
-          description: 'Load a sprite into a Sprite2D node',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              projectPath: {
-                type: 'string',
-                description: 'Path to the Godot project directory',
-              },
-              scenePath: {
-                type: 'string',
-                description: 'Path to the scene file (relative to project)',
-              },
-              nodePath: {
-                type: 'string',
-                description: 'Path to the Sprite2D node (e.g., "root/Player/Sprite2D")',
-              },
-              texturePath: {
-                type: 'string',
-                description: 'Path to the texture file (relative to project)',
-              },
-            },
-            required: ['projectPath', 'scenePath', 'nodePath', 'texturePath'],
-          },
-        },
-        {
-          name: 'export_mesh_library',
-          description: 'Export a scene as a MeshLibrary resource',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              projectPath: {
-                type: 'string',
-                description: 'Path to the Godot project directory',
-              },
-              scenePath: {
-                type: 'string',
-                description: 'Path to the scene file (.tscn) to export',
-              },
-              outputPath: {
-                type: 'string',
-                description: 'Path where the mesh library (.res) will be saved',
-              },
-              meshItemNames: {
-                type: 'array',
-                items: {
+                projectPath: {
                   type: 'string',
+                  description: 'Path to the Godot project directory',
                 },
-                description: 'Optional: Names of specific mesh items to include (defaults to all)',
               },
+              required: ['projectPath'],
             },
-            required: ['projectPath', 'scenePath', 'outputPath'],
           },
-        },
-        {
-          name: 'save_scene',
-          description: 'Save changes to a scene file',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              projectPath: {
-                type: 'string',
-                description: 'Path to the Godot project directory',
+          {
+            name: 'run_project',
+            description: 'Run the Godot project and capture output',
+            inputSchema: {
+              type: 'object',
+              properties: {
+                projectPath: {
+                  type: 'string',
+                  description: 'Path to the Godot project directory',
+                },
+                scene: {
+                  type: 'string',
+                  description: 'Optional: Specific scene to run',
+                },
               },
-              scenePath: {
-                type: 'string',
-                description: 'Path to the scene file (relative to project)',
-              },
-              newPath: {
-                type: 'string',
-                description: 'Optional: New path to save the scene to (for creating variants)',
-              },
+              required: ['projectPath'],
             },
-            required: ['projectPath', 'scenePath'],
           },
-        },
-        {
-          name: 'get_uid',
-          description: 'Get the UID for a specific file in a Godot project (for Godot 4.4+)',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              projectPath: {
-                type: 'string',
-                description: 'Path to the Godot project directory',
-              },
-              filePath: {
-                type: 'string',
-                description: 'Path to the file (relative to project) for which to get the UID',
-              },
+          {
+            name: 'get_debug_output',
+            description: 'Get the current debug output and errors',
+            inputSchema: {
+              type: 'object',
+              properties: {},
+              required: [],
             },
-            required: ['projectPath', 'filePath'],
           },
-        },
-        {
-          name: 'update_project_uids',
-          description: 'Update UID references in a Godot project by resaving resources (for Godot 4.4+)',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              projectPath: {
-                type: 'string',
-                description: 'Path to the Godot project directory',
-              },
+          {
+            name: 'stop_project',
+            description: 'Stop the currently running Godot project',
+            inputSchema: {
+              type: 'object',
+              properties: {},
+              required: [],
             },
-            required: ['projectPath'],
           },
-        },
-      ],
+          {
+            name: 'get_godot_version',
+            description: 'Get the installed Godot version',
+            inputSchema: {
+              type: 'object',
+              properties: {},
+              required: [],
+            },
+          },
+          {
+            name: 'list_projects',
+            description: 'List Godot projects in a directory',
+            inputSchema: {
+              type: 'object',
+              properties: {
+                directory: {
+                  type: 'string',
+                  description: 'Directory to search for Godot projects',
+                },
+                recursive: {
+                  type: 'boolean',
+                  description: 'Whether to search recursively (default: false)',
+                },
+              },
+              required: ['directory'],
+            },
+          },
+          {
+            name: 'get_project_info',
+            description: 'Retrieve metadata about a Godot project',
+            inputSchema: {
+              type: 'object',
+              properties: {
+                projectPath: {
+                  type: 'string',
+                  description: 'Path to the Godot project directory',
+                },
+              },
+              required: ['projectPath'],
+            },
+          },
+          {
+            name: 'create_scene',
+            description: 'Create a new Godot scene file',
+            inputSchema: {
+              type: 'object',
+              properties: {
+                projectPath: {
+                  type: 'string',
+                  description: 'Path to the Godot project directory',
+                },
+                scenePath: {
+                  type: 'string',
+                  description: 'Path where the scene file will be saved (relative to project)',
+                },
+                rootNodeType: {
+                  type: 'string',
+                  description: 'Type of the root node (e.g., Node2D, Node3D)',
+                  default: 'Node2D',
+                },
+              },
+              required: ['projectPath', 'scenePath'],
+            },
+          },
+          {
+            name: 'add_node',
+            description: 'Add a node to an existing scene',
+            inputSchema: {
+              type: 'object',
+              properties: {
+                projectPath: {
+                  type: 'string',
+                  description: 'Path to the Godot project directory',
+                },
+                scenePath: {
+                  type: 'string',
+                  description: 'Path to the scene file (relative to project)',
+                },
+                parentNodePath: {
+                  type: 'string',
+                  description: 'Path to the parent node (e.g., "root" or "root/Player")',
+                  default: 'root',
+                },
+                nodeType: {
+                  type: 'string',
+                  description: 'Type of node to add (e.g., Sprite2D, CollisionShape2D)',
+                },
+                nodeName: {
+                  type: 'string',
+                  description: 'Name for the new node',
+                },
+                properties: {
+                  type: 'object',
+                  description: 'Optional properties to set on the node',
+                },
+              },
+              required: ['projectPath', 'scenePath', 'nodeType', 'nodeName'],
+            },
+          },
+          {
+            name: 'load_sprite',
+            description: 'Load a sprite into a Sprite2D node',
+            inputSchema: {
+              type: 'object',
+              properties: {
+                projectPath: {
+                  type: 'string',
+                  description: 'Path to the Godot project directory',
+                },
+                scenePath: {
+                  type: 'string',
+                  description: 'Path to the scene file (relative to project)',
+                },
+                nodePath: {
+                  type: 'string',
+                  description: 'Path to the Sprite2D node (e.g., "root/Player/Sprite2D")',
+                },
+                texturePath: {
+                  type: 'string',
+                  description: 'Path to the texture file (relative to project)',
+                },
+              },
+              required: ['projectPath', 'scenePath', 'nodePath', 'texturePath'],
+            },
+          },
+          {
+            name: 'export_mesh_library',
+            description: 'Export a scene as a MeshLibrary resource',
+            inputSchema: {
+              type: 'object',
+              properties: {
+                projectPath: {
+                  type: 'string',
+                  description: 'Path to the Godot project directory',
+                },
+                scenePath: {
+                  type: 'string',
+                  description: 'Path to the scene file (.tscn) to export',
+                },
+                outputPath: {
+                  type: 'string',
+                  description: 'Path where the mesh library (.res) will be saved',
+                },
+                meshItemNames: {
+                  type: 'array',
+                  items: {
+                    type: 'string',
+                  },
+                  description: 'Optional: Names of specific mesh items to include (defaults to all)',
+                },
+              },
+              required: ['projectPath', 'scenePath', 'outputPath'],
+            },
+          },
+          {
+            name: 'save_scene',
+            description: 'Save changes to a scene file',
+            inputSchema: {
+              type: 'object',
+              properties: {
+                projectPath: {
+                  type: 'string',
+                  description: 'Path to the Godot project directory',
+                },
+                scenePath: {
+                  type: 'string',
+                  description: 'Path to the scene file (relative to project)',
+                },
+                newPath: {
+                  type: 'string',
+                  description: 'Optional: New path to save the scene to (for creating variants)',
+                },
+              },
+              required: ['projectPath', 'scenePath'],
+            },
+          },
+          {
+            name: 'get_uid',
+            description: 'Get the UID for a specific file in a Godot project (for Godot 4.4+)',
+            inputSchema: {
+              type: 'object',
+              properties: {
+                projectPath: {
+                  type: 'string',
+                  description: 'Path to the Godot project directory',
+                },
+                filePath: {
+                  type: 'string',
+                  description: 'Path to the file (relative to project) for which to get the UID',
+                },
+              },
+              required: ['projectPath', 'filePath'],
+            },
+          },
+          {
+            name: 'update_project_uids',
+            description: 'Update UID references in a Godot project by resaving resources (for Godot 4.4+)',
+            inputSchema: {
+              type: 'object',
+              properties: {
+                projectPath: {
+                  type: 'string',
+                  description: 'Path to the Godot project directory',
+                },
+              },
+              required: ['projectPath'],
+            },
+          },
+          {
+            name: 'capture_screenshot',
+            description: 'Capture a screenshot of the running Godot project',
+            inputSchema: {
+              type: 'object',
+              properties: {
+                projectPath: {
+                  type: 'string',
+                  description: 'Path to the Godot project directory',
+                },
+              },
+              required: ['projectPath'],
+            },
+          },
+          {
+            name: 'get_scene_structure',
+            description: 'Retrieve the hierarchical structure of a Godot scene file with optional property and connection information',
+            inputSchema: {
+              type: 'object',
+              properties: {
+                projectPath: {
+                  type: 'string',
+                  description: 'Path to the Godot project directory',
+                },
+                scenePath: {
+                  type: 'string',
+                  description: 'Path to the scene file (relative to project)',
+                },
+                includeProperties: {
+                  type: 'boolean',
+                  description: 'Include node properties in the structure (default: true)',
+                },
+                includeConnections: {
+                  type: 'boolean', 
+                  description: 'Include signal connections in the structure (default: true)',
+                },
+                maxDepth: {
+                  type: 'integer',
+                  description: 'Maximum depth to traverse the scene tree (default: unlimited)',
+                  minimum: 1,
+                },
+              },
+              required: ['projectPath', 'scenePath'],
+            },
+          },
+        ],
     }));
 
     // Handle tool calls
@@ -959,6 +1165,10 @@ class GodotServer {
           return await this.handleGetUid(request.params.arguments);
         case 'update_project_uids':
           return await this.handleUpdateProjectUids(request.params.arguments);
+        case 'capture_screenshot':
+          return await this.handleCaptureScreenshot(request.params.arguments);
+        case 'get_scene_structure':
+          return await this.handleGetSceneStructure(request.params.arguments);
         default:
           throw new McpError(
             ErrorCode.MethodNotFound,
@@ -1088,8 +1298,53 @@ class GodotServer {
         this.activeProcess.process.kill();
       }
 
+      // Determine the scene to run inside the wrapper
+      let sceneToRun = args.scene;
+
+      if (!sceneToRun) {
+        // Parse project.godot to find the default main scene
+        try {
+          const projectContent = readFileSync(projectFile, 'utf-8');
+          // Look for: run/main_scene="res://path/to/scene.tscn"
+          const match = projectContent.match(/run\/main_scene="([^"]+)"/);
+          if (match && match[1]) {
+            sceneToRun = match[1];
+          }
+        } catch (e) {
+          this.logDebug(`Error reading project.godot: ${e}`);
+        }
+      }
+
+      // If we found a scene to run, set up the wrapper
+      let useWrapper = false;
+      if (sceneToRun) {
+        try {
+          const wrapperScriptPath = join(args.projectPath, '.mcp_wrapper.gd');
+          
+          let formattedScenePath = sceneToRun;
+          if (!formattedScenePath.startsWith('res://')) {
+             // If it's a relative path, assume it's relative to project root
+             formattedScenePath = `res://${formattedScenePath.replace(/\\/g, '/')}`;
+          }
+
+          const wrapperScriptContent = WRAPPER_SCRIPT_TEMPLATE.replace('REPLACE_WITH_MAIN_SCENE_PATH', formattedScenePath);
+          writeFileSync(wrapperScriptPath, wrapperScriptContent);
+
+          const wrapperScenePath = join(args.projectPath, '.mcp_wrapper.tscn');
+          writeFileSync(wrapperScenePath, WRAPPER_SCENE_TEMPLATE);
+          
+          useWrapper = true;
+          this.logDebug(`Initialized screenshot wrapper for scene: ${formattedScenePath}`);
+        } catch (e) {
+          this.logDebug(`Failed to initialize screenshot wrapper: ${e}`);
+        }
+      }
+
       const cmdArgs = ['-d', '--path', args.projectPath];
-      if (args.scene && this.validatePath(args.scene)) {
+      
+      if (useWrapper) {
+        cmdArgs.push('.mcp_wrapper.tscn');
+      } else if (args.scene && this.validatePath(args.scene)) {
         this.logDebug(`Adding scene parameter: ${args.scene}`);
         cmdArgs.push(args.scene);
       }
@@ -1129,7 +1384,7 @@ class GodotServer {
         }
       });
 
-      this.activeProcess = { process, output, errors };
+      this.activeProcess = { process, output, errors, projectPath: args.projectPath };
 
       return {
         content: [
@@ -1201,6 +1456,25 @@ class GodotServer {
     this.activeProcess.process.kill();
     const output = this.activeProcess.output;
     const errors = this.activeProcess.errors;
+    const projectPath = this.activeProcess.projectPath;
+
+    // Clean up wrapper files
+    try {
+      const wrapperScript = join(projectPath, '.mcp_wrapper.gd');
+      const wrapperScene = join(projectPath, '.mcp_wrapper.tscn');
+      const triggerFile = join(projectPath, '.mcp_screenshot_req');
+      const screenshotFile = join(projectPath, '.mcp_screenshot.png');
+
+      if (existsSync(wrapperScript)) unlinkSync(wrapperScript);
+      if (existsSync(wrapperScene)) unlinkSync(wrapperScene);
+      if (existsSync(triggerFile)) unlinkSync(triggerFile);
+      if (existsSync(screenshotFile)) unlinkSync(screenshotFile);
+      
+      this.logDebug('Cleaned up temporary wrapper files');
+    } catch (e) {
+      this.logDebug(`Error cleaning up wrapper files: ${e}`);
+    }
+
     this.activeProcess = null;
 
     return {
@@ -1241,7 +1515,7 @@ class GodotServer {
       }
 
       this.logDebug('Getting Godot version');
-      const { stdout } = await execAsync(`"${this.godotPath}" --version`);
+      const { stdout } = await this.spawnCommand(this.godotPath!, ['--version']);
       return {
         content: [
           {
@@ -1427,8 +1701,8 @@ class GodotServer {
       this.logDebug(`Getting project info for: ${args.projectPath}`);
   
       // Get Godot version
-      const execOptions = { timeout: 10000 }; // 10 second timeout
-      const { stdout } = await execAsync(`"${this.godotPath}" --version`, execOptions);
+      // const execOptions = { timeout: 10000 }; // 10 second timeout
+      const { stdout } = await this.spawnCommand(this.godotPath!, ['--version']);
   
       // Get project structure using the recursive method
       const projectStructure = await this.getProjectStructureAsync(args.projectPath);
@@ -2003,7 +2277,7 @@ class GodotServer {
       }
 
       // Get Godot version to check if UIDs are supported
-      const { stdout: versionOutput } = await execAsync(`"${this.godotPath}" --version`);
+      const { stdout: versionOutput } = await this.spawnCommand(this.godotPath!, ['--version']);
       const version = versionOutput.trim();
 
       if (!this.isGodot44OrLater(version)) {
@@ -2103,7 +2377,7 @@ class GodotServer {
       }
 
       // Get Godot version to check if UIDs are supported
-      const { stdout: versionOutput } = await execAsync(`"${this.godotPath}" --version`);
+      const { stdout: versionOutput } = await this.spawnCommand(this.godotPath!, ['--version']);
       const version = versionOutput.trim();
 
       if (!this.isGodot44OrLater(version)) {
@@ -2155,6 +2429,230 @@ class GodotServer {
   }
 
   /**
+   * Handle the capture_screenshot tool
+   */
+  private async handleCaptureScreenshot(args: any) {
+    // Normalize parameters to camelCase
+    args = this.normalizeParameters(args);
+    
+    if (!args.projectPath) {
+      return this.createErrorResponse(
+        'Project path is required',
+        ['Provide a valid path to a Godot project directory']
+      );
+    }
+
+    if (!this.validatePath(args.projectPath)) {
+      return this.createErrorResponse(
+        'Invalid project path',
+        ['Provide a valid path without ".." or other potentially unsafe characters']
+      );
+    }
+
+    if (!this.activeProcess) {
+      return this.createErrorResponse(
+        'No active Godot process.',
+        [
+          'Use run_project to start a Godot project first',
+          'Screenshots can only be taken from a running project started by this server',
+        ]
+      );
+    }
+
+    try {
+      const triggerFile = join(args.projectPath, '.mcp_screenshot_req');
+      const outputFile = join(args.projectPath, '.mcp_screenshot.png');
+
+      // Clean up any previous screenshot
+      if (existsSync(outputFile)) {
+        unlinkSync(outputFile);
+      }
+
+      // Create trigger file
+      writeFileSync(triggerFile, '');
+      this.logDebug('Created screenshot trigger file');
+
+      // Wait for screenshot to be created (timeout after 5 seconds)
+      let attempts = 0;
+      const maxAttempts = 50; // 5 seconds total (100ms * 50)
+      
+      while (attempts < maxAttempts) {
+        if (existsSync(outputFile)) {
+          // Wait a tiny bit more to ensure write is complete
+          await new Promise(resolve => setTimeout(resolve, 100));
+          
+          return {
+            content: [
+              {
+                type: 'text',
+                text: `Screenshot captured successfully: ${outputFile}`,
+              },
+              {
+                type: 'image',
+                data: readFileSync(outputFile).toString('base64'),
+                mimeType: 'image/png'
+              }
+            ],
+          };
+        }
+        
+        await new Promise(resolve => setTimeout(resolve, 100));
+        attempts++;
+      }
+
+      return this.createErrorResponse(
+        'Timed out waiting for screenshot.',
+        [
+          'Ensure the project is running correctly',
+          'Check if the wrapper script is working',
+        ]
+      );
+
+    } catch (error: any) {
+      return this.createErrorResponse(
+        `Failed to capture screenshot: ${error?.message || 'Unknown error'}`,
+        [
+          'Ensure the project path is accessible',
+          'Check file permissions',
+        ]
+      );
+    }
+  }
+
+  /**
+   * Handle the get_scene_structure tool
+   */
+  private async handleGetSceneStructure(args: any) {
+    // Normalize parameters to camelCase
+    args = this.normalizeParameters(args);
+    
+    if (!args.projectPath || !args.scenePath) {
+      return this.createErrorResponse(
+        'Project path and scene path are required',
+        ['Provide valid paths for both the project and the scene file']
+      );
+    }
+
+    if (!this.validatePath(args.projectPath) || !this.validatePath(args.scenePath)) {
+      return this.createErrorResponse(
+        'Invalid path',
+        ['Provide valid paths without ".." or other potentially unsafe characters']
+      );
+    }
+
+    try {
+      // Ensure godotPath is set
+      if (!this.godotPath) {
+        await this.detectGodotPath();
+        if (!this.godotPath) {
+          return this.createErrorResponse(
+            'Could not find a valid Godot executable path',
+            [
+              'Ensure Godot is installed correctly',
+              'Set GODOT_PATH environment variable to specify the correct path',
+            ]
+          );
+        }
+      }
+
+      // Check if the project directory exists and contains a project.godot file
+      const projectFile = join(args.projectPath, 'project.godot');
+      if (!existsSync(projectFile)) {
+        return this.createErrorResponse(
+          `Not a valid Godot project: ${args.projectPath}`,
+          [
+            'Ensure the path points to a directory containing a project.godot file',
+            'Use list_projects to find valid Godot projects',
+          ]
+        );
+      }
+
+      // Check if the scene file exists
+      const sceneFile = join(args.projectPath, args.scenePath);
+      if (!existsSync(sceneFile)) {
+        return this.createErrorResponse(
+          `Scene file not found: ${args.scenePath}`,
+          [
+            'Ensure the scene path is correct and relative to the project',
+            'Use create_scene to create a new scene if needed',
+          ]
+        );
+      }
+
+      // Check if it's a valid .tscn file
+      if (!args.scenePath.endsWith('.tscn')) {
+        return this.createErrorResponse(
+          `Invalid scene file format: ${args.scenePath}`,
+          [
+            'Only .tscn scene files are supported',
+            'Provide a path to a valid Godot scene file',
+          ]
+        );
+      }
+
+      // Prepare parameters for the operation (already in camelCase)
+      const params = {
+        scenePath: args.scenePath,
+        includeProperties: args.includeProperties || false,
+        includeConnections: args.includeConnections || false,
+        maxDepth: args.maxDepth || null,
+      };
+
+      this.logDebug(`Getting scene structure for: ${args.scenePath}`);
+
+      // Execute the operation
+      const { stdout, stderr } = await this.executeOperation('get_scene_structure', params, args.projectPath);
+
+      if (stderr && stderr.includes('Failed to')) {
+        return this.createErrorResponse(
+          `Failed to get scene structure: ${stderr}`,
+          [
+            'Check if the scene file is valid',
+            'Ensure the scene file is not corrupted',
+            'Try opening the scene in Godot editor to verify it loads correctly',
+          ]
+        );
+      }
+
+      // Parse the JSON output, extracting only the JSON part from potentially contaminated output
+      let structureData;
+      try {
+        const cleanJson = this.extractJsonFromOutput(stdout);
+        structureData = JSON.parse(cleanJson);
+      } catch (parseError) {
+        return this.createErrorResponse(
+          `Failed to parse scene structure data: ${parseError}`,
+          [
+            'The scene structure output may be malformed',
+            'Try the operation again',
+            'Check if the scene file is valid',
+            'Raw output: ' + stdout.substring(0, 200) + (stdout.length > 200 ? '...' : ''),
+          ]
+        );
+      }
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `Scene structure retrieved successfully for: ${args.scenePath}\n\n${JSON.stringify(structureData, null, 2)}`,
+          },
+        ],
+      };
+    } catch (error: any) {
+      return this.createErrorResponse(
+        `Failed to get scene structure: ${error?.message || 'Unknown error'}`,
+        [
+          'Ensure Godot is installed correctly',
+          'Check if the GODOT_PATH environment variable is set correctly',
+          'Verify the project and scene paths are accessible',
+          'Ensure the scene file is a valid .tscn file',
+        ]
+      );
+    }
+  }
+
+  /**
    * Run the MCP server
    */
   async run() {
@@ -2185,7 +2683,7 @@ class GodotServer {
         }
       }
 
-      console.log(`[SERVER] Using Godot at: ${this.godotPath}`);
+      console.error(`[SERVER] Using Godot at: ${this.godotPath}`);
 
       const transport = new StdioServerTransport();
       await this.server.connect(transport);
