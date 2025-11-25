@@ -4,6 +4,9 @@ extends SceneTree
 # Debug mode flag
 var debug_mode = false
 
+# Cached insights engine instance
+var _insights_engine = null
+
 func _init():
     var args = OS.get_cmdline_args()
     
@@ -71,6 +74,10 @@ func _init():
             get_uid(params)
         "resave_resources":
             resave_resources(params)
+        "get_scene_insights":
+            get_scene_insights(params)
+        "get_node_insights":
+            get_node_insights(params)
         _:
             log_error("Unknown operation: " + operation)
             quit(1)
@@ -1190,3 +1197,50 @@ func save_scene(params):
             printerr("Failed to save scene: " + str(error))
     else:
         printerr("Failed to pack scene: " + str(result))
+
+# Get or create the cached insights engine instance
+func _get_insights_engine():
+    if not _insights_engine:
+        var script_dir = get_script().resource_path.get_base_dir()
+        var insights_script_path = script_dir.path_join("godot_insights.gd")
+        var insights_script = load(insights_script_path)
+        
+        if not insights_script:
+            log_error("Failed to load godot_insights.gd from: " + insights_script_path)
+            return null
+        
+        _insights_engine = insights_script.new()
+    
+    return _insights_engine
+
+# Get scene insights operation
+func get_scene_insights(params):
+    var insights_engine = _get_insights_engine()
+    if not insights_engine:
+        var error_result = {
+            "error": "Failed to load godot_insights.gd"
+        }
+        print(JSON.stringify(error_result))
+        quit(1)
+    
+    var result = insights_engine.get_scene_insights(params)
+    
+    var json_string = JSON.stringify(result)
+    print(json_string)
+    quit(0)
+
+# Get node insights operation (uses GodotInsights engine)
+func get_node_insights(params):
+    var insights_engine = _get_insights_engine()
+    if not insights_engine:
+        var error_result = {
+            "error": "Failed to load godot_insights.gd"
+        }
+        print(JSON.stringify(error_result))
+        quit(1)
+    
+    var result = insights_engine.get_node_insights(params)
+    
+    var json_string = JSON.stringify(result)
+    print(json_string)
+    quit(0)
