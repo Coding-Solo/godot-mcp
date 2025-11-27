@@ -204,6 +204,22 @@ Once configured, your AI assistant will automatically run the MCP server when ne
 "Update UID references in my Godot project after upgrading to 4.4"
 ```
 
+### Passing custom Godot CLI arguments
+
+`run_project` now accepts an optional `extraArgs` array. These strings are appended directly to the Godot command line so you can trigger headless runs, select custom main scenes, or pass feature flags without leaving your IDE. Example request payload:
+
+```jsonc
+{
+  "name": "run_project",
+  "arguments": {
+    "projectPath": "/absolute/path/to/project",
+    "extraArgs": ["--headless", "--test=sample_spawn_test"]
+  }
+}
+```
+
+> ℹ️  For safety, the server automatically injects `--path` for you and filters out duplicate `--path`/`-p` flags. Use `extraArgs` strictly for additional Godot options (e.g., `--headless`, `--quit`, `--test=...`).
+
 ## Implementation Details
 
 ### Architecture

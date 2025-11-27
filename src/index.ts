@@ -694,6 +694,13 @@ class GodotServer {
                 type: 'string',
                 description: 'Optional: Specific scene to run',
               },
+              extraArgs: {
+                type: 'array',
+                description: 'Optional additional CLI arguments passed directly to the Godot executable',
+                items: {
+                  type: 'string',
+                },
+              },
             },
             required: ['projectPath'],
           },
@@ -1094,6 +1101,12 @@ class GodotServer {
         cmdArgs.push(args.scene);
       }
 
+      const extraArgs = this.parseExtraArgs(args.extraArgs);
+      if (extraArgs.length > 0) {
+        this.logDebug(`Adding custom CLI args: ${extraArgs.join(' ')}`);
+        cmdArgs.push(...extraArgs);
+      }
+
       this.logDebug(`Running Godot project: ${args.projectPath}`);
       const process = spawn(this.godotPath!, cmdArgs, { stdio: 'pipe' });
       const output: string[] = [];
@@ -1150,6 +1163,42 @@ class GodotServer {
         ]
       );
     }
+  }
+
+  /**
+   * Parse optional extra CLI arguments for Godot
+   */
+  private parseExtraArgs(extraArgs: any): string[] {
+    if (!extraArgs) {
+      return [];
+    }
+
+    const sanitizedArgs: string[] = [];
+    const disallowedArgs = new Set(['--path', '-p']);
+
+    const pushArg = (value: string) => {
+      if (typeof value !== 'string') {
+        return;
+      }
+      const trimmed = value.trim();
+      if (!trimmed || trimmed.includes('\n') || trimmed.includes('\r')) {
+        return;
+      }
+      if (disallowedArgs.has(trimmed)) {
+        return;
+      }
+      const unquoted = trimmed.replace(/^"(.*)"$/, '$1');
+      sanitizedArgs.push(unquoted);
+    };
+
+    if (Array.isArray(extraArgs)) {
+      extraArgs.forEach((arg) => pushArg(arg));
+    } else if (typeof extraArgs === 'string') {
+      const tokens = extraArgs.match(/(?:[^\s"]+|"[^"]*")+/g) ?? [];
+      tokens.forEach((token) => pushArg(token));
+    }
+
+    return sanitizedArgs;
   }
 
   /**
