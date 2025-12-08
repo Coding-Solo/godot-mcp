@@ -65,8 +65,12 @@ This direct feedback loop helps AI assistants like Claude understand what works 
 
 - **Launch Godot Editor**: Open the Godot editor for a specific project
 - **Run Godot Projects**: Execute Godot projects in debug mode
-- **Capture Debug Output**: Retrieve console output and error messages
-- **Control Execution**: Start and stop Godot projects programmatically
+  - **Multi-Instance Support**: Run multiple Godot instances simultaneously (e.g., dedicated server + multiple clients)
+  - **Custom Command-Line Arguments**: Pass additional arguments to Godot (e.g., `--server`, `--headless`, `profile=X`, `port=Y`)
+  - **Instance Management**: Track and manage multiple running instances with unique IDs
+- **Capture Debug Output**: Retrieve console output and error messages for specific instances or all instances
+- **Control Execution**: Start and stop Godot projects programmatically (individual instances or all at once)
+- **List Running Processes**: View all currently running Godot instances and their status
 - **Get Godot Version**: Retrieve the installed Godot version
 - **List Godot Projects**: Find Godot projects in a specified directory
 - **Project Analysis**: Get detailed information about project structure
@@ -120,6 +124,7 @@ Add to your Cline MCP settings file (`~/Library/Application Support/Code/User/gl
         "run_project",
         "get_debug_output",
         "stop_project",
+        "list_processes",
         "get_godot_version",
         "list_projects",
         "get_project_info",
@@ -183,6 +188,16 @@ Once configured, your AI assistant will automatically run the MCP server when ne
 
 "Run my Godot project and show me any errors"
 
+"Run my Godot project as a dedicated server on port 8080 in headless mode"
+
+"Launch a client instance with profile 'Strauberry' connecting to localhost:8080"
+
+"List all currently running Godot instances"
+
+"Get debug output for the server instance"
+
+"Stop the client instance with ID 'client1'"
+
 "Get information about my Godot project structure"
 
 "Analyze my Godot project structure and suggest improvements"
@@ -222,6 +237,24 @@ This architecture provides several benefits:
 - **Reduced Overhead**: Minimizes file I/O operations for better performance
 
 The bundled script accepts operation type and parameters as JSON, allowing for flexible and dynamic operation execution without generating temporary files for each operation.
+
+### Multi-Instance Support
+
+The MCP server supports running multiple Godot instances simultaneously, which is essential for MMORPG development and multiplayer testing:
+
+- **Instance IDs**: Each running instance can be assigned a unique identifier (e.g., "server", "client1", "client2") or use auto-generated IDs
+- **Command-Line Arguments**: Pass custom arguments to each instance (e.g., `--server`, `--headless`, `profile=X`, `port=Y`)
+- **Instance Management**: 
+  - Use `list_processes` to see all running instances and their status
+  - Use `get_debug_output` with an `instanceId` to get output for a specific instance
+  - Use `stop_project` with an `instanceId` to stop a specific instance, or without to stop all instances
+
+**Example Workflow for MMORPG Development:**
+1. Launch dedicated server: `run_project` with `instanceId: "server"` and `args: ["--", "--server", "port=8080", "--headless"]`
+2. Launch client instances: `run_project` with `instanceId: "client1"` and `args: ["--", "profile=Strauberry", "ip=127.0.0.1", "port=8080"]`
+3. Monitor instances: Use `list_processes` to see all running instances
+4. Get specific output: Use `get_debug_output` with `instanceId: "server"` to see server logs
+5. Stop instances individually: Use `stop_project` with `instanceId: "client1"` to stop a specific client
 
 ## Troubleshooting
 
