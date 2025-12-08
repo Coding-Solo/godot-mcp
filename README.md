@@ -190,7 +190,7 @@ Once configured, your AI assistant will automatically run the MCP server when ne
 
 "Run my Godot project as a dedicated server on port 8080 in headless mode"
 
-"Launch a client instance with profile 'Strauberry' connecting to localhost:8080"
+"Launch a client instance with custom profile connecting to localhost:8080"
 
 "List all currently running Godot instances"
 
@@ -240,7 +240,7 @@ The bundled script accepts operation type and parameters as JSON, allowing for f
 
 ### Multi-Instance Support
 
-The MCP server supports running multiple Godot instances simultaneously, which is essential for MMORPG development and multiplayer testing:
+The MCP server supports running multiple Godot instances simultaneously, which is essential for multiplayer game development and testing:
 
 - **Instance IDs**: Each running instance can be assigned a unique identifier (e.g., "server", "client1", "client2") or use auto-generated IDs
 - **Command-Line Arguments**: Pass custom arguments to each instance (e.g., `--server`, `--headless`, `profile=X`, `port=Y`)
@@ -249,9 +249,9 @@ The MCP server supports running multiple Godot instances simultaneously, which i
   - Use `get_debug_output` with an `instanceId` to get output for a specific instance
   - Use `stop_project` with an `instanceId` to stop a specific instance, or without to stop all instances
 
-**Example Workflow for MMORPG Development:**
+**Example Workflow for Multiplayer Development:**
 1. Launch dedicated server: `run_project` with `instanceId: "server"` and `args: ["--", "--server", "port=8080", "--headless"]`
-2. Launch client instances: `run_project` with `instanceId: "client1"` and `args: ["--", "profile=Strauberry", "ip=127.0.0.1", "port=8080"]`
+2. Launch client instances: `run_project` with `instanceId: "client1"` and `args: ["--", "profile=player1", "ip=127.0.0.1", "port=8080"]`
 3. Monitor instances: Use `list_processes` to see all running instances
 4. Get specific output: Use `get_debug_output` with `instanceId: "server"` to see server logs
 5. Stop instances individually: Use `stop_project` with `instanceId: "client1"` to stop a specific client

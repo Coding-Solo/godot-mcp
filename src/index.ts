@@ -715,7 +715,7 @@ class GodotServer {
                 items: {
                   type: 'string',
                 },
-                description: 'Optional: Additional command-line arguments to pass to Godot (e.g., ["--server"] or ["--", "profile=Strauberry"])',
+                description: 'Optional: Additional command-line arguments to pass to Godot (e.g., ["--server"] or ["--", "profile=player1"])',
               },
             },
             required: ['projectPath'],
