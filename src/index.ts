@@ -1037,7 +1037,7 @@ class GodotServer {
         },
         {
           name: 'list_processes',
-          description: 'List all currently running Godot project instances',
+          description: 'List all tracked Godot project instances (both running and recently exited)',
           inputSchema: {
             type: 'object',
             properties: {},
@@ -1253,16 +1253,23 @@ class GodotServer {
         instanceId = `instance_${this.nextInstanceId++}`;
       }
 
-      // Check if instance ID already exists
-      if (this.activeProcesses.has(instanceId)) {
-        return this.createErrorResponse(
-          `Instance ID "${instanceId}" is already in use`,
-          [
-            'Use a different instanceId',
-            'Stop the existing instance first using stop_project',
-            'Use list_processes to see all running instances',
-          ]
-        );
+      // Check if instance ID already exists and is running
+      const existingProcess = this.activeProcesses.get(instanceId);
+      if (existingProcess) {
+        if (existingProcess.isRunning) {
+          return this.createErrorResponse(
+            `Instance ID "${instanceId}" is already in use by a running process`,
+            [
+              'Use a different instanceId',
+              'Stop the existing instance first using stop_project',
+              'Use list_processes to see all running instances',
+            ]
+          );
+        } else {
+          // Clean up exited process to allow reuse of the ID
+          this.logDebug(`Cleaning up exited process ${instanceId} to allow ID reuse`);
+          this.activeProcesses.delete(instanceId);
+        }
       }
 
       const cmdArgs = ['-d', '--path', args.projectPath];
@@ -1385,8 +1392,8 @@ class GodotServer {
         return this.createErrorResponse(
           `No process found with instanceId: ${args.instanceId}`,
           [
-            'Use list_processes to see all running instances',
-            'Check if the instance has already exited',
+            'Use list_processes to see all tracked instances',
+            'The instance may have been cleaned up after being exited for too long',
           ]
         );
       }
@@ -1463,10 +1470,14 @@ class GodotServer {
 
       this.logDebug(`Stopping Godot process: ${instanceId}`);
       try {
-        process.process.kill();
+        // Only attempt to kill if the process is still running
+        if (process.isRunning) {
+          process.process.kill();
+        }
         const result = {
           instanceId: process.id,
           projectPath: process.projectPath,
+          wasRunning: process.isRunning,
           finalOutput: process.output,
           finalErrors: process.errors,
         };
@@ -1541,16 +1552,20 @@ class GodotServer {
       };
     }
 
-    // Stop all instances
+    // Stop all instances (only kill running ones, but remove all from tracking)
     this.logDebug('Stopping all Godot processes');
     const stoppedInstances: any[] = [];
     
     for (const [id, process] of this.activeProcesses.entries()) {
       try {
-        process.process.kill();
+        // Only attempt to kill if the process is still running
+        if (process.isRunning) {
+          process.process.kill();
+        }
         stoppedInstances.push({
           instanceId: process.id,
           projectPath: process.projectPath,
+          wasRunning: process.isRunning,
           finalOutput: process.output,
           finalErrors: process.errors,
         });
@@ -1689,10 +1704,17 @@ class GodotServer {
         instance.instanceId = `instance_${this.nextInstanceId++}`;
       }
 
-      // Check for duplicate instanceId
-      if (this.activeProcesses.has(instance.instanceId)) {
-        validationErrors.push(`Instance ${i}: instanceId "${instance.instanceId}" is already in use`);
-        continue;
+      // Check for duplicate instanceId - only block if process is still running
+      const existingProcess = this.activeProcesses.get(instance.instanceId);
+      if (existingProcess) {
+        if (existingProcess.isRunning) {
+          validationErrors.push(`Instance ${i}: instanceId "${instance.instanceId}" is already in use by a running process`);
+          continue;
+        } else {
+          // Clean up exited process to allow reuse of the ID
+          this.logDebug(`Cleaning up exited process ${instance.instanceId} to allow ID reuse`);
+          this.activeProcesses.delete(instance.instanceId);
+        }
       }
 
       // Check for duplicates within this batch
