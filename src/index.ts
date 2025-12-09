@@ -43,9 +43,28 @@ interface GodotProcess {
   errors: string[];
   projectPath: string;
   scene?: string;
+  args?: string[];
   startedAt: Date;
   isRunning: boolean;
+  exitedAt?: Date;
 }
+
+/**
+ * Interface for instance configuration in batch operations
+ */
+interface InstanceConfig {
+  projectPath: string;
+  instanceId?: string;
+  scene?: string;
+  args?: string[];
+  delayMs?: number;
+}
+
+/**
+ * Configuration for output buffer limits
+ */
+const OUTPUT_BUFFER_LIMIT = 1000; // Max lines to keep per stream
+const STALE_PROCESS_CLEANUP_MS = 10 * 60 * 1000; // 10 minutes
 
 /**
  * Interface for server configuration
@@ -75,6 +94,7 @@ class GodotServer {
   private validatedPaths: Map<string, boolean> = new Map();
   private strictPathValidation: boolean = false;
   private nextInstanceId: number = 1;
+  private cleanupInterval: NodeJS.Timeout | null = null;
 
   /**
    * Parameter name mappings between snake_case and camelCase
@@ -161,11 +181,57 @@ class GodotServer {
     // Error handling
     this.server.onerror = (error) => console.error('[MCP Error]', error);
 
+    // Start periodic cleanup of stale exited processes
+    this.startStaleProcessCleanup();
+
     // Cleanup on exit
     process.on('SIGINT', async () => {
       await this.cleanup();
       process.exit(0);
     });
+  }
+
+  /**
+   * Start periodic cleanup of stale exited processes
+   */
+  private startStaleProcessCleanup(): void {
+    // Run cleanup every minute
+    this.cleanupInterval = setInterval(() => {
+      this.cleanupStaleProcesses();
+    }, 60 * 1000);
+  }
+
+  /**
+   * Clean up processes that have exited and been stale for too long
+   */
+  private cleanupStaleProcesses(): void {
+    const now = Date.now();
+    const toDelete: string[] = [];
+
+    for (const [id, process] of this.activeProcesses.entries()) {
+      if (!process.isRunning && process.exitedAt) {
+        const staleDuration = now - process.exitedAt.getTime();
+        if (staleDuration > STALE_PROCESS_CLEANUP_MS) {
+          this.logDebug(`Cleaning up stale process: ${id} (exited ${Math.round(staleDuration / 1000)}s ago)`);
+          toDelete.push(id);
+        }
+      }
+    }
+
+    for (const id of toDelete) {
+      this.activeProcesses.delete(id);
+    }
+  }
+
+  /**
+   * Add a line to a bounded buffer, removing oldest entries if limit exceeded
+   */
+  private addToBoundedBuffer(buffer: string[], line: string): void {
+    buffer.push(line);
+    // Remove oldest entries if we exceed the limit
+    while (buffer.length > OUTPUT_BUFFER_LIMIT) {
+      buffer.shift();
+    }
   }
 
   /**
@@ -391,6 +457,13 @@ class GodotServer {
    */
   private async cleanup() {
     this.logDebug('Cleaning up resources');
+    
+    // Clear the cleanup interval
+    if (this.cleanupInterval) {
+      clearInterval(this.cleanupInterval);
+      this.cleanupInterval = null;
+    }
+    
     for (const [id, godotProcess] of this.activeProcesses.entries()) {
       this.logDebug(`Killing Godot process: ${id}`);
       try {
@@ -737,13 +810,18 @@ class GodotServer {
         },
         {
           name: 'stop_project',
-          description: 'Stop a running Godot project instance',
+          description: 'Stop running Godot project instance(s)',
           inputSchema: {
             type: 'object',
             properties: {
               instanceId: {
                 type: 'string',
-                description: 'Optional: Instance ID to stop. If not provided, stops all running instances.',
+                description: 'Optional: Single instance ID to stop.',
+              },
+              instanceIds: {
+                type: 'array',
+                items: { type: 'string' },
+                description: 'Optional: Array of instance IDs to stop. Use this to stop multiple specific instances in one call.',
               },
             },
             required: [],
@@ -966,6 +1044,47 @@ class GodotServer {
             required: [],
           },
         },
+        {
+          name: 'run_multiple_projects',
+          description: 'Launch multiple Godot project instances in a single call. Useful for multiplayer testing (server + clients).',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              instances: {
+                type: 'array',
+                items: {
+                  type: 'object',
+                  properties: {
+                    projectPath: {
+                      type: 'string',
+                      description: 'Path to the Godot project directory',
+                    },
+                    instanceId: {
+                      type: 'string',
+                      description: 'Optional: Unique identifier for this instance (e.g., "server", "client1")',
+                    },
+                    scene: {
+                      type: 'string',
+                      description: 'Optional: Specific scene to run',
+                    },
+                    args: {
+                      type: 'array',
+                      items: { type: 'string' },
+                      description: 'Optional: Command-line arguments for this instance',
+                    },
+                    delayMs: {
+                      type: 'number',
+                      description: 'Optional: Delay in milliseconds before launching this instance (useful for staggering server/client startup)',
+                    },
+                  },
+                  required: ['projectPath'],
+                },
+                description: 'Array of instance configurations to launch',
+              },
+            },
+            required: ['instances'],
+          },
+        },
       ],
     }));
 
@@ -1003,6 +1122,8 @@ class GodotServer {
           return await this.handleUpdateProjectUids(request.params.arguments);
         case 'list_processes':
           return await this.handleListProcesses();
+        case 'run_multiple_projects':
+          return await this.handleRunMultipleProjects(request.params.arguments);
         default:
           throw new McpError(
             ErrorCode.MethodNotFound,
@@ -1164,6 +1285,18 @@ class GodotServer {
       const output: string[] = [];
       const errors: string[] = [];
 
+      const processInfo: GodotProcess = {
+        id: instanceId,
+        process: godotProcess,
+        output,
+        errors,
+        projectPath: args.projectPath,
+        scene: args.scene,
+        args: args.args,
+        startedAt: new Date(),
+        isRunning: true,
+      };
+
       godotProcess.stdout?.on('data', (data: Buffer) => {
         const rawLines = data.toString().split('\n');
         for (const line of rawLines) {
@@ -1171,7 +1304,7 @@ class GodotServer {
           const cleaned = line.replace(/\r/g, '').trimEnd();
           // Only add non-empty lines to output
           if (cleaned.length > 0) {
-            output.push(cleaned);
+            this.addToBoundedBuffer(processInfo.output, cleaned);
             this.logDebug(`[Godot ${instanceId} stdout] ${cleaned}`);
           }
         }
@@ -1184,35 +1317,25 @@ class GodotServer {
           const cleaned = line.replace(/\r/g, '').trimEnd();
           // Only add non-empty lines to errors
           if (cleaned.length > 0) {
-            errors.push(cleaned);
+            this.addToBoundedBuffer(processInfo.errors, cleaned);
             this.logDebug(`[Godot ${instanceId} stderr] ${cleaned}`);
           }
         }
       });
 
-      const processInfo: GodotProcess = {
-        id: instanceId,
-        process: godotProcess,
-        output,
-        errors,
-        projectPath: args.projectPath,
-        scene: args.scene,
-        startedAt: new Date(),
-        isRunning: true,
-      };
-
       godotProcess.on('exit', (code: number | null) => {
         this.logDebug(`Godot process ${instanceId} exited with code ${code}`);
         processInfo.isRunning = false;
+        processInfo.exitedAt = new Date();
         // Keep the process info after exit so we can retrieve output
-        // Only delete if explicitly stopped, not on natural exit
-        // This allows get_debug_output to still work for recently exited processes
+        // Stale processes will be cleaned up by the periodic cleanup task
       });
 
       godotProcess.on('error', (err: Error) => {
         console.error(`Failed to start Godot process ${instanceId}:`, err);
-        errors.push(`Process error: ${err.message}`);
-        // Keep process info even on error so we can see what happened
+        processInfo.errors.push(`Process error: ${err.message}`);
+        processInfo.isRunning = false;
+        processInfo.exitedAt = new Date();
       });
 
       this.activeProcesses.set(instanceId, processInfo);
@@ -1331,24 +1454,75 @@ class GodotServer {
       );
     }
 
-    // If instanceId is provided, stop that specific instance
-    if (args.instanceId) {
-      const process = this.activeProcesses.get(args.instanceId);
+    // Helper function to stop a single instance
+    const stopInstance = (instanceId: string): { success: boolean; result?: any; error?: string } => {
+      const process = this.activeProcesses.get(instanceId);
       if (!process) {
+        return { success: false, error: `No process found with instanceId: ${instanceId}` };
+      }
+
+      this.logDebug(`Stopping Godot process: ${instanceId}`);
+      try {
+        process.process.kill();
+        const result = {
+          instanceId: process.id,
+          projectPath: process.projectPath,
+          finalOutput: process.output,
+          finalErrors: process.errors,
+        };
+        this.activeProcesses.delete(instanceId);
+        return { success: true, result };
+      } catch (error) {
+        this.logDebug(`Error stopping process ${instanceId}: ${error}`);
+        return { success: false, error: `Failed to stop ${instanceId}: ${error}` };
+      }
+    };
+
+    // If instanceIds array is provided, stop those specific instances
+    if (args.instanceIds && Array.isArray(args.instanceIds) && args.instanceIds.length > 0) {
+      this.logDebug(`Stopping multiple Godot processes: ${args.instanceIds.join(', ')}`);
+      const stoppedInstances: any[] = [];
+      const errors: string[] = [];
+
+      for (const instanceId of args.instanceIds) {
+        const result = stopInstance(instanceId);
+        if (result.success && result.result) {
+          stoppedInstances.push(result.result);
+        } else if (result.error) {
+          errors.push(result.error);
+        }
+      }
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(
+              {
+                message: `Stopped ${stoppedInstances.length} of ${args.instanceIds.length} requested instances`,
+                stoppedInstances,
+                errors: errors.length > 0 ? errors : undefined,
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    }
+
+    // If single instanceId is provided, stop that specific instance
+    if (args.instanceId) {
+      const result = stopInstance(args.instanceId);
+      if (!result.success) {
         return this.createErrorResponse(
-          `No process found with instanceId: ${args.instanceId}`,
+          result.error || `Failed to stop instance: ${args.instanceId}`,
           [
             'Use list_processes to see all running instances',
             'Check if the instance has already exited',
           ]
         );
       }
-
-      this.logDebug(`Stopping Godot process: ${args.instanceId}`);
-      process.process.kill();
-      const output = process.output;
-      const errors = process.errors;
-      this.activeProcesses.delete(args.instanceId);
 
       return {
         content: [
@@ -1357,9 +1531,7 @@ class GodotServer {
             text: JSON.stringify(
               {
                 message: `Godot project instance "${args.instanceId}" stopped`,
-                instanceId: args.instanceId,
-                finalOutput: output,
-                finalErrors: errors,
+                ...result.result,
               },
               null,
               2
@@ -1434,8 +1606,10 @@ class GodotServer {
         instanceId: process.id,
         projectPath: process.projectPath,
         scene: process.scene,
+        args: process.args,
         startedAt: process.startedAt.toISOString(),
-        isRunning: !process.process.killed,
+        exitedAt: process.exitedAt?.toISOString(),
+        isRunning: process.isRunning,
         outputLines: process.output.length,
         errorLines: process.errors.length,
       });
@@ -1449,6 +1623,222 @@ class GodotServer {
             {
               count: processes.length,
               processes,
+            },
+            null,
+            2
+          ),
+        },
+      ],
+    };
+  }
+
+  /**
+   * Handle the run_multiple_projects tool
+   * Launches multiple Godot instances with optional staggered delays
+   */
+  private async handleRunMultipleProjects(args: any) {
+    // Normalize parameters to camelCase
+    args = this.normalizeParameters(args || {});
+
+    if (!args.instances || !Array.isArray(args.instances) || args.instances.length === 0) {
+      return this.createErrorResponse(
+        'instances array is required and must not be empty',
+        ['Provide an array of instance configurations with at least one entry']
+      );
+    }
+
+    // Ensure godotPath is set
+    if (!this.godotPath) {
+      await this.detectGodotPath();
+      if (!this.godotPath) {
+        return this.createErrorResponse(
+          'Could not find a valid Godot executable path',
+          [
+            'Ensure Godot is installed correctly',
+            'Set GODOT_PATH environment variable to specify the correct path',
+          ]
+        );
+      }
+    }
+
+    // Validate all instances first before launching any
+    const validatedInstances: InstanceConfig[] = [];
+    const validationErrors: string[] = [];
+
+    for (let i = 0; i < args.instances.length; i++) {
+      const instance = this.normalizeParameters(args.instances[i]) as InstanceConfig;
+      
+      if (!instance.projectPath) {
+        validationErrors.push(`Instance ${i}: projectPath is required`);
+        continue;
+      }
+
+      if (!this.validatePath(instance.projectPath)) {
+        validationErrors.push(`Instance ${i}: Invalid project path`);
+        continue;
+      }
+
+      const projectFile = join(instance.projectPath, 'project.godot');
+      if (!existsSync(projectFile)) {
+        validationErrors.push(`Instance ${i}: Not a valid Godot project: ${instance.projectPath}`);
+        continue;
+      }
+
+      // Generate instanceId if not provided
+      if (!instance.instanceId) {
+        instance.instanceId = `instance_${this.nextInstanceId++}`;
+      }
+
+      // Check for duplicate instanceId
+      if (this.activeProcesses.has(instance.instanceId)) {
+        validationErrors.push(`Instance ${i}: instanceId "${instance.instanceId}" is already in use`);
+        continue;
+      }
+
+      // Check for duplicates within this batch
+      if (validatedInstances.some(v => v.instanceId === instance.instanceId)) {
+        validationErrors.push(`Instance ${i}: duplicate instanceId "${instance.instanceId}" in batch`);
+        continue;
+      }
+
+      validatedInstances.push(instance);
+    }
+
+    if (validationErrors.length > 0) {
+      return this.createErrorResponse(
+        `Validation failed for ${validationErrors.length} instance(s):\n${validationErrors.join('\n')}`,
+        [
+          'Fix the validation errors and try again',
+          'Use list_processes to see currently running instances',
+        ]
+      );
+    }
+
+    // Sort instances by delayMs (ascending) for proper staggering
+    validatedInstances.sort((a, b) => (a.delayMs || 0) - (b.delayMs || 0));
+
+    // Launch instances with delays
+    const launchedInstances: any[] = [];
+    const launchErrors: string[] = [];
+
+    const launchInstance = (instance: InstanceConfig): { success: boolean; result?: any; error?: string } => {
+      try {
+        const cmdArgs = ['-d', '--path', instance.projectPath];
+        
+        if (instance.scene && this.validatePath(instance.scene)) {
+          cmdArgs.push(instance.scene);
+        }
+        
+        if (instance.args && Array.isArray(instance.args)) {
+          for (const arg of instance.args) {
+            if (typeof arg === 'string' && arg.trim() !== '') {
+              cmdArgs.push(arg);
+            }
+          }
+        }
+
+        this.logDebug(`Launching Godot instance: ${instance.instanceId} with args: ${cmdArgs.join(' ')}`);
+        const godotProcess = spawn(this.godotPath!, cmdArgs, { stdio: 'pipe' });
+        const output: string[] = [];
+        const errors: string[] = [];
+
+        const processInfo: GodotProcess = {
+          id: instance.instanceId!,
+          process: godotProcess,
+          output,
+          errors,
+          projectPath: instance.projectPath,
+          scene: instance.scene,
+          args: instance.args,
+          startedAt: new Date(),
+          isRunning: true,
+        };
+
+        godotProcess.stdout?.on('data', (data: Buffer) => {
+          const rawLines = data.toString().split('\n');
+          for (const line of rawLines) {
+            const cleaned = line.replace(/\r/g, '').trimEnd();
+            if (cleaned.length > 0) {
+              this.addToBoundedBuffer(processInfo.output, cleaned);
+              this.logDebug(`[Godot ${instance.instanceId} stdout] ${cleaned}`);
+            }
+          }
+        });
+
+        godotProcess.stderr?.on('data', (data: Buffer) => {
+          const rawLines = data.toString().split('\n');
+          for (const line of rawLines) {
+            const cleaned = line.replace(/\r/g, '').trimEnd();
+            if (cleaned.length > 0) {
+              this.addToBoundedBuffer(processInfo.errors, cleaned);
+              this.logDebug(`[Godot ${instance.instanceId} stderr] ${cleaned}`);
+            }
+          }
+        });
+
+        godotProcess.on('exit', (code: number | null) => {
+          this.logDebug(`Godot process ${instance.instanceId} exited with code ${code}`);
+          processInfo.isRunning = false;
+          processInfo.exitedAt = new Date();
+        });
+
+        godotProcess.on('error', (err: Error) => {
+          console.error(`Failed to start Godot process ${instance.instanceId}:`, err);
+          processInfo.errors.push(`Process error: ${err.message}`);
+          processInfo.isRunning = false;
+          processInfo.exitedAt = new Date();
+        });
+
+        this.activeProcesses.set(instance.instanceId!, processInfo);
+
+        return {
+          success: true,
+          result: {
+            instanceId: instance.instanceId,
+            projectPath: instance.projectPath,
+            scene: instance.scene,
+            args: instance.args,
+            delayMs: instance.delayMs || 0,
+          },
+        };
+      } catch (error: unknown) {
+        const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+        return { success: false, error: `Failed to launch ${instance.instanceId}: ${errorMessage}` };
+      }
+    };
+
+    // Launch with delays using async/await
+    const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+    let lastDelay = 0;
+
+    for (const instance of validatedInstances) {
+      const targetDelay = instance.delayMs || 0;
+      const waitTime = targetDelay - lastDelay;
+      
+      if (waitTime > 0) {
+        this.logDebug(`Waiting ${waitTime}ms before launching ${instance.instanceId}`);
+        await sleep(waitTime);
+      }
+      
+      lastDelay = targetDelay;
+
+      const result = launchInstance(instance);
+      if (result.success && result.result) {
+        launchedInstances.push(result.result);
+      } else if (result.error) {
+        launchErrors.push(result.error);
+      }
+    }
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(
+            {
+              message: `Launched ${launchedInstances.length} of ${validatedInstances.length} instances`,
+              launchedInstances,
+              errors: launchErrors.length > 0 ? launchErrors : undefined,
             },
             null,
             2
