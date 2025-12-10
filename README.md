@@ -65,8 +65,17 @@ This direct feedback loop helps AI assistants like Claude understand what works 
 
 - **Launch Godot Editor**: Open the Godot editor for a specific project
 - **Run Godot Projects**: Execute Godot projects in debug mode
-- **Capture Debug Output**: Retrieve console output and error messages
+  - **Multi-Instance Support**: Run multiple Godot instances simultaneously (e.g., dedicated server + multiple clients)
+  - **Batch Launch**: Launch multiple instances in a single call with `run_multiple_projects`
+  - **Staggered Startup**: Use `delayMs` to stagger instance launches (e.g., start server before clients)
+  - **Custom Command-Line Arguments**: Pass additional arguments to Godot (e.g., `--server`, `--headless`, `profile=X`, `port=Y`)
+  - **Instance Management**: Track and manage multiple running instances with unique IDs
+  - **Bounded Output Buffers**: Automatic memory management for long-running instances (keeps last 1000 lines)
+  - **Auto-Cleanup**: Stale exited processes are automatically cleaned up after 10 minutes
+- **Capture Debug Output**: Retrieve console output and error messages for specific instances or all instances
 - **Control Execution**: Start and stop Godot projects programmatically
+  - Stop individual instances, multiple specific instances, or all at once
+- **List Running Processes**: View all currently running Godot instances and their status
 - **Get Godot Version**: Retrieve the installed Godot version
 - **List Godot Projects**: Find Godot projects in a specified directory
 - **Project Analysis**: Get detailed information about project structure
@@ -120,6 +129,8 @@ Add to your Cline MCP settings file (`~/Library/Application Support/Code/User/gl
         "run_project",
         "get_debug_output",
         "stop_project",
+        "list_processes",
+        "run_multiple_projects",
         "get_godot_version",
         "list_projects",
         "get_project_info",
@@ -183,6 +194,20 @@ Once configured, your AI assistant will automatically run the MCP server when ne
 
 "Run my Godot project and show me any errors"
 
+"Run my Godot project as a dedicated server on port 8080 in headless mode"
+
+"Launch a client instance with custom profile connecting to localhost:8080"
+
+"Launch a server and two clients for my multiplayer game, with the server starting first"
+
+"List all currently running Godot instances"
+
+"Stop all client instances but keep the server running"
+
+"Get debug output for the server instance"
+
+"Stop the client instance with ID 'client1'"
+
 "Get information about my Godot project structure"
 
 "Analyze my Godot project structure and suggest improvements"
@@ -222,6 +247,62 @@ This architecture provides several benefits:
 - **Reduced Overhead**: Minimizes file I/O operations for better performance
 
 The bundled script accepts operation type and parameters as JSON, allowing for flexible and dynamic operation execution without generating temporary files for each operation.
+
+### Multi-Instance Support
+
+The MCP server supports running multiple Godot instances simultaneously, which is essential for multiplayer game development and testing:
+
+- **Instance IDs**: Each running instance can be assigned a unique identifier (e.g., "server", "client1", "client2") or use auto-generated IDs
+- **Command-Line Arguments**: Pass custom arguments to each instance (e.g., `--server`, `--headless`, `profile=X`, `port=Y`)
+- **Batch Launch**: Use `run_multiple_projects` to launch multiple instances in a single tool call
+- **Staggered Startup**: Use `delayMs` parameter to delay instance launches (e.g., start server 2 seconds before clients)
+- **Instance Management**: 
+  - Use `list_processes` to see all running instances and their status
+  - Use `get_debug_output` with an `instanceId` to get output for a specific instance
+  - Use `stop_project` with `instanceId` (single) or `instanceIds` (array) to stop specific instances, or without parameters to stop all
+
+**Example Workflow for Multiplayer Development:**
+
+**Option 1: Single Tool Call (Recommended)**
+
+Use `run_multiple_projects` to launch everything at once with staggered delays:
+
+```json
+{
+  "instances": [
+    {
+      "projectPath": "/path/to/project",
+      "instanceId": "server",
+      "args": ["--", "--server", "port=8080", "--headless"],
+      "delayMs": 0
+    },
+    {
+      "projectPath": "/path/to/project",
+      "instanceId": "client1",
+      "args": ["--", "profile=player1", "ip=127.0.0.1", "port=8080"],
+      "delayMs": 2000
+    },
+    {
+      "projectPath": "/path/to/project",
+      "instanceId": "client2",
+      "args": ["--", "profile=player2", "ip=127.0.0.1", "port=8080"],
+      "delayMs": 2000
+    }
+  ]
+}
+```
+
+**Option 2: Individual Tool Calls**
+
+1. Launch dedicated server: `run_project` with `instanceId: "server"` and `args: ["--", "--server", "port=8080", "--headless"]`
+2. Launch client instances: `run_project` with `instanceId: "client1"` and `args: ["--", "profile=player1", "ip=127.0.0.1", "port=8080"]`
+
+**Managing Instances:**
+
+- Monitor instances: Use `list_processes` to see all running instances
+- Get specific output: Use `get_debug_output` with `instanceId: "server"` to see server logs
+- Stop specific instances: Use `stop_project` with `instanceIds: ["client1", "client2"]` to stop multiple clients
+- Stop all instances: Use `stop_project` without parameters
 
 ## Troubleshooting
 
