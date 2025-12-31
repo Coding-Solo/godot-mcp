@@ -2185,7 +2185,7 @@ class GodotServer {
         }
       }
 
-      console.log(`[SERVER] Using Godot at: ${this.godotPath}`);
+      console.error(`[SERVER] Using Godot at: ${this.godotPath}`);
 
       const transport = new StdioServerTransport();
       await this.server.connect(transport);
