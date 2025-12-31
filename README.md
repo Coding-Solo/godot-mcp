@@ -167,6 +167,17 @@ Create a file at `.cursor/mcp.json` in your project directory with the following
 }
 ```
 
+#### Option C: Configure with Codex CLI
+
+Add a server entry to your Codex config (typically `~/.codex/config.toml`):
+
+```toml
+[mcp_servers.godot]
+command = "node"
+args = ["/absolute/path/to/godot-mcp/build/index.js"]
+env = { DEBUG = "true" }
+```
+
 ### Step 3: Optional Environment Variables
 
 You can customize the server behavior with these environment variables:
