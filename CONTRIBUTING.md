@@ -104,6 +104,17 @@ The following tools have been recently added:
   - Saves the screenshot to the specified path
   - Useful for visual debugging and feedback
 
+- **get_scene_insights**: Read scene files and identify nodes, scripts, signals, and how they interact
+  - Hierarchical node structure with attached script analysis (get_node_insights)
+  - Detects behavioral patterns: physics interactions, input handling, animation control
+  - Tracks signal connections and emissions across scene hierarchy
+
+- **get_node_insights**: Read GDScript files and identify classes, methods, signals, and dependencies
+  - Class structure including exports, signals, methods, and variables
+  - Dependency extraction from type hints, preloads, and resource paths
+  - Detects behavioral patterns: node queries, scene loading, tree manipulation
+  - Local variable type inference and method call analysis with context
+
 Example:
 
 ```typescript
