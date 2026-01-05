@@ -167,6 +167,31 @@ Create a file at `.cursor/mcp.json` in your project directory with the following
 }
 ```
 
+#### Option C: Configure with Claude Code
+
+Run the following command to add godot-mcp to the MCP servers available to Claude Code:
+
+```bash
+claude mcp add godot-mcp --transport stdio -- node /absolute/path/to/godot-mcp/build/index.js
+```
+
+Alternatively, edit the list of available MCP servers in `~/.claude.json`:
+
+```json
+"mcpServers": {
+  "godot-mcp": {
+    "type": "stdio",
+    "command": "node",
+    "args": [
+      "/absolute/path/to/godot-mcp/build/index.js"
+    ],
+    "env": {} // add optional environment variables here
+  }
+},
+```
+
+Restart Claude Code after adding the MCP configuration.
+
 ### Step 3: Optional Environment Variables
 
 You can customize the server behavior with these environment variables:
