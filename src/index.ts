@@ -775,7 +775,6 @@ class GodotServer {
               rootNodeType: {
                 type: 'string',
                 description: 'Type of the root node (e.g., Node2D, Node3D)',
-                default: 'Node2D',
               },
             },
             required: ['projectPath', 'scenePath'],
@@ -798,7 +797,6 @@ class GodotServer {
               parentNodePath: {
                 type: 'string',
                 description: 'Path to the parent node (e.g., "root" or "root/Player")',
-                default: 'root',
               },
               nodeType: {
                 type: 'string',
