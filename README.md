@@ -13,6 +13,8 @@
 [![](https://img.shields.io/github/forks/Coding-Solo/godot-mcp 'Forks')](https://github.com/Coding-Solo/godot-mcp/network/members)
 [![](https://img.shields.io/badge/License-MIT-red.svg 'MIT License')](https://opensource.org/licenses/MIT)
 
+[![Trust Score](https://archestra.ai/mcp-catalog/api/badge/quality/Coding-Solo/godot-mcp)](https://archestra.ai/mcp-catalog/coding-solo__godot-mcp)
+
 ```text
                            (((((((             (((((((                          
                         (((((((((((           (((((((((((                      
