@@ -9,7 +9,7 @@
 
 import { fileURLToPath } from 'url';
 import { join, dirname, basename, normalize } from 'path';
-import { existsSync, readdirSync, mkdirSync } from 'fs';
+import { existsSync, readdirSync, mkdirSync, writeFileSync, readFileSync, unlinkSync } from 'fs';
 import { spawn } from 'child_process';
 import { promisify } from 'util';
 import { exec } from 'child_process';
@@ -923,6 +923,24 @@ class GodotServer {
             required: ['projectPath'],
           },
         },
+        {
+          name: 'take_screenshot',
+          description: 'Take a screenshot of the running Godot project window. Returns the screenshot as a base64-encoded image or saves it to a file.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: {
+                type: 'string',
+                description: 'Path to the Godot project directory (used to determine save location if filePath not specified)',
+              },
+              filePath: {
+                type: 'string',
+                description: 'Optional: Absolute path to save the screenshot. If not provided, returns base64 image data.',
+              },
+            },
+            required: [],
+          },
+        },
       ],
     }));
 
@@ -958,6 +976,8 @@ class GodotServer {
           return await this.handleGetUid(request.params.arguments);
         case 'update_project_uids':
           return await this.handleUpdateProjectUids(request.params.arguments);
+        case 'take_screenshot':
+          return await this.handleTakeScreenshot(request.params.arguments);
         default:
           throw new McpError(
             ErrorCode.MethodNotFound,
@@ -2148,6 +2168,142 @@ class GodotServer {
           'Ensure Godot is installed correctly',
           'Check if the GODOT_PATH environment variable is set correctly',
           'Verify the project path is accessible',
+        ]
+      );
+    }
+  }
+
+  /**
+   * Handle the take_screenshot tool
+   * Takes a screenshot using Godot's native viewport capture
+   * Requires the ScreenshotManager autoload to be present in the project
+   */
+  private async handleTakeScreenshot(args: any) {
+    // Normalize parameters to camelCase
+    args = this.normalizeParameters(args);
+
+    try {
+      this.logDebug('Taking screenshot using Godot native capture...');
+
+      // Check if a project is running
+      if (!this.activeProcess) {
+        return this.createErrorResponse(
+          'No Godot project is currently running',
+          [
+            'Start a project first using run_project',
+            'The project must have the ScreenshotManager autoload installed',
+          ]
+        );
+      }
+
+      // Get project name from project.godot to find user:// directory
+      let projectName = 'Unknown Project';
+      const projectPath = args.projectPath || process.cwd();
+      const projectGodotPath = join(projectPath, 'project.godot');
+
+      if (existsSync(projectGodotPath)) {
+        const projectContent = readFileSync(projectGodotPath, 'utf-8');
+        const nameMatch = projectContent.match(/config\/name="([^"]+)"/);
+        if (nameMatch) {
+          projectName = nameMatch[1];
+        }
+      }
+
+      // Determine user:// directory based on OS
+      let userDataDir: string;
+      if (process.platform === 'win32') {
+        userDataDir = join(process.env.APPDATA || '', 'Godot', 'app_userdata', projectName);
+      } else if (process.platform === 'darwin') {
+        userDataDir = join(process.env.HOME || '', 'Library', 'Application Support', 'Godot', 'app_userdata', projectName);
+      } else {
+        userDataDir = join(process.env.HOME || '', '.local', 'share', 'godot', 'app_userdata', projectName);
+      }
+
+      this.logDebug(`User data directory: ${userDataDir}`);
+
+      // Ensure user data directory exists
+      if (!existsSync(userDataDir)) {
+        mkdirSync(userDataDir, { recursive: true });
+      }
+
+      const requestFile = join(userDataDir, 'mcp_screenshot_request.txt');
+      const outputFile = join(userDataDir, 'mcp_screenshot.png');
+
+      // Remove any existing screenshot
+      if (existsSync(outputFile)) {
+        unlinkSync(outputFile);
+      }
+
+      // Create the screenshot request file
+      writeFileSync(requestFile, 'take_screenshot');
+      this.logDebug(`Screenshot request created: ${requestFile}`);
+
+      // Wait for the screenshot to be taken (poll for up to 5 seconds)
+      const maxWaitTime = 5000;
+      const pollInterval = 100;
+      let waited = 0;
+
+      while (waited < maxWaitTime) {
+        await new Promise(resolve => setTimeout(resolve, pollInterval));
+        waited += pollInterval;
+
+        if (existsSync(outputFile)) {
+          this.logDebug('Screenshot file found!');
+          break;
+        }
+      }
+
+      if (!existsSync(outputFile)) {
+        return this.createErrorResponse(
+          'Screenshot request timed out',
+          [
+            'Make sure the ScreenshotManager autoload is installed in your project',
+            'Add this to your project.godot under [autoload]:',
+            'ScreenshotManager="*res://scripts/screenshot_manager.gd"',
+            'The project must be running for screenshots to work',
+          ]
+        );
+      }
+
+      // Read the screenshot
+      const imgBuffer = readFileSync(outputFile);
+      this.logDebug(`Screenshot read: ${imgBuffer.length} bytes`);
+
+      // If a specific file path is requested, copy there
+      if (args.filePath) {
+        const savePath = normalize(args.filePath);
+        writeFileSync(savePath, imgBuffer);
+        this.logDebug(`Screenshot copied to: ${savePath}`);
+
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `Screenshot saved successfully to: ${savePath}`,
+            },
+          ],
+        };
+      }
+
+      // Return as base64 image
+      const base64Image = imgBuffer.toString('base64');
+
+      return {
+        content: [
+          {
+            type: 'image',
+            data: base64Image,
+            mimeType: 'image/png',
+          },
+        ],
+      };
+    } catch (error: any) {
+      return this.createErrorResponse(
+        `Failed to take screenshot: ${error?.message || 'Unknown error'}`,
+        [
+          'Ensure a Godot project is running (use run_project first)',
+          'Make sure the ScreenshotManager autoload is installed',
+          'Check if the project has proper write permissions',
         ]
       );
     }
