@@ -9,7 +9,7 @@
 
 import { fileURLToPath } from 'url';
 import { join, dirname, basename, normalize } from 'path';
-import { existsSync, readdirSync, mkdirSync } from 'fs';
+import { existsSync, readdirSync, mkdirSync, writeFileSync, readFileSync, unlinkSync, copyFileSync } from 'fs';
 import { spawn } from 'child_process';
 import { promisify } from 'util';
 import { exec } from 'child_process';
@@ -67,6 +67,7 @@ class GodotServer {
   private activeProcess: GodotProcess | null = null;
   private godotPath: string | null = null;
   private operationsScriptPath: string;
+  private screenshotManagerScriptPath: string;
   private validatedPaths: Map<string, boolean> = new Map();
   private strictPathValidation: boolean = false;
 
@@ -135,6 +136,10 @@ class GodotServer {
     // Set the path to the operations script
     this.operationsScriptPath = join(__dirname, 'scripts', 'godot_operations.gd');
     if (debugMode) console.error(`[DEBUG] Operations script path: ${this.operationsScriptPath}`);
+
+    // Set the path to the screenshot manager script
+    this.screenshotManagerScriptPath = join(__dirname, 'scripts', 'screenshot_manager.gd');
+    if (debugMode) console.error(`[DEBUG] Screenshot manager script path: ${this.screenshotManagerScriptPath}`);
 
     // Initialize the MCP server
     this.server = new Server(
@@ -923,6 +928,38 @@ class GodotServer {
             required: ['projectPath'],
           },
         },
+        {
+          name: 'take_screenshot',
+          description: 'Take a screenshot of the running Godot project window. Returns the screenshot as a base64-encoded image or saves it to a file. Requires the ScreenshotManager autoload to be installed (use setup_screenshot_manager first). Wait for the game to fully load before calling this tool, otherwise it may timeout.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: {
+                type: 'string',
+                description: 'Path to the Godot project directory (used to determine save location if filePath not specified)',
+              },
+              filePath: {
+                type: 'string',
+                description: 'Optional: Absolute path to save the screenshot. If not provided, returns base64 image data.',
+              },
+            },
+            required: [],
+          },
+        },
+        {
+          name: 'setup_screenshot_manager',
+          description: 'Install the ScreenshotManager autoload in a Godot project to enable screenshot capture. This copies the screenshot_manager.gd script to the project and configures it as an autoload.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: {
+                type: 'string',
+                description: 'Path to the Godot project directory',
+              },
+            },
+            required: ['projectPath'],
+          },
+        },
       ],
     }));
 
@@ -958,6 +995,10 @@ class GodotServer {
           return await this.handleGetUid(request.params.arguments);
         case 'update_project_uids':
           return await this.handleUpdateProjectUids(request.params.arguments);
+        case 'take_screenshot':
+          return await this.handleTakeScreenshot(request.params.arguments);
+        case 'setup_screenshot_manager':
+          return await this.handleSetupScreenshotManager(request.params.arguments);
         default:
           throw new McpError(
             ErrorCode.MethodNotFound,
@@ -2148,6 +2189,262 @@ class GodotServer {
           'Ensure Godot is installed correctly',
           'Check if the GODOT_PATH environment variable is set correctly',
           'Verify the project path is accessible',
+        ]
+      );
+    }
+  }
+
+  /**
+   * Handle the take_screenshot tool
+   * Takes a screenshot using Godot's native viewport capture
+   * Requires the ScreenshotManager autoload to be present in the project
+   */
+  private async handleTakeScreenshot(args: any) {
+    // Normalize parameters to camelCase
+    args = this.normalizeParameters(args);
+
+    try {
+      this.logDebug('Taking screenshot using Godot native capture...');
+
+      // Check if a project is running
+      if (!this.activeProcess) {
+        return this.createErrorResponse(
+          'No Godot project is currently running',
+          [
+            'Start a project first using run_project',
+            'The project must have the ScreenshotManager autoload installed',
+          ]
+        );
+      }
+
+      // Get project name from project.godot to find user:// directory
+      let projectName = 'Unknown Project';
+      const projectPath = args.projectPath || process.cwd();
+      const projectGodotPath = join(projectPath, 'project.godot');
+
+      if (existsSync(projectGodotPath)) {
+        const projectContent = readFileSync(projectGodotPath, 'utf-8');
+        const nameMatch = projectContent.match(/config\/name="([^"]+)"/);
+        if (nameMatch) {
+          projectName = nameMatch[1];
+        }
+      }
+
+      // Determine user:// directory based on OS
+      let userDataDir: string;
+      if (process.platform === 'win32') {
+        userDataDir = join(process.env.APPDATA || '', 'Godot', 'app_userdata', projectName);
+      } else if (process.platform === 'darwin') {
+        userDataDir = join(process.env.HOME || '', 'Library', 'Application Support', 'Godot', 'app_userdata', projectName);
+      } else {
+        userDataDir = join(process.env.HOME || '', '.local', 'share', 'godot', 'app_userdata', projectName);
+      }
+
+      this.logDebug(`User data directory: ${userDataDir}`);
+
+      // Ensure user data directory exists
+      if (!existsSync(userDataDir)) {
+        mkdirSync(userDataDir, { recursive: true });
+      }
+
+      const requestFile = join(userDataDir, 'mcp_screenshot_request.txt');
+      const outputFile = join(userDataDir, 'mcp_screenshot.png');
+
+      // Remove any existing screenshot
+      if (existsSync(outputFile)) {
+        unlinkSync(outputFile);
+      }
+
+      // Create the screenshot request file
+      writeFileSync(requestFile, 'take_screenshot');
+      this.logDebug(`Screenshot request created: ${requestFile}`);
+
+      // Wait for the screenshot to be taken (poll for up to 5 seconds)
+      const maxWaitTime = 5000;
+      const pollInterval = 100;
+      let waited = 0;
+
+      while (waited < maxWaitTime) {
+        await new Promise(resolve => setTimeout(resolve, pollInterval));
+        waited += pollInterval;
+
+        if (existsSync(outputFile)) {
+          this.logDebug('Screenshot file found!');
+          break;
+        }
+      }
+
+      if (!existsSync(outputFile)) {
+        return this.createErrorResponse(
+          'Screenshot request timed out',
+          [
+            'Make sure the ScreenshotManager autoload is installed in your project',
+            'Run the setup_screenshot_manager tool first to install it automatically',
+            'Or manually add to your project.godot under [autoload]:',
+            'ScreenshotManager="*res://addons/godot_mcp/screenshot_manager.gd"',
+            'The project must be running for screenshots to work',
+          ]
+        );
+      }
+
+      // Read the screenshot
+      const imgBuffer = readFileSync(outputFile);
+      this.logDebug(`Screenshot read: ${imgBuffer.length} bytes`);
+
+      // If a specific file path is requested, copy there
+      if (args.filePath) {
+        const savePath = normalize(args.filePath);
+        writeFileSync(savePath, imgBuffer);
+        this.logDebug(`Screenshot copied to: ${savePath}`);
+
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `Screenshot saved successfully to: ${savePath}`,
+            },
+          ],
+        };
+      }
+
+      // Return as base64 image
+      const base64Image = imgBuffer.toString('base64');
+
+      return {
+        content: [
+          {
+            type: 'image',
+            data: base64Image,
+            mimeType: 'image/png',
+          },
+        ],
+      };
+    } catch (error: any) {
+      return this.createErrorResponse(
+        `Failed to take screenshot: ${error?.message || 'Unknown error'}`,
+        [
+          'Ensure a Godot project is running (use run_project first)',
+          'Make sure the ScreenshotManager autoload is installed (use setup_screenshot_manager tool)',
+          'Check if the project has proper write permissions',
+        ]
+      );
+    }
+  }
+
+  /**
+   * Handle the setup_screenshot_manager tool
+   * Installs the ScreenshotManager autoload script into a Godot project
+   */
+  private async handleSetupScreenshotManager(args: any) {
+    // Normalize parameters to camelCase
+    args = this.normalizeParameters(args);
+
+    if (!args.projectPath) {
+      return this.createErrorResponse(
+        'Project path is required',
+        ['Provide a valid path to a Godot project directory']
+      );
+    }
+
+    if (!this.validatePath(args.projectPath)) {
+      return this.createErrorResponse(
+        'Invalid project path',
+        ['Provide a valid path without ".." or other potentially unsafe characters']
+      );
+    }
+
+    try {
+      // Check if the project directory exists and contains a project.godot file
+      const projectGodotPath = join(args.projectPath, 'project.godot');
+      if (!existsSync(projectGodotPath)) {
+        return this.createErrorResponse(
+          `Not a valid Godot project: ${args.projectPath}`,
+          [
+            'Ensure the path points to a directory containing a project.godot file',
+            'Use list_projects to find valid Godot projects',
+          ]
+        );
+      }
+
+      // Check if the source script exists
+      if (!existsSync(this.screenshotManagerScriptPath)) {
+        return this.createErrorResponse(
+          'Screenshot manager script not found in MCP server bundle',
+          [
+            'Reinstall the godot-mcp package',
+            'Ensure the build process completed successfully',
+          ]
+        );
+      }
+
+      // Create the target directory: res://addons/godot_mcp/
+      const addonsDir = join(args.projectPath, 'addons');
+      const godotMcpDir = join(addonsDir, 'godot_mcp');
+
+      if (!existsSync(addonsDir)) {
+        mkdirSync(addonsDir);
+        this.logDebug(`Created addons directory: ${addonsDir}`);
+      }
+
+      if (!existsSync(godotMcpDir)) {
+        mkdirSync(godotMcpDir);
+        this.logDebug(`Created godot_mcp directory: ${godotMcpDir}`);
+      }
+
+      // Copy the screenshot manager script
+      const targetScriptPath = join(godotMcpDir, 'screenshot_manager.gd');
+      copyFileSync(this.screenshotManagerScriptPath, targetScriptPath);
+      this.logDebug(`Copied screenshot_manager.gd to: ${targetScriptPath}`);
+
+      // Update project.godot to add the autoload
+      let projectContent = readFileSync(projectGodotPath, 'utf-8');
+      const autoloadEntry = 'ScreenshotManager="*res://addons/godot_mcp/screenshot_manager.gd"';
+
+      // Check if autoload section exists
+      if (projectContent.includes('[autoload]')) {
+        // Check if ScreenshotManager is already configured
+        if (projectContent.includes('ScreenshotManager=')) {
+          // Update existing entry
+          projectContent = projectContent.replace(
+            /ScreenshotManager="[^"]*"/,
+            autoloadEntry
+          );
+          this.logDebug('Updated existing ScreenshotManager autoload entry');
+        } else {
+          // Add new entry after [autoload] section header
+          projectContent = projectContent.replace(
+            '[autoload]',
+            `[autoload]\n\n${autoloadEntry}`
+          );
+          this.logDebug('Added ScreenshotManager to existing [autoload] section');
+        }
+      } else {
+        // Add new autoload section at the end of the file
+        projectContent += `\n[autoload]\n\n${autoloadEntry}\n`;
+        this.logDebug('Created new [autoload] section with ScreenshotManager');
+      }
+
+      // Write the updated project.godot
+      writeFileSync(projectGodotPath, projectContent);
+      this.logDebug('Updated project.godot with ScreenshotManager autoload');
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `ScreenshotManager installed successfully!\n\n` +
+              `Script copied to: res://addons/godot_mcp/screenshot_manager.gd\n` +
+              `Autoload configured in project.godot\n\n` +
+              `Note: If the project is currently running in the editor, you may need to reload it for the autoload to take effect.`,
+          },
+        ],
+      };
+    } catch (error: any) {
+      return this.createErrorResponse(
+        `Failed to setup screenshot manager: ${error?.message || 'Unknown error'}`,
+        [
+          'Ensure you have write permissions to the project directory',
+          'Check if the project.godot file is not locked by another process',
         ]
       );
     }
