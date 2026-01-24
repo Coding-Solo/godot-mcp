@@ -26,3 +26,8 @@ Thumbs.db
 
 # Coverage directory
 coverage/
+
+# Claude Code
+.claude/
+.subtask/
+CLAUDE.md

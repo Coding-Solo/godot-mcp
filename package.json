@@ -17,9 +17,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "0.6.0",
-    "axios": "^1.7.9",
-    "fs-extra": "^11.2.0",
-    "screenshot-desktop": "^1.15.3"
+    "fs-extra": "^11.2.0"
   },
   "devDependencies": {
     "@types/node": "^20.11.24",
