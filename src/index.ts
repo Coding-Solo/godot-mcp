@@ -10,9 +10,8 @@
 import { fileURLToPath } from 'url';
 import { join, dirname, basename, normalize } from 'path';
 import { existsSync, readdirSync, mkdirSync } from 'fs';
-import { spawn } from 'child_process';
+import { spawn, execFile } from 'child_process';
 import { promisify } from 'util';
-import { exec } from 'child_process';
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
@@ -27,7 +26,7 @@ import {
 const DEBUG_MODE: boolean = process.env.DEBUG === 'true';
 const GODOT_DEBUG_MODE: boolean = true; // Always use GODOT DEBUG MODE
 
-const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
 
 // Derive __filename and __dirname in ESM
 const __filename = fileURLToPath(import.meta.url);
@@ -252,8 +251,8 @@ class GodotServer {
       }
 
       // Try to execute Godot with --version flag
-      const command = path === 'godot' ? 'godot --version' : `"${path}" --version`;
-      await execAsync(command);
+      // Using execFileAsync with argument array to prevent command injection
+      await execFileAsync(path, ['--version']);
 
       this.logDebug(`Valid Godot path: ${path}`);
       this.validatedPaths.set(path, true);
@@ -496,45 +495,36 @@ class GodotServer {
     try {
       // Serialize the snake_case parameters to a valid JSON string
       const paramsJson = JSON.stringify(snakeCaseParams);
-      // Escape single quotes in the JSON string to prevent command injection
-      const escapedParams = paramsJson.replace(/'/g, "'\\''");
-      // On Windows, cmd.exe does not strip single quotes, so we use
-      // double quotes and escape them to ensure the JSON is parsed
-      // correctly by Godot.
-      const isWindows = process.platform === 'win32';
-      const quotedParams = isWindows
-        ? `\"${paramsJson.replace(/\"/g, '\\"')}\"`
-        : `'${escapedParams}'`;
 
-
-      // Add debug arguments if debug mode is enabled
-      const debugArgs = GODOT_DEBUG_MODE ? ['--debug-godot'] : [];
-
-      // Construct the command with the operation and JSON parameters
-      const cmd = [
-        `"${this.godotPath}"`,
+      // Build argument array for execFile to prevent command injection
+      // Using execFile with argument arrays avoids shell interpretation entirely
+      const args = [
         '--headless',
         '--path',
-        `"${projectPath}"`,
+        projectPath,  // Safe: passed as argument, not interpolated into shell command
         '--script',
-        `"${this.operationsScriptPath}"`,
+        this.operationsScriptPath,
         operation,
-        quotedParams, // Pass the JSON string as a single argument
-        ...debugArgs,
-      ].join(' ');
+        paramsJson,  // Safe: passed as argument, not interpreted by shell
+      ];
 
-      this.logDebug(`Command: ${cmd}`);
+      
+      if (GODOT_DEBUG_MODE) {
+        args.push('--debug-godot');
+      }
 
-      const { stdout, stderr } = await execAsync(cmd);
+      this.logDebug(`Executing: ${this.godotPath} ${args.join(' ')}`);
 
-      return { stdout, stderr };
+      const { stdout, stderr } = await execFileAsync(this.godotPath!, args);
+
+      return { stdout: stdout ?? '', stderr: stderr ?? '' };
     } catch (error: unknown) {
-      // If execAsync throws, it still contains stdout/stderr
+      // If execFileAsync throws, it still contains stdout/stderr
       if (error instanceof Error && 'stdout' in error && 'stderr' in error) {
         const execError = error as Error & { stdout: string; stderr: string };
         return {
-          stdout: execError.stdout,
-          stderr: execError.stderr,
+          stdout: execError.stdout ?? '',
+          stderr: execError.stderr ?? '',
         };
       }
 
@@ -1240,7 +1230,7 @@ class GodotServer {
       }
 
       this.logDebug('Getting Godot version');
-      const { stdout } = await execAsync(`"${this.godotPath}" --version`);
+      const { stdout } = await execFileAsync(this.godotPath!, ['--version']);
       return {
         content: [
           {
@@ -1427,7 +1417,7 @@ class GodotServer {
   
       // Get Godot version
       const execOptions = { timeout: 10000 }; // 10 second timeout
-      const { stdout } = await execAsync(`"${this.godotPath}" --version`, execOptions);
+      const { stdout } = await execFileAsync(this.godotPath!, ['--version'], execOptions);
   
       // Get project structure using the recursive method
       const projectStructure = await this.getProjectStructureAsync(args.projectPath);
@@ -2002,7 +1992,7 @@ class GodotServer {
       }
 
       // Get Godot version to check if UIDs are supported
-      const { stdout: versionOutput } = await execAsync(`"${this.godotPath}" --version`);
+      const { stdout: versionOutput } = await execFileAsync(this.godotPath!, ['--version']);
       const version = versionOutput.trim();
 
       if (!this.isGodot44OrLater(version)) {
@@ -2102,7 +2092,7 @@ class GodotServer {
       }
 
       // Get Godot version to check if UIDs are supported
-      const { stdout: versionOutput } = await execAsync(`"${this.godotPath}" --version`);
+      const { stdout: versionOutput } = await execFileAsync(this.godotPath!, ['--version']);
       const version = versionOutput.trim();
 
       if (!this.isGodot44OrLater(version)) {
