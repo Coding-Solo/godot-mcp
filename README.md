@@ -80,6 +80,33 @@ This direct feedback loop helps AI assistants like Claude understand what works 
   - Get UID for specific files
   - Update UID references by resaving resources
 
+### GUT Test Tools
+
+Tools for running [GUT](https://github.com/bitwes/Gut) tests from your assistant:
+
+- run_unit_tests_file: Run a single unit test script headless
+  - Args: `projectPath`, `test`, optional `includeSubdirs` (default true), `log`
+  - Example `test`: `res://test/unit/ui/test_target_selection_basic.gd`
+
+- run_unit_tests_dir: Run all unit tests in a directory headless
+  - Args: `projectPath`, `dir`, optional `includeSubdirs` (default true), `log`
+  - Example `dir`: `res://test/unit/ui`
+
+- run_unit_tests_all: Run all unit tests under `res://test/unit/` headless
+  - Args: `projectPath`, optional `includeSubdirs` (default true), `log`
+
+- run_integration_tests_file: Run a single integration test with display
+  - Args: `projectPath`, `test`, optional `includeSubdirs` (default true), `glog`
+  - Note: Does not use `--headless`. Prefer `glog: 0` for clean output.
+
+- run_integration_tests_dir: Run all integration tests in a directory with display
+  - Args: `projectPath`, `dir`, optional `includeSubdirs` (default true), `glog`
+
+- run_integration_tests_all: Run all integration tests under `res://test/integration/` with display
+  - Args: `projectPath`, optional `includeSubdirs` (default true), `glog`
+
+On macOS, the server auto-detects `/Applications/Godot.app/Contents/MacOS/Godot` if present. Otherwise set `GODOT_PATH` or ensure `godot` is in your `PATH`.
+
 ## Requirements
 
 - [Godot Engine](https://godotengine.org/download) installed on your system

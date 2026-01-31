@@ -89,6 +89,21 @@ class GodotServer {
     'directory': 'directory',
     'recursive': 'recursive',
     'scene': 'scene',
+    // GUT-related params
+    'test': 'test',
+    'dir': 'dir',
+    'include_subdirs': 'includeSubdirs',
+    'headless': 'headless',
+    'log': 'log',
+    'glog': 'glog',
+    'select': 'select',
+    'unit_test_name': 'unitTestName',
+    'gconfig': 'gconfig',
+    'inner_class': 'innerClass',
+    'prefix': 'prefix',
+    'suffix': 'suffix',
+    'hide_orphans': 'hideOrphans',
+    'exit': 'exit',
   };
 
   /**
@@ -672,6 +687,88 @@ class GodotServer {
           },
         },
         {
+          name: 'run_unit_tests_file',
+          description: 'Run a single GUT unit test file (headless)',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: { type: 'string', description: 'Path to the Godot project directory' },
+              test: { type: 'string', description: 'Full res:// path to test script' },
+              includeSubdirs: { type: 'boolean', description: 'Include subdirectories when applicable', default: true },
+              log: { type: 'number', description: 'GUT log level (default 1)' },
+            },
+            required: ['projectPath', 'test'],
+          },
+        },
+        {
+          name: 'run_unit_tests_dir',
+          description: 'Run all GUT unit tests in a directory (headless)',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: { type: 'string', description: 'Path to the Godot project directory' },
+              dir: { type: 'string', description: 'res:// directory containing tests' },
+              includeSubdirs: { type: 'boolean', description: 'Include subdirectories', default: true },
+              log: { type: 'number', description: 'GUT log level (default 1)' },
+            },
+            required: ['projectPath', 'dir'],
+          },
+        },
+        {
+          name: 'run_unit_tests_all',
+          description: 'Run all GUT unit tests under res://test/unit (headless)',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: { type: 'string', description: 'Path to the Godot project directory' },
+              includeSubdirs: { type: 'boolean', description: 'Include subdirectories', default: true },
+              log: { type: 'number', description: 'GUT log level (default 1)' },
+            },
+            required: ['projectPath'],
+          },
+        },
+        {
+          name: 'run_integration_tests_file',
+          description: 'Run a single GUT integration test file (with display)',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: { type: 'string', description: 'Path to the Godot project directory' },
+              test: { type: 'string', description: 'Full res:// path to test script' },
+              includeSubdirs: { type: 'boolean', description: 'Include subdirectories when applicable', default: true },
+              glog: { type: 'number', description: 'GUT log level (suggest 0 for clean output)' },
+            },
+            required: ['projectPath', 'test'],
+          },
+        },
+        {
+          name: 'run_integration_tests_dir',
+          description: 'Run all GUT integration tests in a directory (with display)',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: { type: 'string', description: 'Path to the Godot project directory' },
+              dir: { type: 'string', description: 'res:// directory containing tests' },
+              includeSubdirs: { type: 'boolean', description: 'Include subdirectories', default: true },
+              glog: { type: 'number', description: 'GUT log level (suggest 0 for clean output)' },
+            },
+            required: ['projectPath', 'dir'],
+          },
+        },
+        {
+          name: 'run_integration_tests_all',
+          description: 'Run all GUT integration tests under res://test/integration (with display)',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: { type: 'string', description: 'Path to the Godot project directory' },
+              includeSubdirs: { type: 'boolean', description: 'Include subdirectories', default: true },
+              glog: { type: 'number', description: 'GUT log level (suggest 0 for clean output)' },
+            },
+            required: ['projectPath'],
+          },
+        },
+        {
           name: 'run_project',
           description: 'Run the Godot project and capture output',
           inputSchema: {
@@ -948,14 +1045,26 @@ class GodotServer {
           return await this.handleGetUid(request.params.arguments);
         case 'update_project_uids':
           return await this.handleUpdateProjectUids(request.params.arguments);
+        case 'run_unit_tests_file':
+          return await this.handleRunUnitTestsFile(request.params.arguments);
+        case 'run_unit_tests_dir':
+          return await this.handleRunUnitTestsDir(request.params.arguments);
+        case 'run_unit_tests_all':
+          return await this.handleRunUnitTestsAll(request.params.arguments);
+        case 'run_integration_tests_file':
+          return await this.handleRunIntegrationTestsFile(request.params.arguments);
+        case 'run_integration_tests_dir':
+          return await this.handleRunIntegrationTestsDir(request.params.arguments);
+        case 'run_integration_tests_all':
+          return await this.handleRunIntegrationTestsAll(request.params.arguments);
         default:
           throw new McpError(
             ErrorCode.MethodNotFound,
             `Unknown tool: ${request.params.name}`
-          );
-      }
-    });
-  }
+	  );
+	}
+      });
+    }
 
   /**
    * Handle the launch_editor tool
@@ -1208,6 +1317,153 @@ class GodotServer {
         },
       ],
     };
+  }
+
+  /**
+   * Internal helper to run GUT tests with configurable flags
+   */
+  private async runGutTestsInternal(args: any, opts: { headless: boolean; defaultDir?: string }): Promise<any> {
+    // Normalize to camelCase
+    args = this.normalizeParameters(args || {});
+
+    if (!args.projectPath) {
+      return this.createErrorResponse('Project path is required', [
+        'Provide a valid path to a Godot project directory',
+      ]);
+    }
+    if (!this.validatePath(args.projectPath)) {
+      return this.createErrorResponse('Invalid project path', [
+        'Provide a valid path without ".." or other potentially unsafe characters',
+      ]);
+    }
+
+    try {
+      // Ensure Godot path
+      if (!this.godotPath) {
+        await this.detectGodotPath();
+        if (!this.godotPath) {
+          return this.createErrorResponse('Could not find a valid Godot executable path', [
+            'Ensure Godot is installed correctly',
+            'Set GODOT_PATH environment variable to specify the correct path',
+          ]);
+        }
+      }
+
+      // Validate project
+      const projectFile = join(args.projectPath, 'project.godot');
+      if (!existsSync(projectFile)) {
+        return this.createErrorResponse(`Not a valid Godot project: ${args.projectPath}`, [
+          'Ensure the path points to a directory containing a project.godot file',
+          'Use list_projects to find valid Godot projects',
+        ]);
+      }
+
+      // Build command args
+      const cmdArgs: string[] = [];
+      if (opts.headless) {
+        cmdArgs.push('--headless');
+      }
+      cmdArgs.push('--path', args.projectPath, '-s', 'addons/gut/gut_cmdln.gd');
+
+      const toComma = (v: string | string[] | undefined) =>
+        Array.isArray(v) ? v.join(',') : v;
+
+      // Determine selectors
+      const testVal = toComma(args.test);
+      const dirVal = toComma(args.dir ?? opts.defaultDir);
+      if (testVal) cmdArgs.push(`-gtest=${testVal}`);
+      if (dirVal) cmdArgs.push(`-gdir=${dirVal}`);
+
+      // Common flags
+      const includeSubdirs = args.includeSubdirs !== false; // default true
+      if (includeSubdirs) cmdArgs.push('-ginclude_subdirs=true');
+
+      // Exit after run by default
+      if (args.exit !== false) cmdArgs.push('-gexit');
+
+      // Log level: prefer explicit glog, then log
+      if (typeof args.glog === 'number') cmdArgs.push(`-glog=${args.glog}`);
+      else if (typeof args.log === 'number') cmdArgs.push(`-glog=${args.log}`);
+
+      if (args.select) cmdArgs.push(`-gselect=${args.select}`);
+      if (args.unitTestName) cmdArgs.push(`-gunit_test_name=${args.unitTestName}`);
+      if (args.gconfig) cmdArgs.push(`-gconfig=${args.gconfig}`);
+      if (args.innerClass) cmdArgs.push(`-ginner_class=${args.innerClass}`);
+      if (args.prefix) cmdArgs.push(`-gprefix=${args.prefix}`);
+      if (args.suffix) cmdArgs.push(`-gsuffix=${args.suffix}`);
+      if (args.hideOrphans === true) cmdArgs.push(`-ghide_orphans=true`);
+
+      this.logDebug(`Running GUT with args: ${JSON.stringify(cmdArgs)}`);
+
+      const child = spawn(this.godotPath!, cmdArgs, { stdio: 'pipe' });
+      let stdoutBuf = '';
+      let stderrBuf = '';
+      let exitCode: number | null = null;
+
+      await new Promise<void>((resolve) => {
+        child.stdout?.on('data', (d: Buffer) => (stdoutBuf += d.toString()))
+        child.stderr?.on('data', (d: Buffer) => (stderrBuf += d.toString()))
+        child.on('close', (code: number | null) => { exitCode = code; resolve(); })
+      });
+
+      const out = stdoutBuf.trim();
+      const err = stderrBuf.trim();
+
+      // Determine failure strictly by process exit code.
+      // GUT returns non-zero on failures; engine warnings/noise may appear on stderr.
+      const isFailure = (exitCode === null) || (exitCode !== 0);
+
+      if (isFailure) {
+        return this.createErrorResponse(
+          `GUT tests reported failures.\n\nSTDOUT:\n${out}\n\nSTDERR:\n${err}`,
+          [
+            'Review the output for failing assertions',
+            'Use glog=0 for less verbose await output (integration)',
+          ]
+        );
+      }
+
+      return {
+        content: [
+          { type: 'text', text: `STDOUT:\n${out || '(empty)'}\n\nSTDERR:\n${err || '(empty)'}\n\nExit code: ${exitCode === null ? 'unknown' : exitCode}` },
+        ],
+      };
+    } catch (error: unknown) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      return this.createErrorResponse(`Failed to run GUT tests: ${errorMessage}`, [
+        'Ensure Godot and GUT are installed in the project',
+        'Verify addons/gut/gut_cmdln.gd exists in the project',
+      ]);
+    }
+  }
+
+  private async handleRunUnitTestsFile(args: any) {
+    return this.runGutTestsInternal(args, { headless: true });
+  }
+
+  private async handleRunUnitTestsDir(args: any) {
+    return this.runGutTestsInternal(args, { headless: true });
+  }
+
+  private async handleRunUnitTestsAll(args: any) {
+    const merged = { ...args, dir: 'res://test/unit/' };
+    return this.runGutTestsInternal(merged, { headless: true, defaultDir: 'res://test/unit/' });
+  }
+
+  private async handleRunIntegrationTestsFile(args: any) {
+    // For integration tests, do NOT use --headless; default glog=0 for clean output
+    const merged = { glog: 0, ...args };
+    return this.runGutTestsInternal(merged, { headless: false });
+  }
+
+  private async handleRunIntegrationTestsDir(args: any) {
+    const merged = { glog: 0, ...args };
+    return this.runGutTestsInternal(merged, { headless: false });
+  }
+
+  private async handleRunIntegrationTestsAll(args: any) {
+    const merged = { glog: 0, ...args, dir: 'res://test/integration/' };
+    return this.runGutTestsInternal(merged, { headless: false, defaultDir: 'res://test/integration/' });
   }
 
   /**
