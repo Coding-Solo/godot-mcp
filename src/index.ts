@@ -76,6 +76,7 @@ class GodotServer {
   private parameterMappings: Record<string, string> = {
     'project_path': 'projectPath',
     'scene_path': 'scenePath',
+    'script_path': 'scriptPath',
     'root_node_type': 'rootNodeType',
     'parent_node_path': 'parentNodePath',
     'node_type': 'nodeType',
@@ -89,6 +90,13 @@ class GodotServer {
     'directory': 'directory',
     'recursive': 'recursive',
     'scene': 'scene',
+    'include_properties': 'includeProperties',
+    'include_connections': 'includeConnections',
+    'include_script_insights': 'includeScriptInsights',
+    'include_dependencies': 'includeDependencies',
+    'include_methods': 'includeMethods',
+    'include_variables': 'includeVariables',
+    'max_depth': 'maxDepth',
   };
 
   /**
@@ -533,6 +541,81 @@ class GodotServer {
   }
 
   /**
+   * Extract JSON from potentially contaminated output (with Godot startup messages)
+   * @param output The raw output from Godot
+   * @returns Clean JSON string
+   */
+  private extractJsonFromOutput(output: string): string {
+    const lines = output.split('\n');
+    
+    // Find the first line that starts with { (after trimming)
+    // This avoids matching { characters in PowerShell error messages that echo the command line
+    let jsonStartLine = -1;
+    for (let i = 0; i < lines.length; i++) {
+      if (lines[i].trim().startsWith('{')) {
+        jsonStartLine = i;
+        break;
+      }
+    }
+    
+    if (jsonStartLine === -1) {
+      throw new Error('No JSON found in output');
+    }
+    
+    // Reconstruct output from the JSON start line onwards
+    const jsonOutput = lines.slice(jsonStartLine).join('\n');
+    const jsonStart = 0; // JSON starts at the beginning of this substring
+    
+    // Count braces to find the matching closing brace
+    let braceCount = 0;
+    let inString = false;
+    let escapeNext = false;
+    let jsonEnd = -1;
+    
+    for (let i = jsonStart; i < jsonOutput.length; i++) {
+      const char = jsonOutput[i];
+      
+      // Handle escape sequences in strings
+      if (escapeNext) {
+        escapeNext = false;
+        continue;
+      }
+      
+      if (char === '\\') {
+        escapeNext = true;
+        continue;
+      }
+      
+      // Toggle string state on unescaped quotes
+      if (char === '"') {
+        inString = !inString;
+      }
+      
+      // Only count braces outside of strings
+      if (!inString) {
+        if (char === '{') {
+          braceCount++;
+        } else if (char === '}') {
+          braceCount--;
+          
+          // When braces balance to zero, we've found the end of JSON
+          if (braceCount === 0) {
+            jsonEnd = i;
+            break;
+          }
+        }
+      }
+    }
+    
+    if (jsonEnd === -1) {
+      throw new Error('Incomplete JSON found in output');
+    }
+    
+    // Extract the JSON substring and trim any whitespace
+    return jsonOutput.substring(jsonStart, jsonEnd + 1).trim();
+  }
+
+  /**
    * Get the structure of a Godot project
    * @param projectPath Path to the Godot project
    * @returns Object representing the project structure
@@ -913,6 +996,76 @@ class GodotServer {
             required: ['projectPath'],
           },
         },
+        {
+          name: 'get_scene_insights',
+          description: 'When you need to understand a Godot scene file (.tscn), start here. Retrieves comprehensive scene structure including node hierarchy, behavioral patterns, signal connections, script attachments, and property configurations. This provides deep insights into scene architecture and relationships between components without needing to read raw scene files.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: {
+                type: 'string',
+                description: 'Path to the Godot project directory',
+              },
+              scenePath: {
+                type: 'string',
+                description: 'Path to the scene file (relative to project)',
+              },
+              includeProperties: {
+                type: 'boolean',
+                description: 'Include node properties in the structure (default: true)',
+              },
+              includeConnections: {
+                type: 'boolean', 
+                description: 'Include signal connections in the structure (default: true)',
+              },
+              includeScriptInsights: {
+                type: 'boolean',
+                description: 'Include behavioral analysis for scripts attached to nodes (default: true)',
+              },
+              maxDepth: {
+                type: 'integer',
+                description: 'Maximum depth to traverse the scene tree (default: unlimited)',
+                minimum: 1,
+              },
+            },
+            required: ['projectPath', 'scenePath'],
+          },
+        },
+        {
+          name: 'get_node_insights',
+          description: 'When you need to understand a GDScript file (.gd), start here. Provides comprehensive script analysis including class structure, exported variables, methods with signatures, signals, dependencies, scene usage, and behavioral patterns. This gives you a complete understanding of the script\'s purpose, capabilities, and relationships without reading the raw code.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: {
+                type: 'string',
+                description: 'Path to the Godot project directory',
+              },
+              scriptPath: {
+                type: 'string',
+                description: 'Path to the script file (relative to project)',
+              },
+              includeDependencies: {
+                type: 'boolean',
+                description: 'Include dependency analysis and scene usage (default: true)',
+              },
+              includeMethods: {
+                type: 'boolean',
+                description: 'Include method definitions in the structure (default: true)',
+              },
+              includeVariables: {
+                type: 'boolean',
+                description: 'Include variable declarations in the structure (default: true)',
+              },
+              maxDepth: {
+                type: 'integer',
+                description: 'Maximum depth for dependency analysis (default: unlimited)',
+                minimum: 1,
+              },
+            },
+            required: ['projectPath', 'scriptPath'],
+          },
+        },
       ],
     }));
 
@@ -948,6 +1101,10 @@ class GodotServer {
           return await this.handleGetUid(request.params.arguments);
         case 'update_project_uids':
           return await this.handleUpdateProjectUids(request.params.arguments);
+        case 'get_scene_insights':
+          return await this.handleGetSceneInsights(request.params.arguments);
+        case 'get_node_insights':
+          return await this.handleGetNodeInsights(request.params.arguments);
         default:
           throw new McpError(
             ErrorCode.MethodNotFound,
@@ -2138,6 +2295,284 @@ class GodotServer {
           'Ensure Godot is installed correctly',
           'Check if the GODOT_PATH environment variable is set correctly',
           'Verify the project path is accessible',
+        ]
+      );
+    }
+  }
+
+  /**
+   * Handle the get_scene_insights tool
+   */
+  private async handleGetSceneInsights(args: any) {
+    // Normalize parameters to camelCase
+    args = this.normalizeParameters(args);
+    
+    if (!args.projectPath || !args.scenePath) {
+      return this.createErrorResponse(
+        'Project path and scene path are required',
+        ['Provide valid paths for both the project and the scene file']
+      );
+    }
+
+    if (!this.validatePath(args.projectPath) || !this.validatePath(args.scenePath)) {
+      return this.createErrorResponse(
+        'Invalid path',
+        ['Provide valid paths without ".." or other potentially unsafe characters']
+      );
+    }
+
+    try {
+      // Ensure godotPath is set
+      if (!this.godotPath) {
+        await this.detectGodotPath();
+        if (!this.godotPath) {
+          return this.createErrorResponse(
+            'Could not find a valid Godot executable path',
+            [
+              'Ensure Godot is installed correctly',
+              'Set GODOT_PATH environment variable to specify the correct path',
+            ]
+          );
+        }
+      }
+
+      // Check if the project directory exists and contains a project.godot file
+      const projectFile = join(args.projectPath, 'project.godot');
+      if (!existsSync(projectFile)) {
+        return this.createErrorResponse(
+          `Not a valid Godot project: ${args.projectPath}`,
+          [
+            'Ensure the path points to a directory containing a project.godot file',
+            'Use list_projects to find valid Godot projects',
+          ]
+        );
+      }
+
+      // Check if the scene file exists
+      const sceneFile = join(args.projectPath, args.scenePath);
+      if (!existsSync(sceneFile)) {
+        return this.createErrorResponse(
+          `Scene file not found: ${args.scenePath}`,
+          [
+            'Ensure the scene path is correct and relative to the project',
+            'Use create_scene to create a new scene if needed',
+          ]
+        );
+      }
+
+      // Check if it's a valid .tscn file
+      if (!args.scenePath.endsWith('.tscn')) {
+        return this.createErrorResponse(
+          `Invalid scene file format: ${args.scenePath}`,
+          [
+            'Only .tscn scene files are supported',
+            'Provide a path to a valid Godot scene file',
+          ]
+        );
+      }
+
+      // Prepare parameters for the operation (already in camelCase)
+      const params = {
+        scenePath: args.scenePath,
+        includeProperties: args.includeProperties !== undefined ? args.includeProperties : true,
+        includeConnections: args.includeConnections !== undefined ? args.includeConnections : true,
+        includeScriptInsights: args.includeScriptInsights !== undefined ? args.includeScriptInsights : true,
+        maxDepth: args.maxDepth || null,
+      };
+
+      this.logDebug(`Getting scene structure for: ${args.scenePath}`);
+
+      // Execute the operation
+      const { stdout, stderr } = await this.executeOperation('get_scene_insights', params, args.projectPath);
+
+      if (stderr && stderr.includes('Failed to')) {
+        return this.createErrorResponse(
+          `Failed to get scene structure: ${stderr}`,
+          [
+            'Check if the scene file is valid',
+            'Ensure the scene file is not corrupted',
+            'Try opening the scene in Godot editor to verify it loads correctly',
+          ]
+        );
+      }
+
+      // Parse the JSON output, extracting only the JSON part from potentially contaminated output
+      let structureData;
+      try {
+        const cleanJson = this.extractJsonFromOutput(stdout);
+        structureData = JSON.parse(cleanJson);
+      } catch (parseError) {
+        return this.createErrorResponse(
+          `Failed to parse scene structure data: ${parseError}`,
+          [
+            'The scene structure output may be malformed',
+            'Try the operation again',
+            'Check if the scene file is valid',
+            'Raw output: ' + stdout.substring(0, 200) + (stdout.length > 200 ? '...' : ''),
+          ]
+        );
+      }
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `Scene structure retrieved successfully for: ${args.scenePath}\n\n${JSON.stringify(structureData, null, 2)}`,
+          },
+        ],
+      };
+    } catch (error: any) {
+      return this.createErrorResponse(
+        `Failed to get scene structure: ${error?.message || 'Unknown error'}`,
+        [
+          'Ensure Godot is installed correctly',
+          'Check if the GODOT_PATH environment variable is set correctly',
+          'Verify the project and scene paths are accessible',
+          'Ensure the scene file is a valid .tscn file',
+        ]
+      );
+    }
+  }
+
+  /**
+   * Handle the get_node_insights tool
+   */
+  private async handleGetNodeInsights(args: any) {
+    // Normalize parameters to camelCase
+    args = this.normalizeParameters(args);
+    
+    if (!args.projectPath || !args.scriptPath) {
+      return this.createErrorResponse(
+        'Project path and script path are required',
+        ['Provide valid paths for both the project and the script file']
+      );
+    }
+
+    if (!this.validatePath(args.projectPath) || !this.validatePath(args.scriptPath)) {
+      return this.createErrorResponse(
+        'Invalid path',
+        ['Provide valid paths without ".." or other potentially unsafe characters']
+      );
+    }
+
+    try {
+      // Ensure godotPath is set
+      if (!this.godotPath) {
+        await this.detectGodotPath();
+        if (!this.godotPath) {
+          return this.createErrorResponse(
+            'Could not find a valid Godot executable path',
+            [
+              'Ensure Godot is installed correctly',
+              'Set GODOT_PATH environment variable to specify the correct path',
+            ]
+          );
+        }
+      }
+
+      // Check if the project directory exists and contains a project.godot file
+      const projectFile = join(args.projectPath, 'project.godot');
+      if (!existsSync(projectFile)) {
+        return this.createErrorResponse(
+          `Not a valid Godot project: ${args.projectPath}`,
+          [
+            'Ensure the path points to a directory containing a project.godot file',
+            'Use list_projects to find valid Godot projects',
+          ]
+        );
+      }
+
+      // Check if the script file exists
+      const scriptFile = join(args.projectPath, args.scriptPath);
+      if (!existsSync(scriptFile)) {
+        return this.createErrorResponse(
+          `Script file not found: ${args.scriptPath}`,
+          [
+            'Ensure the script path is correct and relative to the project',
+            'Verify the file exists in the project directory',
+          ]
+        );
+      }
+
+      // Check if it's a valid .gd file
+      if (!args.scriptPath.endsWith('.gd')) {
+        return this.createErrorResponse(
+          `Invalid script file format: ${args.scriptPath}`,
+          [
+            'Only .gd GDScript files are supported',
+            'Provide a path to a valid GDScript file',
+          ]
+        );
+      }
+
+      // Prepare parameters for the operation (already in camelCase)
+      const params = {
+        scriptPath: args.scriptPath,
+        includeDependencies: args.includeDependencies !== false, // default true
+        includeMethods: args.includeMethods !== false, // default true
+        includeVariables: args.includeVariables !== false, // default true
+        maxDepth: args.maxDepth || null,
+      };
+
+      this.logDebug(`Getting node insights for: ${args.scriptPath}`);
+
+      // Execute the operation
+      const { stdout, stderr } = await this.executeOperation('get_node_insights', params, args.projectPath);
+
+      if (stderr && stderr.includes('Failed to')) {
+        return this.createErrorResponse(
+          `Failed to get node insights: ${stderr}`,
+          [
+            'Check if the script file is valid',
+            'Ensure the script file is not corrupted',
+            'Try opening the script in Godot editor to verify it loads correctly',
+          ]
+        );
+      }
+
+      // Parse the JSON output, extracting only the JSON part from potentially contaminated output
+      let insightsData;
+      try {
+        const cleanJson = this.extractJsonFromOutput(stdout);
+        insightsData = JSON.parse(cleanJson);
+      } catch (parseError) {
+        // Try to extract what was found for debugging
+        let extractedPreview = 'Could not extract JSON';
+        try {
+          const cleanJson = this.extractJsonFromOutput(stdout);
+          extractedPreview = cleanJson.substring(0, 200) + (cleanJson.length > 200 ? '...' : '');
+        } catch (e) {
+          // Extraction failed, show raw output instead
+          extractedPreview = 'Extraction failed. Raw: ' + stdout.substring(0, 200);
+        }
+        
+        return this.createErrorResponse(
+          `Failed to parse node insights data: ${parseError}`,
+          [
+            'The node insights output may be malformed',
+            'Try the operation again',
+            'Check if the script file is valid',
+            'Extracted JSON preview: ' + extractedPreview,
+          ]
+        );
+      }
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `Node insights retrieved successfully for: ${args.scriptPath}\n\n${JSON.stringify(insightsData, null, 2)}`,
+          },
+        ],
+      };
+    } catch (error: any) {
+      return this.createErrorResponse(
+        `Failed to get node insights: ${error?.message || 'Unknown error'}`,
+        [
+          'Ensure Godot is installed correctly',
+          'Check if the GODOT_PATH environment variable is set correctly',
+          'Verify the project and script paths are accessible',
+          'Ensure the script file is a valid .gd file',
         ]
       );
     }
