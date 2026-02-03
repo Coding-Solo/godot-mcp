@@ -76,6 +76,12 @@ This direct feedback loop helps AI assistants like Claude understand what works 
   - Load sprites and textures into Sprite2D nodes
   - Export 3D scenes as MeshLibrary resources for GridMap
   - Save scenes with options for creating variants
+- **Input Simulation**:
+  - Send mouse clicks, drags, and movement to running games
+  - Simulate keyboard input and key combinations
+  - Trigger input actions defined in project settings
+  - Type text character by character
+  - Take screenshots of the running game
 - **UID Management** (for Godot 4.4+):
   - Get UID for specific files
   - Update UID references by resaving resources
@@ -129,7 +135,9 @@ Add to your Cline MCP settings file (`~/Library/Application Support/Code/User/gl
         "export_mesh_library",
         "save_scene",
         "get_uid",
-        "update_project_uids"
+        "update_project_uids",
+        "simulate_input",
+        "setup_input_simulation"
       ]
     }
   }
@@ -202,6 +210,12 @@ Once configured, your AI assistant will automatically run the MCP server when ne
 "Get the UID for a specific script file in my Godot 4.4 project"
 
 "Update UID references in my Godot project after upgrading to 4.4"
+
+"Set up input simulation for my project and click on the play button"
+
+"Run my game and press the spacebar to test the jump mechanic"
+
+"Take a screenshot of my running game after clicking through the main menu"
 ```
 
 ## Implementation Details
@@ -223,16 +237,70 @@ This architecture provides several benefits:
 
 The bundled script accepts operation type and parameters as JSON, allowing for flexible and dynamic operation execution without generating temporary files for each operation.
 
+## Input Simulation Setup
+
+Input simulation allows AI assistants to interact with your running Godot game by sending mouse clicks, keyboard input, and action triggers. This requires a small autoload script in your project.
+
+### Setup Steps
+
+1. **Install the addon** to your Godot project:
+   ```text
+   Use the setup_input_simulation tool with your project path
+   ```
+   This copies the `GodotMCPInput` addon to your project's `addons/` folder.
+
+2. **Enable the autoload** in Godot Editor:
+   - Go to **Project > Project Settings > Autoload**
+   - Click the folder icon and select: `res://addons/godot_mcp_input/godot_mcp_input.gd`
+   - Set Node Name to: `GodotMCPInput`
+   - Click **Add**
+
+3. **Run your game** - you should see in the console:
+   ```
+   GodotMCPInput: Listening on 127.0.0.1:7070
+   ```
+
+### How It Works
+
+The addon runs a TCP server inside your game on port 7070. When you use `simulate_input`, the MCP server connects to this port and sends input commands. The game executes them and returns results.
+
+### Available Commands
+
+| Command | Parameters | Description |
+|---------|------------|-------------|
+| `click` | `x`, `y`, `button?`, `double?` | Mouse click at coordinates |
+| `mouse_move` | `x`, `y` | Move mouse to position |
+| `mouse_drag` | `from_x`, `from_y`, `to_x`, `to_y`, `button?` | Drag from one point to another |
+| `key` | `key`, `modifiers?` | Press a keyboard key |
+| `action` | `action`, `pressed?` | Trigger an input action |
+| `action_pulse` | `action`, `duration_ms?` | Press and release an action |
+| `text` | `text`, `delay_ms?` | Type text character by character |
+| `wait` | `duration_ms` | Wait before next command |
+| `screenshot` | `output_path?` | Capture screenshot |
+
+### Gotchas
+
+- **Game must be running**: The `simulate_input` tool only works when your game is running with the autoload enabled. Use `run_project` first.
+- **Port 7070**: The addon listens on `127.0.0.1:7070`. If this port is in use, you'll need to modify the `PORT` constant in the addon script.
+- **Coordinates are viewport-relative**: Mouse positions are in viewport pixels, not screen pixels. (0,0) is top-left of the game window.
+- **Actions must exist**: When using `action` or `action_pulse`, the action name must be defined in your project's Input Map.
+- **Runs even when paused**: The addon uses `PROCESS_MODE_ALWAYS` so it can receive commands even when the game tree is paused.
+
 ## Troubleshooting
 
 - **Godot Not Found**: Set the GODOT_PATH environment variable to your Godot executable
 - **Connection Issues**: Ensure the server is running and restart your AI assistant
 - **Invalid Project Path**: Ensure the path points to a directory containing a project.godot file
 - **Build Issues**: Make sure all dependencies are installed by running `npm install`
+- **Input Simulation Not Working**:
+  - Ensure the game is running (use `run_project` first)
+  - Check that `GodotMCPInput` autoload is enabled in Project Settings
+  - Look for "Listening on 127.0.0.1:7070" in the game's console output
+  - If port 7070 is in use, modify the `PORT` constant in the addon
 - **For Cursor Specifically**:
--   Ensure the MCP server shows up and is enabled in Cursor settings (Settings > MCP)
--   MCP tools can only be run using the Agent chat profile (Cursor Pro or Business subscription)
--   Use "Yolo Mode" to automatically run MCP tool requests
+  - Ensure the MCP server shows up and is enabled in Cursor settings (Settings > MCP)
+  - MCP tools can only be run using the Agent chat profile (Cursor Pro or Business subscription)
+  - Use "Yolo Mode" to automatically run MCP tool requests
 
 ## License
 
