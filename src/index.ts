@@ -72,6 +72,7 @@ class GodotServer {
   private strictPathValidation: boolean = false;
   private inputSocket: Socket | null = null;
   private inputSocketPort: number = 0;
+  private inputRequestQueue: Promise<any> = Promise.resolve();
 
   /**
    * Parameter name mappings between snake_case and camelCase
@@ -2237,6 +2238,7 @@ class GodotServer {
   /**
    * Handle the simulate_input tool
    * Sends simulated input events to a running Godot project via TCP
+   * Requests are serialized to prevent cross-talk on the shared socket
    */
   private async handleSimulateInput(args: any) {
     args = this.normalizeParameters(args);
@@ -2251,6 +2253,23 @@ class GodotServer {
       );
     }
 
+    // Serialize requests through queue to prevent concurrent cross-talk
+    const result = new Promise<any>((resolveOuter) => {
+      this.inputRequestQueue = this.inputRequestQueue.then(async () => {
+        const response = await this.executeSimulateInput(commands, port, timeoutMs);
+        resolveOuter(response);
+      }).catch((err) => {
+        resolveOuter(this.createErrorResponse(`Request queue error: ${err.message}`, []));
+      });
+    });
+
+    return result;
+  }
+
+  /**
+   * Execute a single simulate_input request (called from queue)
+   */
+  private async executeSimulateInput(commands: unknown[], port: number, timeoutMs: number): Promise<any> {
     const payload = {
       id: Date.now().toString(),
       commands: commands,
@@ -2283,7 +2302,9 @@ class GodotServer {
         if (!resolved) {
           resolved = true;
           cleanup();
-          // Don't destroy the socket on timeout, just report the error
+          // Destroy socket on timeout to prevent stale responses affecting next request
+          socket.destroy();
+          this.inputSocket = null;
           resolve(this.createErrorResponse(
             'Timeout waiting for input commands to complete',
             [
