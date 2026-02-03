@@ -64,29 +64,31 @@ func _process(_delta: float) -> void:
 		_pending_data.erase(client)
 
 func _try_process_request(client: StreamPeerTCP) -> void:
-	var buffer: String = _pending_data.get(client, "")
+	# Process all complete lines in buffer (loop to avoid losing back-to-back requests)
+	while true:
+		var buffer: String = _pending_data.get(client, "")
 
-	# Look for newline-delimited JSON
-	var newline_pos = buffer.find("\n")
-	if newline_pos == -1:
-		return
+		# Look for newline-delimited JSON
+		var newline_pos = buffer.find("\n")
+		if newline_pos == -1:
+			return
 
-	var json_str = buffer.substr(0, newline_pos)
-	_pending_data[client] = buffer.substr(newline_pos + 1)
+		var json_str = buffer.substr(0, newline_pos)
+		_pending_data[client] = buffer.substr(newline_pos + 1)
 
-	# Parse and execute
-	var data = JSON.parse_string(json_str)
-	if data == null:
-		_send_response(client, {"success": false, "error": "Invalid JSON"})
-		return
+		# Parse and execute
+		var data = JSON.parse_string(json_str)
+		if data == null:
+			_send_response(client, {"success": false, "error": "Invalid JSON"})
+			continue
 
-	if not data.has("commands"):
-		_send_response(client, {"success": false, "error": "Missing 'commands' array"})
-		return
+		if not data.has("commands"):
+			_send_response(client, {"success": false, "error": "Missing 'commands' array"})
+			continue
 
-	# Execute commands and send response
-	var result = await _execute_commands(data.get("id", ""), data.commands)
-	_send_response(client, result)
+		# Execute commands and send response
+		var result = await _execute_commands(data.get("id", ""), data.commands)
+		_send_response(client, result)
 
 func _send_response(client: StreamPeerTCP, response: Dictionary) -> void:
 	if client.get_status() != StreamPeerTCP.STATUS_CONNECTED:
