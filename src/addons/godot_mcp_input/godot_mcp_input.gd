@@ -2,22 +2,38 @@ extends Node
 
 ## TCP server for receiving input commands from godot-mcp.
 ## Add this as an autoload named "GodotMCPInput" in your project.
+##
+## Port can be configured via Project Settings > Godot MCP > Input Port
+## or by setting the GODOT_MCP_INPUT_PORT environment variable.
 
-const PORT := 7070
+const DEFAULT_PORT := 7070
 const MAX_PENDING_CONNECTIONS := 4
+const SETTING_PATH := "godot_mcp/input_port"
 
+var _port: int
 var _server: TCPServer
 var _clients: Array[StreamPeerTCP] = []
 var _pending_data: Dictionary = {}  # client -> accumulated data
 
 func _ready() -> void:
 	process_mode = Node.PROCESS_MODE_ALWAYS  # Run even when paused
+	_port = _get_port()
 	_server = TCPServer.new()
-	var err = _server.listen(PORT, "127.0.0.1")
+	var err = _server.listen(_port, "127.0.0.1")
 	if err != OK:
-		push_error("GodotMCPInput: Failed to start TCP server on port %d: %s" % [PORT, error_string(err)])
+		push_error("GodotMCPInput: Failed to start TCP server on port %d: %s" % [_port, error_string(err)])
 	else:
-		print("GodotMCPInput: Listening on 127.0.0.1:%d" % PORT)
+		print("GodotMCPInput: Listening on 127.0.0.1:%d" % _port)
+
+func _get_port() -> int:
+	# Check environment variable first
+	var env_port = OS.get_environment("GODOT_MCP_INPUT_PORT")
+	if not env_port.is_empty():
+		return int(env_port)
+	# Check project setting
+	if ProjectSettings.has_setting(SETTING_PATH):
+		return ProjectSettings.get_setting(SETTING_PATH)
+	return DEFAULT_PORT
 
 func _exit_tree() -> void:
 	if _server:
