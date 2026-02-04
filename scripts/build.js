@@ -26,4 +26,28 @@ try {
   process.exit(1);
 }
 
+// Copy the godot_mcp_input addon to the build directory
+try {
+  const addonSrcDir = path.join(__dirname, '..', 'src', 'addons', 'godot_mcp_input');
+  const addonDestDir = path.join(__dirname, '..', 'build', 'addons', 'godot_mcp_input');
+
+  // Ensure the build/addons/godot_mcp_input directory exists
+  fs.ensureDirSync(addonDestDir);
+
+  // Copy addon files
+  const addonFiles = ['godot_mcp_input.gd', 'plugin.cfg'];
+  for (const file of addonFiles) {
+    const srcPath = path.join(addonSrcDir, file);
+    const destPath = path.join(addonDestDir, file);
+    if (fs.existsSync(srcPath)) {
+      fs.copyFileSync(srcPath, destPath);
+    }
+  }
+
+  console.log('Successfully copied godot_mcp_input addon to build/addons');
+} catch (error) {
+  console.error('Error copying addon:', error);
+  process.exit(1);
+}
+
 console.log('Build scripts completed successfully!');

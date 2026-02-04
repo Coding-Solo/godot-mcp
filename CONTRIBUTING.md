@@ -98,11 +98,24 @@ The following tools have been recently added:
   - Analyzes project structure
   - Returns information about scenes, scripts, and assets
   - Helps LLMs understand the organization of Godot projects
-  
+
 - **capture_screenshot**: Takes a screenshot of a running Godot project
   - Requires an active Godot process
   - Saves the screenshot to the specified path
   - Useful for visual debugging and feedback
+
+- **simulate_input**: Send simulated input events to a running Godot project
+  - Supports mouse clicks, drags, movement
+  - Keyboard input with modifier keys
+  - Input action triggers (press, release, pulse)
+  - Text typing character by character
+  - Screenshot capture
+  - Requires GodotMCPInput autoload in target project
+
+- **setup_input_simulation**: Install the GodotMCPInput addon to a Godot project
+  - Copies the addon files to the project's addons folder
+  - Provides instructions for enabling the autoload
+  - Required before using simulate_input
 
 Example:
 
