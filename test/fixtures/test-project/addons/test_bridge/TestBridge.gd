@@ -1,0 +1,1 @@
+../../../../src/scripts/test_bridge.gd

@@ -19,8 +19,14 @@ try {
     path.join(__dirname, '..', 'src', 'scripts', 'godot_operations.gd'),
     path.join(__dirname, '..', 'build', 'scripts', 'godot_operations.gd')
   );
-  
-  console.log('Successfully copied godot_operations.gd to build/scripts');
+
+  // Copy the test_bridge.gd file
+  fs.copyFileSync(
+    path.join(__dirname, '..', 'src', 'scripts', 'test_bridge.gd'),
+    path.join(__dirname, '..', 'build', 'scripts', 'test_bridge.gd')
+  );
+
+  console.log('Successfully copied GDScript files to build/scripts');
 } catch (error) {
   console.error('Error copying scripts:', error);
   process.exit(1);

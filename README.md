@@ -79,6 +79,14 @@ This direct feedback loop helps AI assistants like Claude understand what works 
 - **UID Management** (for Godot 4.4+):
   - Get UID for specific files
   - Update UID references by resaving resources
+- **E2E Testing Bridge** (25 tools):
+  - Connect to running Godot games via WebSocket for live testing
+  - Inspect the scene tree, find nodes, read/write properties
+  - Simulate keyboard, mouse, and text input
+  - Wait for signals, node existence, or property changes
+  - Take screenshots and query viewport info
+  - Load/reset scenes for test orchestration
+  - Query singletons and performance metrics
 
 ## Requirements
 
@@ -202,6 +210,14 @@ Once configured, your AI assistant will automatically run the MCP server when ne
 "Get the UID for a specific script file in my Godot 4.4 project"
 
 "Update UID references in my Godot project after upgrading to 4.4"
+
+"Run my project with the test bridge and check that the main menu loads correctly"
+
+"Connect to my running game and verify the player's health is 100"
+
+"Simulate clicking the Start button and wait for the game scene to load"
+
+"Take a screenshot of my game after the intro animation finishes"
 ```
 
 ## Implementation Details
@@ -222,6 +238,50 @@ This architecture provides several benefits:
 - **Reduced Overhead**: Minimizes file I/O operations for better performance
 
 The bundled script accepts operation type and parameters as JSON, allowing for flexible and dynamic operation execution without generating temporary files for each operation.
+
+### E2E Testing Bridge
+
+The E2E testing bridge enables AI assistants to interact with **running** Godot games in real time. It works via a WebSocket connection between the MCP server and a TestBridge autoload running inside the game.
+
+**How it works:**
+
+1. `install_test_bridge` registers the TestBridge autoload in your project's `project.godot`
+2. `run_project_with_bridge` launches the game with `--test-bridge` flag and waits for connection
+3. The MCP server connects via WebSocket (default port 9505) and exchanges JSON-RPC messages
+4. E2E tools send commands (inspect nodes, simulate input, take screenshots, etc.) through this bridge
+5. `disconnect_from_game` / `stop_project` cleans up when done
+
+**Safety:** Operations that evaluate arbitrary expressions (`evaluate_expression`, `wait_for_condition`) and dangerous methods in `call_method` require the `--unsafe` flag to be passed when launching the game.
+
+#### E2E Tool Reference
+
+| Category | Tool | Description |
+|---|---|---|
+| **Connection** | `connect_to_game` | Connect to a running game's TestBridge WebSocket |
+| | `disconnect_from_game` | Disconnect from the game |
+| | `get_bridge_status` | Check connection status and capabilities |
+| **Orchestration** | `install_test_bridge` | Register TestBridge autoload in project.godot |
+| | `run_project_with_bridge` | Launch game and auto-connect to TestBridge |
+| **Scene Tree** | `get_tree` | Get full or partial scene tree as JSON |
+| | `find_nodes` | Find nodes by name, class, group, or metadata |
+| | `get_node_properties` | Read properties from a node by path |
+| | `set_node_property` | Set a property on a node |
+| | `call_method` | Call a method on a node with arguments |
+| **Game State** | `get_singleton` | Read properties from an autoload/singleton |
+| | `evaluate_expression` | Evaluate a GDScript expression (unsafe) |
+| | `get_performance_metrics` | Get FPS, memory, draw calls, etc. |
+| **Input** | `send_key` | Simulate key press/release/tap |
+| | `send_mouse_click` | Simulate mouse click at coordinates |
+| | `send_mouse_drag` | Simulate mouse drag between two points |
+| | `send_text` | Type a string of text character by character |
+| **Waiting** | `wait_for_signal` | Wait for a signal to be emitted |
+| | `wait_for_condition` | Wait for a GDScript expression to be truthy (unsafe) |
+| | `wait_for_node` | Wait for a node to exist at a path |
+| | `wait_for_property` | Wait for a node property to reach a value |
+| **Visual** | `take_screenshot` | Capture the game viewport as a PNG (base64) |
+| | `get_viewport_info` | Get viewport size, content scale, etc. |
+| **Scene Control** | `reset_scene` | Reload the current scene |
+| | `load_scene` | Change to a different scene by path |
 
 ## Troubleshooting
 
