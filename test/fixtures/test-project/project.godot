@@ -1,0 +1,17 @@
+; Engine configuration file.
+; It's best edited using the editor UI and not directly,
+; since the parameters that go here are not all obvious.
+;
+; Format:
+;   [section] key=value
+
+config_version=5
+
+[application]
+
+config/name="TestProject"
+run/main_scene="res://main.tscn"
+
+[autoload]
+
+TestBridge="*res://addons/test_bridge/TestBridge.gd"

@@ -22,6 +22,9 @@ import {
   McpError,
 } from '@modelcontextprotocol/sdk/types.js';
 
+import { BridgeClient } from './bridge.js';
+import { getE2EToolSchemas, handleE2ETool, getE2EParameterMappings, ServerContext } from './e2e-tools.js';
+
 // Check if debug mode is enabled
 const DEBUG_MODE: boolean = process.env.DEBUG === 'true';
 const GODOT_DEBUG_MODE: boolean = true; // Always use GODOT DEBUG MODE
@@ -68,6 +71,7 @@ class GodotServer {
   private operationsScriptPath: string;
   private validatedPaths: Map<string, boolean> = new Map();
   private strictPathValidation: boolean = false;
+  private bridge: BridgeClient = new BridgeClient();
 
   /**
    * Parameter name mappings between snake_case and camelCase
@@ -101,6 +105,12 @@ class GodotServer {
     // Initialize reverse parameter mappings
     for (const [snakeCase, camelCase] of Object.entries(this.parameterMappings)) {
       this.reverseParameterMappings[camelCase] = snakeCase;
+    }
+    // Merge E2E tool parameter mappings
+    const e2eMappings = getE2EParameterMappings();
+    for (const [snake, camel] of Object.entries(e2eMappings)) {
+      this.parameterMappings[snake] = camel;
+      this.reverseParameterMappings[camel] = snake;
     }
     // Apply configuration if provided
     let debugMode = DEBUG_MODE;
@@ -383,6 +393,7 @@ class GodotServer {
    */
   private async cleanup() {
     this.logDebug('Cleaning up resources');
+    this.bridge.disconnect();
     if (this.activeProcess) {
       this.logDebug('Killing active Godot process');
       this.activeProcess.process.kill();
@@ -913,6 +924,7 @@ class GodotServer {
             required: ['projectPath'],
           },
         },
+        ...getE2EToolSchemas(),
       ],
     }));
 
@@ -948,11 +960,29 @@ class GodotServer {
           return await this.handleGetUid(request.params.arguments);
         case 'update_project_uids':
           return await this.handleUpdateProjectUids(request.params.arguments);
-        default:
+        default: {
+          // Delegate to E2E tools
+          const e2eContext: ServerContext = {
+            bridge: this.bridge,
+            createErrorResponse: this.createErrorResponse.bind(this),
+            normalizeParameters: this.normalizeParameters.bind(this),
+            godotPath: this.godotPath,
+            setActiveProcess: (proc: any) => { this.activeProcess = proc; },
+            getActiveProcess: () => this.activeProcess,
+          };
+          const e2eResult = await handleE2ETool(
+            request.params.name,
+            request.params.arguments,
+            e2eContext,
+          );
+          if (e2eResult !== null) {
+            return e2eResult;
+          }
           throw new McpError(
             ErrorCode.MethodNotFound,
             `Unknown tool: ${request.params.name}`
           );
+        }
       }
     });
   }
