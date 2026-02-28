@@ -90,14 +90,33 @@ This direct feedback loop helps AI assistants like Claude understand what works 
 
 ### Step 1: Install and Build
 
-First, clone the repository and build the MCP server:
+
+First, clone the repository and install dependencies:
 
 ```bash
 git clone https://github.com/Coding-Solo/godot-mcp.git
 cd godot-mcp
 npm install
+```
+
+#### Node
+
+To build the MCP server for CLI use:
+
+```bash
 npm run build
 ```
+
+#### Claude Desktop (MCPB)
+
+To build the MCPB extension for Claude Desktop:
+
+```bash
+npm run build:mcpb
+```
+
+After building, double-click the generated `.mcpb` file in the build directory to install it in Claude Desktop. In the Config menu, set the path to your Godot executable. You can skip the rest of the configuration steps below.
+
 
 ### Step 2: Configure with Your AI Assistant
 
