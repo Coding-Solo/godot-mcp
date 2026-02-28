@@ -42,7 +42,7 @@
     "@anthropic-ai/mcpb": "^2.1.2",
     "@types/node": "^20.11.24",
     "typescript": "^5.3.3",
-    "esbuild": "^0.18.20"
+    "esbuild": "^0.27.3"
   },
   "engines": {
     "node": ">=18.0.0"
