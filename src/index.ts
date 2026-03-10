@@ -1496,6 +1496,20 @@ class GodotServer {
           return await this.handleListProcesses();
         case 'run_multiple_projects':
           return await this.handleRunMultipleProjects(request.params.arguments);
+        case 'signal_connect':
+          return await this.handleSignalConnect(request.params.arguments);
+        case 'signal_disconnect':
+          return await this.handleSignalDisconnect(request.params.arguments);
+        case 'group_add':
+          return await this.handleGroupAdd(request.params.arguments);
+        case 'group_remove':
+          return await this.handleGroupRemove(request.params.arguments);
+        case 'list_groups':
+          return await this.handleListGroups(request.params.arguments);
+        case 'ui_create_button':
+          return await this.handleUiCreateButton(request.params.arguments);
+        case 'ui_create_label':
+          return await this.handleUiCreateLabel(request.params.arguments);
         default:
           throw new McpError(
             ErrorCode.MethodNotFound,
@@ -2161,6 +2175,260 @@ class GodotServer {
         ]
       );
     }
+  }
+
+  /**
+   * Handle the signal_connect tool
+   * Connect a signal from one node to another node's method
+   */
+  private async handleSignalConnect(args: any) {
+    args = this.normalizeParameters(args || {});
+
+    if (!args.projectPath || !args.scenePath || !args.sourceNodePath || 
+        !args.signalName || !args.targetNodePath || !args.methodName) {
+      return this.createErrorResponse(
+        'Missing required parameters for signal_connect',
+        ['Required: projectPath, scenePath, sourceNodePath, signalName, targetNodePath, methodName']
+      );
+    }
+
+    const params = {
+      scene_path: args.scenePath,
+      source_node_path: args.sourceNodePath,
+      signal_name: args.signalName,
+      target_node_path: args.targetNodePath,
+      method_name: args.methodName,
+      flags: args.flags || 0,
+    };
+
+    return await this.executeGodotOperation(args.projectPath, 'signal_connect', params);
+  }
+
+  /**
+   * Handle the signal_disconnect tool
+   * Disconnect a signal connection
+   */
+  private async handleSignalDisconnect(args: any) {
+    args = this.normalizeParameters(args || {});
+
+    if (!args.projectPath || !args.scenePath || !args.sourceNodePath || 
+        !args.signalName || !args.targetNodePath || !args.methodName) {
+      return this.createErrorResponse(
+        'Missing required parameters for signal_disconnect',
+        ['Required: projectPath, scenePath, sourceNodePath, signalName, targetNodePath, methodName']
+      );
+    }
+
+    const params = {
+      scene_path: args.scenePath,
+      source_node_path: args.sourceNodePath,
+      signal_name: args.signalName,
+      target_node_path: args.targetNodePath,
+      method_name: args.methodName,
+    };
+
+    return await this.executeGodotOperation(args.projectPath, 'signal_disconnect', params);
+  }
+
+  /**
+   * Handle the group_add tool
+   * Add a node to a group
+   */
+  private async handleGroupAdd(args: any) {
+    args = this.normalizeParameters(args || {});
+
+    if (!args.projectPath || !args.scenePath || !args.nodePath || !args.groupName) {
+      return this.createErrorResponse(
+        'Missing required parameters for group_add',
+        ['Required: projectPath, scenePath, nodePath, groupName']
+      );
+    }
+
+    const params = {
+      scene_path: args.scenePath,
+      node_path: args.nodePath,
+      group_name: args.groupName,
+    };
+
+    return await this.executeGodotOperation(args.projectPath, 'group_add', params);
+  }
+
+  /**
+   * Handle the group_remove tool
+   * Remove a node from a group
+   */
+  private async handleGroupRemove(args: any) {
+    args = this.normalizeParameters(args || {});
+
+    if (!args.projectPath || !args.scenePath || !args.nodePath || !args.groupName) {
+      return this.createErrorResponse(
+        'Missing required parameters for group_remove',
+        ['Required: projectPath, scenePath, nodePath, groupName']
+      );
+    }
+
+    const params = {
+      scene_path: args.scenePath,
+      node_path: args.nodePath,
+      group_name: args.groupName,
+    };
+
+    return await this.executeGodotOperation(args.projectPath, 'group_remove', params);
+  }
+
+  /**
+   * Handle the list_groups tool
+   * List all groups in a scene
+   */
+  private async handleListGroups(args: any) {
+    args = this.normalizeParameters(args || {});
+
+    if (!args.projectPath || !args.scenePath) {
+      return this.createErrorResponse(
+        'Missing required parameters for list_groups',
+        ['Required: projectPath, scenePath']
+      );
+    }
+
+    const params = {
+      scene_path: args.scenePath,
+    };
+
+    return await this.executeGodotOperation(args.projectPath, 'list_groups', params);
+  }
+
+  /**
+   * Handle the ui_create_button tool
+   * Create a Button node in a scene
+   */
+  private async handleUiCreateButton(args: any) {
+    args = this.normalizeParameters(args || {});
+
+    if (!args.projectPath || !args.scenePath || !args.parentNodePath || 
+        !args.nodeName || !args.text) {
+      return this.createErrorResponse(
+        'Missing required parameters for ui_create_button',
+        ['Required: projectPath, scenePath, parentNodePath, nodeName, text']
+      );
+    }
+
+    const params: any = {
+      scene_path: args.scenePath,
+      parent_node_path: args.parentNodePath,
+      node_name: args.nodeName,
+      text: args.text,
+    };
+
+    if (args.position) {
+      params.position = args.position;
+    }
+    if (args.size) {
+      params.size = args.size;
+    }
+
+    return await this.executeGodotOperation(args.projectPath, 'ui_create_button', params);
+  }
+
+  /**
+   * Handle the ui_create_label tool
+   * Create a Label node in a scene
+   */
+  private async handleUiCreateLabel(args: any) {
+    args = this.normalizeParameters(args || {});
+
+    if (!args.projectPath || !args.scenePath || !args.parentNodePath || 
+        !args.nodeName || !args.text) {
+      return this.createErrorResponse(
+        'Missing required parameters for ui_create_label',
+        ['Required: projectPath, scenePath, parentNodePath, nodeName, text']
+      );
+    }
+
+    const params: any = {
+      scene_path: args.scenePath,
+      parent_node_path: args.parentNodePath,
+      node_name: args.nodeName,
+      text: args.text,
+    };
+
+    if (args.position) {
+      params.position = args.position;
+    }
+    if (args.fontSize) {
+      params.font_size = args.fontSize;
+    }
+
+    return await this.executeGodotOperation(args.projectPath, 'ui_create_label', params);
+  }
+
+  /**
+   * Execute a Godot operation using the operations script
+   */
+  private async executeGodotOperation(projectPath: string, operation: string, params: any) {
+    if (!this.godotPath) {
+      await this.detectGodotPath();
+      if (!this.godotPath) {
+        return this.createErrorResponse(
+          'Could not find a valid Godot executable path',
+          ['Set GODOT_PATH environment variable']
+        );
+      }
+    }
+
+    const operationScript = join(__dirname, 'scripts', 'godot_operations.gd');
+    if (!existsSync(operationScript)) {
+      return this.createErrorResponse(
+        'Godot operations script not found',
+        ['Ensure the MCP server is built correctly']
+      );
+    }
+
+    const args = [
+      '--headless',
+      '--path', projectPath,
+      '-s', operationScript,
+      '--',
+      JSON.stringify({ operation, params }),
+    ];
+
+    return new Promise((resolve) => {
+      const process = spawn(this.godotPath!, args, { stdio: 'pipe' });
+      let output = '';
+      let errors = '';
+
+      process.stdout.on('data', (data: Buffer) => {
+        output += data.toString();
+      });
+
+      process.stderr.on('data', (data: Buffer) => {
+        errors += data.toString();
+      });
+
+      process.on('close', (code: number) => {
+        if (code === 0) {
+          resolve({
+            content: [
+              {
+                type: 'text',
+                text: output || `Operation ${operation} completed successfully`,
+              },
+            ],
+          });
+        } else {
+          resolve(this.createErrorResponse(
+            `Operation ${operation} failed with code ${code}`,
+            [errors || 'Unknown error']
+          ));
+        }
+      });
+
+      process.on('error', (error: Error) => {
+        resolve(this.createErrorResponse(
+          `Failed to execute operation: ${error.message}`,
+          ['Ensure Godot is installed correctly']
+        ));
+      });
+    });
   }
 
   /**
