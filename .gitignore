@@ -4,6 +4,7 @@ node_modules/
 # Build output
 build/
 dist/
+mcpb-staging/
 
 # Logs
 *.log

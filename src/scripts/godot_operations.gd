@@ -71,6 +71,20 @@ func _init():
             get_uid(params)
         "resave_resources":
             resave_resources(params)
+        "signal_connect":
+            signal_connect(params)
+        "signal_disconnect":
+            signal_disconnect(params)
+        "group_add":
+            group_add(params)
+        "group_remove":
+            group_remove(params)
+        "list_groups":
+            list_groups(params)
+        "ui_create_button":
+            ui_create_button(params)
+        "ui_create_label":
+            ui_create_label(params)
         _:
             log_error("Unknown operation: " + operation)
             quit(1)
@@ -461,6 +475,362 @@ func create_scene(params):
             quit(1)
     else:
         printerr("Failed to pack scene: " + str(result))
+
+## Signal Operations
+
+func signal_connect(params: Dictionary) -> void:
+    """
+    Connect a signal from one node to another node's method.
+    params:
+        - scene_path: Path to the scene file
+        - source_node_path: Path to the source node (emitter)
+        - signal_name: Name of the signal to connect
+        - target_node_path: Path to the target node (receiver)
+        - method_name: Name of the method to call when signal is emitted
+        - flags: Optional connection flags (default: 0)
+    """
+    var scene_path = params.get("scene_path", "")
+    var source_node_path = params.get("source_node_path", "")
+    var signal_name = params.get("signal_name", "")
+    var target_node_path = params.get("target_node_path", "")
+    var method_name = params.get("method_name", "")
+    var flags = params.get("flags", 0)
+    
+    if scene_path.is_empty() or source_node_path.is_empty() or signal_name.is_empty():
+        printerr("Missing required parameters for signal_connect")
+        quit(1)
+        return
+    
+    var scene = load_scene(scene_path)
+    if scene == null:
+        return
+    
+    var source_node = get_node_by_path(scene, source_node_path)
+    var target_node = get_node_by_path(scene, target_node_path)
+    
+    if source_node == null:
+        printerr("Source node not found: " + source_node_path)
+        quit(1)
+        return
+    
+    if target_node == null:
+        printerr("Target node not found: " + target_node_path)
+        quit(1)
+        return
+    
+    # Connect the signal
+    var error = source_node.connect(signal_name, Callable(target_node, method_name), flags)
+    
+    if error == OK:
+        print("Signal '" + signal_name + "' connected from '" + source_node_path + "' to '" + target_node_path + "." + method_name + "'")
+        
+        # Save the scene to persist the connection
+        var packed_scene = PackedScene.new()
+        var result = packed_scene.pack(scene)
+        if result == OK:
+            ResourceSaver.save(packed_scene, scene_path)
+            print("Scene saved with new signal connection")
+    else:
+        printerr("Failed to connect signal: " + str(error))
+        quit(1)
+
+func signal_disconnect(params: Dictionary) -> void:
+    """
+    Disconnect a signal connection.
+    params:
+        - scene_path: Path to the scene file
+        - source_node_path: Path to the source node (emitter)
+        - signal_name: Name of the signal to disconnect
+        - target_node_path: Path to the target node (receiver)
+        - method_name: Name of the method that was connected
+    """
+    var scene_path = params.get("scene_path", "")
+    var source_node_path = params.get("source_node_path", "")
+    var signal_name = params.get("signal_name", "")
+    var target_node_path = params.get("target_node_path", "")
+    var method_name = params.get("method_name", "")
+    
+    if scene_path.is_empty() or source_node_path.is_empty() or signal_name.is_empty():
+        printerr("Missing required parameters for signal_disconnect")
+        quit(1)
+        return
+    
+    var scene = load_scene(scene_path)
+    if scene == null:
+        return
+    
+    var source_node = get_node_by_path(scene, source_node_path)
+    var target_node = get_node_by_path(scene, target_node_path)
+    
+    if source_node == null:
+        printerr("Source node not found: " + source_node_path)
+        quit(1)
+        return
+    
+    if target_node == null:
+        printerr("Target node not found: " + target_node_path)
+        quit(1)
+        return
+    
+    # Disconnect the signal
+    if source_node.is_connected(signal_name, Callable(target_node, method_name)):
+        source_node.disconnect(signal_name, Callable(target_node, method_name))
+        print("Signal '" + signal_name + "' disconnected from '" + target_node_path + "." + method_name + "'")
+        
+        # Save the scene
+        var packed_scene = PackedScene.new()
+        var result = packed_scene.pack(scene)
+        if result == OK:
+            ResourceSaver.save(packed_scene, scene_path)
+            print("Scene saved with signal disconnection")
+    else:
+        printerr("Signal connection not found")
+        quit(1)
+
+## Group Operations
+
+func group_add(params: Dictionary) -> void:
+    """
+    Add a node to a group.
+    params:
+        - scene_path: Path to the scene file
+        - node_path: Path to the node
+        - group_name: Name of the group
+    """
+    var scene_path = params.get("scene_path", "")
+    var node_path = params.get("node_path", "")
+    var group_name = params.get("group_name", "")
+    
+    if scene_path.is_empty() or node_path.is_empty() or group_name.is_empty():
+        printerr("Missing required parameters for group_add")
+        quit(1)
+        return
+    
+    var scene = load_scene(scene_path)
+    if scene == null:
+        return
+    
+    var node = get_node_by_path(scene, node_path)
+    
+    if node == null:
+        printerr("Node not found: " + node_path)
+        quit(1)
+        return
+    
+    # Add to group
+    node.add_to_group(group_name)
+    print("Node '" + node_path + "' added to group '" + group_name + "'")
+    
+    # Save the scene
+    var packed_scene = PackedScene.new()
+    var result = packed_scene.pack(scene)
+    if result == OK:
+        ResourceSaver.save(packed_scene, scene_path)
+        print("Scene saved with group addition")
+
+func group_remove(params: Dictionary) -> void:
+    """
+    Remove a node from a group.
+    params:
+        - scene_path: Path to the scene file
+        - node_path: Path to the node
+        - group_name: Name of the group
+    """
+    var scene_path = params.get("scene_path", "")
+    var node_path = params.get("node_path", "")
+    var group_name = params.get("group_name", "")
+    
+    if scene_path.is_empty() or node_path.is_empty() or group_name.is_empty():
+        printerr("Missing required parameters for group_remove")
+        quit(1)
+        return
+    
+    var scene = load_scene(scene_path)
+    if scene == null:
+        return
+    
+    var node = get_node_by_path(scene, node_path)
+    
+    if node == null:
+        printerr("Node not found: " + node_path)
+        quit(1)
+        return
+    
+    # Remove from group
+    if node.is_in_group(group_name):
+        node.remove_from_group(group_name)
+        print("Node '" + node_path + "' removed from group '" + group_name + "'")
+        
+        # Save the scene
+        var packed_scene = PackedScene.new()
+        var result = packed_scene.pack(scene)
+        if result == OK:
+            ResourceSaver.save(packed_scene, scene_path)
+            print("Scene saved with group removal")
+    else:
+        printerr("Node is not in group '" + group_name + "'")
+        quit(1)
+
+func list_groups(params: Dictionary) -> void:
+    """
+    List all groups in a scene.
+    params:
+        - scene_path: Path to the scene file
+    """
+    var scene_path = params.get("scene_path", "")
+    
+    if scene_path.is_empty():
+        printerr("Missing required parameter: scene_path")
+        quit(1)
+        return
+    
+    var scene = load_scene(scene_path)
+    if scene == null:
+        return
+    
+    # Collect all groups
+    var groups = {}
+    var nodes_to_check = [scene]
+    
+    while nodes_to_check.size() > 0:
+        var node = nodes_to_check.pop_back()
+        var node_groups = node.get_groups()
+        
+        for group in node_groups:
+            if not groups.has(group):
+                groups[group] = []
+            groups[group].append(node.get_path())
+        
+        # Add children to check
+        for child in node.get_children():
+            nodes_to_check.append(child)
+    
+    # Output result
+    var result = {"groups": groups, "count": groups.size()}
+    print(JSON.stringify(result))
+
+## UI Operations
+
+func ui_create_button(params: Dictionary) -> void:
+    """
+    Create a Button node in a scene.
+    params:
+        - scene_path: Path to the scene file
+        - parent_node_path: Path to the parent node
+        - node_name: Name for the new button
+        - text: Text to display on the button
+        - position: Optional {x, y} position
+        - size: Optional {width, height} size
+    """
+    var scene_path = params.get("scene_path", "")
+    var parent_node_path = params.get("parent_node_path", "")
+    var node_name = params.get("node_name", "")
+    var text = params.get("text", "")
+    var position = params.get("position", {})
+    var size = params.get("size", {})
+    
+    if scene_path.is_empty() or parent_node_path.is_empty() or node_name.is_empty():
+        printerr("Missing required parameters for ui_create_button")
+        quit(1)
+        return
+    
+    var scene = load_scene(scene_path)
+    if scene == null:
+        return
+    
+    var parent_node = get_node_by_path(scene, parent_node_path)
+    
+    if parent_node == null:
+        printerr("Parent node not found: " + parent_node_path)
+        quit(1)
+        return
+    
+    # Create Button node
+    var button = Button.new()
+    button.name = node_name
+    button.text = text
+    
+    # Set position if provided
+    if position.has("x") and position.has("y"):
+        button.position = Vector2(position.x, position.y)
+    
+    # Set size if provided
+    if size.has("width") and size.has("height"):
+        button.size = Vector2(size.width, size.height)
+    
+    # Add to parent
+    parent_node.add_child(button)
+    button.owner = scene
+    
+    print("Button '" + node_name + "' created at '" + parent_node_path + "'")
+    
+    # Save the scene
+    var packed_scene = PackedScene.new()
+    var result = packed_scene.pack(scene)
+    if result == OK:
+        ResourceSaver.save(packed_scene, scene_path)
+        print("Scene saved with new button")
+
+func ui_create_label(params: Dictionary) -> void:
+    """
+    Create a Label node in a scene.
+    params:
+        - scene_path: Path to the scene file
+        - parent_node_path: Path to the parent node
+        - node_name: Name for the new label
+        - text: Text to display in the label
+        - position: Optional {x, y} position
+        - font_size: Optional font size
+    """
+    var scene_path = params.get("scene_path", "")
+    var parent_node_path = params.get("parent_node_path", "")
+    var node_name = params.get("node_name", "")
+    var text = params.get("text", "")
+    var position = params.get("position", {})
+    var font_size = params.get("font_size", 16)
+    
+    if scene_path.is_empty() or parent_node_path.is_empty() or node_name.is_empty():
+        printerr("Missing required parameters for ui_create_label")
+        quit(1)
+        return
+    
+    var scene = load_scene(scene_path)
+    if scene == null:
+        return
+    
+    var parent_node = get_node_by_path(scene, parent_node_path)
+    
+    if parent_node == null:
+        printerr("Parent node not found: " + parent_node_path)
+        quit(1)
+        return
+    
+    # Create Label node
+    var label = Label.new()
+    label.name = node_name
+    label.text = text
+    
+    # Set position if provided
+    if position.has("x") and position.has("y"):
+        label.position = Vector2(position.x, position.y)
+    
+    # Set font size
+    var theme = Theme.new()
+    theme.set_font_size("font_size", "Label", font_size)
+    label.theme = theme
+    
+    # Add to parent
+    parent_node.add_child(label)
+    label.owner = scene
+    
+    print("Label '" + node_name + "' created at '" + parent_node_path + "'")
+    
+    # Save the scene
+    var packed_scene = PackedScene.new()
+    var result = packed_scene.pack(scene)
+    if result == OK:
+        ResourceSaver.save(packed_scene, scene_path)
+        print("Scene saved with new label")
         printerr("Error code: " + str(result))
         quit(1)
 

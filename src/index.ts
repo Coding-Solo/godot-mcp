@@ -36,10 +36,76 @@ const __dirname = dirname(__filename);
  * Interface representing a running Godot process
  */
 interface GodotProcess {
+  id: string;
   process: any;
   output: string[];
   errors: string[];
+  projectPath: string;
+  scene?: string;
+  args?: string[];
+  startedAt: Date;
+  isRunning: boolean;
+  exitedAt?: Date;
+  screenshotEnabled?: boolean;
 }
+
+/**
+ * Interface for instance configuration in batch operations
+ */
+interface InstanceConfig {
+  projectPath: string;
+  instanceId?: string;
+  scene?: string;
+  args?: string[];
+  delayMs?: number;
+}
+
+/**
+ * Configuration for output buffer limits
+ */
+const OUTPUT_BUFFER_LIMIT = 1000; // Max lines to keep per stream
+const STALE_PROCESS_CLEANUP_MS = 10 * 60 * 1000; // 10 minutes
+
+/**
+ * Screenshot wrapper script for capturing viewport
+ */
+const SCREENSHOT_WRAPPER_SCRIPT = `extends Node
+
+const REAL_MAIN_SCENE = "REPLACE_WITH_MAIN_SCENE_PATH"
+const TRIGGER_FILE = "res://.mcp_screenshot_req"
+const OUTPUT_FILE = "res://.mcp_screenshot.png"
+
+func _ready():
+    print("[MCP] Wrapper loaded. Starting main scene: ", REAL_MAIN_SCENE)
+    if ResourceLoader.exists(REAL_MAIN_SCENE):
+        var main_packed = load(REAL_MAIN_SCENE)
+        var main_inst = main_packed.instantiate()
+        add_child.call_deferred(main_inst)
+    else:
+        printerr("[MCP] Error: Could not find main scene at ", REAL_MAIN_SCENE)
+
+func _process(_delta):
+    if FileAccess.file_exists(TRIGGER_FILE):
+        _take_screenshot()
+        DirAccess.remove_absolute(TRIGGER_FILE)
+
+func _take_screenshot():
+    print("[MCP] Capturing screenshot...")
+    var image = get_viewport().get_texture().get_image()
+    var error = image.save_png(OUTPUT_FILE)
+    if error == OK:
+        print("[MCP] Screenshot saved to ", OUTPUT_FILE)
+    else:
+        printerr("[MCP] Failed to save screenshot. Error code: ", error)
+`;
+
+const SCREENSHOT_WRAPPER_SCENE = `[gd_scene load_steps=2 format=3]
+
+[ext_resource type="Script" path="res://.mcp_wrapper.gd" id="1_mcp"]
+
+[node name="MCPWrapper" type="Node"]
+script = ExtResource("1_mcp")
+`;
 
 /**
  * Interface for server configuration
@@ -63,11 +129,13 @@ interface OperationParams {
  */
 class GodotServer {
   private server: Server;
-  private activeProcess: GodotProcess | null = null;
+  private activeProcesses: Map<string, GodotProcess> = new Map();
   private godotPath: string | null = null;
   private operationsScriptPath: string;
   private validatedPaths: Map<string, boolean> = new Map();
   private strictPathValidation: boolean = false;
+  private nextInstanceId: number = 1;
+  private cleanupInterval: NodeJS.Timeout | null = null;
 
   /**
    * Parameter name mappings between snake_case and camelCase
@@ -154,6 +222,9 @@ class GodotServer {
     // Error handling
     this.server.onerror = (error) => console.error('[MCP Error]', error);
 
+    // Start periodic cleanup of stale exited processes
+    this.startStaleProcessCleanup();
+
     // Cleanup on exit
     process.on('SIGINT', async () => {
       await this.cleanup();
@@ -162,8 +233,51 @@ class GodotServer {
   }
 
   /**
+   * Start periodic cleanup of stale exited processes
+   */
+  private startStaleProcessCleanup(): void {
+    // Run cleanup every minute
+    this.cleanupInterval = setInterval(() => {
+      this.cleanupStaleProcesses();
+    }, 60 * 1000);
+  }
+
+  /**
+   * Clean up processes that have exited and been stale for too long
+   */
+  private cleanupStaleProcesses(): void {
+    const now = Date.now();
+    const toDelete: string[] = [];
+
+    for (const [id, process] of this.activeProcesses.entries()) {
+      if (!process.isRunning && process.exitedAt) {
+        const staleDuration = now - process.exitedAt.getTime();
+        if (staleDuration > STALE_PROCESS_CLEANUP_MS) {
+          this.logDebug(`Cleaning up stale process: ${id} (exited ${Math.round(staleDuration / 1000)}s ago)`);
+          toDelete.push(id);
+        }
+      }
+    }
+
+    for (const id of toDelete) {
+      this.activeProcesses.delete(id);
+    }
+  }
+
+  /**
+   * Add a line to a bounded buffer, removing oldest entries if limit exceeded
+   */
+  private addToBoundedBuffer(buffer: string[], line: string): void {
+    buffer.push(line);
+    // Remove oldest entries if we exceed the limit
+    while (buffer.length > OUTPUT_BUFFER_LIMIT) {
+      buffer.shift();
+    }
+  }
+
+  /**
    * Log debug messages if debug mode is enabled
-   * Using stderr instead of stdout to avoid interfering with JSON-RPC communication
+   * Note: Uses console.error to ensure it goes to stderr, not stdout (which is used for MCP protocol)
    */
   private logDebug(message: string): void {
     if (DEBUG_MODE) {
@@ -383,12 +497,94 @@ class GodotServer {
    */
   private async cleanup() {
     this.logDebug('Cleaning up resources');
-    if (this.activeProcess) {
-      this.logDebug('Killing active Godot process');
-      this.activeProcess.process.kill();
-      this.activeProcess = null;
+    
+    // Clear the cleanup interval
+    if (this.cleanupInterval) {
+      clearInterval(this.cleanupInterval);
+      this.cleanupInterval = null;
     }
+    
+    for (const [id, godotProcess] of this.activeProcesses.entries()) {
+      this.logDebug(`Killing Godot process: ${id}`);
+      try {
+        this.cleanupScreenshotArtifacts(godotProcess.projectPath);
+        godotProcess.process.kill();
+      } catch (error) {
+        this.logDebug(`Error killing process ${id}: ${error}`);
+      }
+    }
+    this.activeProcesses.clear();
     await this.server.close();
+  }
+
+  /**
+   * Setup screenshot wrapper files for a project
+   * @param projectPath Path to the Godot project
+   * @param mainScenePath Path to the main scene (relative to project)
+   */
+  private setupScreenshotWrapper(projectPath: string, mainScenePath: string): void {
+    const fs = require('fs');
+    const wrapperScriptPath = join(projectPath, '.mcp_wrapper.gd');
+    const wrapperScenePath = join(projectPath, '.mcp_wrapper.tscn');
+    
+    // Create wrapper script with the main scene path
+    const scriptContent = SCREENSHOT_WRAPPER_SCRIPT.replace(
+      'REPLACE_WITH_MAIN_SCENE_PATH',
+      mainScenePath
+    );
+    
+    fs.writeFileSync(wrapperScriptPath, scriptContent, 'utf8');
+    fs.writeFileSync(wrapperScenePath, SCREENSHOT_WRAPPER_SCENE, 'utf8');
+    
+    this.logDebug(`Created screenshot wrapper files in ${projectPath}`);
+  }
+
+  /**
+   * Clean up screenshot wrapper files from a project
+   * @param projectPath Path to the Godot project
+   */
+  private cleanupScreenshotArtifacts(projectPath: string): void {
+    const fs = require('fs');
+    const filesToRemove = [
+      '.mcp_wrapper.gd',
+      '.mcp_wrapper.tscn',
+      '.mcp_screenshot_req',
+      '.mcp_screenshot.png'
+    ];
+    
+    for (const file of filesToRemove) {
+      const filePath = join(projectPath, file);
+      try {
+        if (fs.existsSync(filePath)) {
+          fs.unlinkSync(filePath);
+          this.logDebug(`Removed screenshot artifact: ${file}`);
+        }
+      } catch (error) {
+        this.logDebug(`Failed to remove ${file}: ${error}`);
+      }
+    }
+  }
+
+  /**
+   * Get the main scene path from project.godot
+   * @param projectPath Path to the Godot project
+   * @returns The main scene path or null if not found
+   */
+  private getMainScenePath(projectPath: string): string | null {
+    const fs = require('fs');
+    const projectFile = join(projectPath, 'project.godot');
+    
+    try {
+      const content = fs.readFileSync(projectFile, 'utf8');
+      const match = content.match(/run\/main_scene="([^"]+)"/);
+      if (match && match[1]) {
+        return match[1];
+      }
+    } catch (error) {
+      this.logDebug(`Failed to read project.godot: ${error}`);
+    }
+    
+    return null;
   }
 
   /**
@@ -685,6 +881,21 @@ class GodotServer {
                 type: 'string',
                 description: 'Optional: Specific scene to run',
               },
+              instanceId: {
+                type: 'string',
+                description: 'Optional: Unique identifier for this instance (e.g., "server", "client1", "client2"). If not provided, an auto-generated ID will be used.',
+              },
+              args: {
+                type: 'array',
+                items: {
+                  type: 'string',
+                },
+                description: 'Optional: Additional command-line arguments to pass to Godot (e.g., ["--server"] or ["--", "profile=player1"])',
+              },
+              enableScreenshot: {
+                type: 'boolean',
+                description: 'Optional: Enable screenshot capture for this instance. When true, a wrapper scene will be used that allows capturing screenshots via capture_screenshot tool.',
+              },
             },
             required: ['projectPath'],
           },
@@ -694,17 +905,68 @@ class GodotServer {
           description: 'Get the current debug output and errors',
           inputSchema: {
             type: 'object',
-            properties: {},
+            properties: {
+              instanceId: {
+                type: 'string',
+                description: 'Optional: Instance ID to get output for. If not provided, returns output for all instances.',
+              },
+            },
             required: [],
           },
         },
         {
           name: 'stop_project',
-          description: 'Stop the currently running Godot project',
+          description: 'Stop running Godot project instance(s)',
           inputSchema: {
             type: 'object',
-            properties: {},
+            properties: {
+              instanceId: {
+                type: 'string',
+                description: 'Optional: Single instance ID to stop.',
+              },
+              instanceIds: {
+                type: 'array',
+                items: { type: 'string' },
+                description: 'Optional: Array of instance IDs to stop. Use this to stop multiple specific instances in one call.',
+              },
+            },
             required: [],
+          },
+        },
+        {
+          name: 'capture_screenshot',
+          description: 'Capture a screenshot from a running Godot project instance. The instance must have been started with enableScreenshot=true.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              instanceId: {
+                type: 'string',
+                description: 'Instance ID of the running Godot project to capture screenshot from.',
+              },
+              outputPath: {
+                type: 'string',
+                description: 'Optional: Path to save the screenshot. If not provided, returns base64 encoded image.',
+              },
+            },
+            required: ['instanceId'],
+          },
+        },
+        {
+          name: 'capture_screenshot',
+          description: 'Capture a screenshot from a running Godot project instance. The instance must have been started with enableScreenshot=true.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              instanceId: {
+                type: 'string',
+                description: 'Instance ID of the running Godot project to capture screenshot from.',
+              },
+              outputPath: {
+                type: 'string',
+                description: 'Optional: Path to save the screenshot. If not provided, returns base64 encoded image.',
+              },
+            },
+            required: ['instanceId'],
           },
         },
         {
@@ -913,6 +1175,286 @@ class GodotServer {
             required: ['projectPath'],
           },
         },
+        {
+          name: 'list_processes',
+          description: 'List all tracked Godot project instances (both running and recently exited)',
+          inputSchema: {
+            type: 'object',
+            properties: {},
+            required: [],
+          },
+        },
+        {
+          name: 'signal_connect',
+          description: 'Connect a signal from one node to another node\'s method in a Godot scene',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: {
+                type: 'string',
+                description: 'Path to the Godot project directory',
+              },
+              scenePath: {
+                type: 'string',
+                description: 'Path to the scene file (relative to project)',
+              },
+              sourceNodePath: {
+                type: 'string',
+                description: 'Path to the source node that emits the signal (e.g., "root/Player/Button")',
+              },
+              signalName: {
+                type: 'string',
+                description: 'Name of the signal to connect (e.g., "pressed", "body_entered")',
+              },
+              targetNodePath: {
+                type: 'string',
+                description: 'Path to the target node that will receive the signal (e.g., "root/Player")',
+              },
+              methodName: {
+                type: 'string',
+                description: 'Name of the method to call when the signal is emitted',
+              },
+              flags: {
+                type: 'number',
+                description: 'Optional: Connection flags (default: 0). Common values: 0=DEFERRED, 1=PERSIST, 2=ONE_SHOT',
+              },
+            },
+            required: ['projectPath', 'scenePath', 'sourceNodePath', 'signalName', 'targetNodePath', 'methodName'],
+          },
+        },
+        {
+          name: 'signal_disconnect',
+          description: 'Disconnect a signal connection in a Godot scene',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: {
+                type: 'string',
+                description: 'Path to the Godot project directory',
+              },
+              scenePath: {
+                type: 'string',
+                description: 'Path to the scene file (relative to project)',
+              },
+              sourceNodePath: {
+                type: 'string',
+                description: 'Path to the source node that emits the signal',
+              },
+              signalName: {
+                type: 'string',
+                description: 'Name of the signal to disconnect',
+              },
+              targetNodePath: {
+                type: 'string',
+                description: 'Path to the target node that receives the signal',
+              },
+              methodName: {
+                type: 'string',
+                description: 'Name of the method that was connected to the signal',
+              },
+            },
+            required: ['projectPath', 'scenePath', 'sourceNodePath', 'signalName', 'targetNodePath', 'methodName'],
+          },
+        },
+        {
+          name: 'group_add',
+          description: 'Add a node to a group in a Godot scene',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: {
+                type: 'string',
+                description: 'Path to the Godot project directory',
+              },
+              scenePath: {
+                type: 'string',
+                description: 'Path to the scene file (relative to project)',
+              },
+              nodePath: {
+                type: 'string',
+                description: 'Path to the node to add to the group (e.g., "root/Player")',
+              },
+              groupName: {
+                type: 'string',
+                description: 'Name of the group to add the node to',
+              },
+            },
+            required: ['projectPath', 'scenePath', 'nodePath', 'groupName'],
+          },
+        },
+        {
+          name: 'group_remove',
+          description: 'Remove a node from a group in a Godot scene',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: {
+                type: 'string',
+                description: 'Path to the Godot project directory',
+              },
+              scenePath: {
+                type: 'string',
+                description: 'Path to the scene file (relative to project)',
+              },
+              nodePath: {
+                type: 'string',
+                description: 'Path to the node to remove from the group',
+              },
+              groupName: {
+                type: 'string',
+                description: 'Name of the group to remove the node from',
+              },
+            },
+            required: ['projectPath', 'scenePath', 'nodePath', 'groupName'],
+          },
+        },
+        {
+          name: 'list_groups',
+          description: 'List all groups in a Godot scene',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: {
+                type: 'string',
+                description: 'Path to the Godot project directory',
+              },
+              scenePath: {
+                type: 'string',
+                description: 'Path to the scene file (relative to project)',
+              },
+            },
+            required: ['projectPath', 'scenePath'],
+          },
+        },
+        {
+          name: 'ui_create_button',
+          description: 'Create a Button node in a Godot scene with customizable properties',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: {
+                type: 'string',
+                description: 'Path to the Godot project directory',
+              },
+              scenePath: {
+                type: 'string',
+                description: 'Path to the scene file (relative to project)',
+              },
+              parentNodePath: {
+                type: 'string',
+                description: 'Path to the parent node (e.g., "root/MainMenu")',
+              },
+              nodeName: {
+                type: 'string',
+                description: 'Name for the new button node',
+              },
+              text: {
+                type: 'string',
+                description: 'Text to display on the button',
+              },
+              position: {
+                type: 'object',
+                properties: {
+                  x: { type: 'number', description: 'X position' },
+                  y: { type: 'number', description: 'Y position' },
+                },
+                description: 'Position of the button (x, y)',
+              },
+              size: {
+                type: 'object',
+                properties: {
+                  width: { type: 'number', description: 'Width' },
+                  height: { type: 'number', description: 'Height' },
+                },
+                description: 'Size of the button (width, height)',
+              },
+            },
+            required: ['projectPath', 'scenePath', 'parentNodePath', 'nodeName', 'text'],
+          },
+        },
+        {
+          name: 'ui_create_label',
+          description: 'Create a Label node in a Godot scene with customizable properties',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: {
+                type: 'string',
+                description: 'Path to the Godot project directory',
+              },
+              scenePath: {
+                type: 'string',
+                description: 'Path to the scene file (relative to project)',
+              },
+              parentNodePath: {
+                type: 'string',
+                description: 'Path to the parent node (e.g., "root/MainMenu")',
+              },
+              nodeName: {
+                type: 'string',
+                description: 'Name for the new label node',
+              },
+              text: {
+                type: 'string',
+                description: 'Text to display in the label',
+              },
+              position: {
+                type: 'object',
+                properties: {
+                  x: { type: 'number', description: 'X position' },
+                  y: { type: 'number', description: 'Y position' },
+                },
+                description: 'Position of the label (x, y)',
+              },
+              fontSize: {
+                type: 'number',
+                description: 'Font size for the label text',
+              },
+            },
+            required: ['projectPath', 'scenePath', 'parentNodePath', 'nodeName', 'text'],
+          },
+        },
+        {
+          name: 'run_multiple_projects',
+          description: 'Launch multiple Godot project instances in a single call. Useful for multiplayer testing (server + clients).',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              instances: {
+                type: 'array',
+                items: {
+                  type: 'object',
+                  properties: {
+                    projectPath: {
+                      type: 'string',
+                      description: 'Path to the Godot project directory',
+                    },
+                    instanceId: {
+                      type: 'string',
+                      description: 'Optional: Unique identifier for this instance (e.g., "server", "client1")',
+                    },
+                    scene: {
+                      type: 'string',
+                      description: 'Optional: Specific scene to run',
+                    },
+                    args: {
+                      type: 'array',
+                      items: { type: 'string' },
+                      description: 'Optional: Command-line arguments for this instance',
+                    },
+                    delayMs: {
+                      type: 'number',
+                      description: 'Optional: Delay in milliseconds before launching this instance (useful for staggering server/client startup)',
+                    },
+                  },
+                  required: ['projectPath'],
+                },
+                description: 'Array of instance configurations to launch',
+              },
+            },
+            required: ['instances'],
+          },
+        },
       ],
     }));
 
@@ -925,9 +1467,11 @@ class GodotServer {
         case 'run_project':
           return await this.handleRunProject(request.params.arguments);
         case 'get_debug_output':
-          return await this.handleGetDebugOutput();
+          return await this.handleGetDebugOutput(request.params.arguments);
         case 'stop_project':
-          return await this.handleStopProject();
+          return await this.handleStopProject(request.params.arguments);
+        case 'capture_screenshot':
+          return await this.handleCaptureScreenshot(request.params.arguments);
         case 'get_godot_version':
           return await this.handleGetGodotVersion();
         case 'list_projects':
@@ -948,6 +1492,24 @@ class GodotServer {
           return await this.handleGetUid(request.params.arguments);
         case 'update_project_uids':
           return await this.handleUpdateProjectUids(request.params.arguments);
+        case 'list_processes':
+          return await this.handleListProcesses();
+        case 'run_multiple_projects':
+          return await this.handleRunMultipleProjects(request.params.arguments);
+        case 'signal_connect':
+          return await this.handleSignalConnect(request.params.arguments);
+        case 'signal_disconnect':
+          return await this.handleSignalDisconnect(request.params.arguments);
+        case 'group_add':
+          return await this.handleGroupAdd(request.params.arguments);
+        case 'group_remove':
+          return await this.handleGroupRemove(request.params.arguments);
+        case 'list_groups':
+          return await this.handleListGroups(request.params.arguments);
+        case 'ui_create_button':
+          return await this.handleUiCreateButton(request.params.arguments);
+        case 'ui_create_label':
+          return await this.handleUiCreateLabel(request.params.arguments);
         default:
           throw new McpError(
             ErrorCode.MethodNotFound,
@@ -1071,60 +1633,127 @@ class GodotServer {
         );
       }
 
-      // Kill any existing process
-      if (this.activeProcess) {
-        this.logDebug('Killing existing Godot process before starting a new one');
-        this.activeProcess.process.kill();
+      // Generate or use provided instance ID
+      let instanceId = args.instanceId;
+      if (!instanceId) {
+        instanceId = `instance_${this.nextInstanceId++}`;
+      }
+
+      // Check if instance ID already exists and is running
+      const existingProcess = this.activeProcesses.get(instanceId);
+      if (existingProcess) {
+        if (existingProcess.isRunning) {
+          return this.createErrorResponse(
+            `Instance ID "${instanceId}" is already in use by a running process`,
+            [
+              'Use a different instanceId',
+              'Stop the existing instance first using stop_project',
+              'Use list_processes to see all running instances',
+            ]
+          );
+        } else {
+          // Clean up exited process to allow reuse of the ID
+          this.logDebug(`Cleaning up exited process ${instanceId} to allow ID reuse`);
+          this.activeProcesses.delete(instanceId);
+        }
       }
 
       const cmdArgs = ['-d', '--path', args.projectPath];
-      if (args.scene && this.validatePath(args.scene)) {
+      
+      // Handle screenshot wrapper setup
+      let screenshotEnabled = false;
+      if (args.enableScreenshot === true) {
+        const mainScene = this.getMainScenePath(args.projectPath);
+        if (mainScene) {
+          this.setupScreenshotWrapper(args.projectPath, mainScene);
+          cmdArgs.push('.mcp_wrapper.tscn');
+          screenshotEnabled = true;
+          this.logDebug(`Screenshot wrapper enabled for instance ${instanceId}`);
+        } else {
+          this.logDebug(`Could not determine main scene, screenshot disabled for instance ${instanceId}`);
+        }
+      }
+      
+      if (args.scene && this.validatePath(args.scene) && !screenshotEnabled) {
         this.logDebug(`Adding scene parameter: ${args.scene}`);
         cmdArgs.push(args.scene);
       }
+      // Add additional command-line arguments if provided
+      if (args.args && Array.isArray(args.args)) {
+        for (const arg of args.args) {
+          if (typeof arg === 'string' && arg.trim() !== '') {
+            this.logDebug(`Adding command-line argument: ${arg}`);
+            cmdArgs.push(arg);
+          }
+        }
+      }
 
-      this.logDebug(`Running Godot project: ${args.projectPath}`);
-      const process = spawn(this.godotPath!, cmdArgs, { stdio: 'pipe' });
+      this.logDebug(`Running Godot project: ${args.projectPath} with instanceId: ${instanceId}`);
+      const godotProcess = spawn(this.godotPath!, cmdArgs, { stdio: 'pipe' });
       const output: string[] = [];
       const errors: string[] = [];
 
-      process.stdout?.on('data', (data: Buffer) => {
-        const lines = data.toString().split('\n');
-        output.push(...lines);
-        lines.forEach((line: string) => {
-          if (line.trim()) this.logDebug(`[Godot stdout] ${line}`);
-        });
-      });
+      const processInfo: GodotProcess = {
+        id: instanceId,
+        process: godotProcess,
+        output,
+        errors,
+        projectPath: args.projectPath,
+        scene: args.scene,
+        args: args.args,
+        startedAt: new Date(),
+        isRunning: true,
+        screenshotEnabled,
+      };
 
-      process.stderr?.on('data', (data: Buffer) => {
-        const lines = data.toString().split('\n');
-        errors.push(...lines);
-        lines.forEach((line: string) => {
-          if (line.trim()) this.logDebug(`[Godot stderr] ${line}`);
-        });
-      });
-
-      process.on('exit', (code: number | null) => {
-        this.logDebug(`Godot process exited with code ${code}`);
-        if (this.activeProcess && this.activeProcess.process === process) {
-          this.activeProcess = null;
+      godotProcess.stdout?.on('data', (data: Buffer) => {
+        const rawLines = data.toString().split('\n');
+        for (const line of rawLines) {
+          // Strip carriage returns and trim whitespace
+          const cleaned = line.replace(/\r/g, '').trimEnd();
+          // Only add non-empty lines to output
+          if (cleaned.length > 0) {
+            this.addToBoundedBuffer(processInfo.output, cleaned);
+            this.logDebug(`[Godot ${instanceId} stdout] ${cleaned}`);
+          }
         }
       });
 
-      process.on('error', (err: Error) => {
-        console.error('Failed to start Godot process:', err);
-        if (this.activeProcess && this.activeProcess.process === process) {
-          this.activeProcess = null;
+      godotProcess.stderr?.on('data', (data: Buffer) => {
+        const rawLines = data.toString().split('\n');
+        for (const line of rawLines) {
+          // Strip carriage returns and trim whitespace
+          const cleaned = line.replace(/\r/g, '').trimEnd();
+          // Only add non-empty lines to errors
+          if (cleaned.length > 0) {
+            this.addToBoundedBuffer(processInfo.errors, cleaned);
+            this.logDebug(`[Godot ${instanceId} stderr] ${cleaned}`);
+          }
         }
       });
 
-      this.activeProcess = { process, output, errors };
+      godotProcess.on('exit', (code: number | null) => {
+        this.logDebug(`Godot process ${instanceId} exited with code ${code}`);
+        processInfo.isRunning = false;
+        processInfo.exitedAt = new Date();
+        // Keep the process info after exit so we can retrieve output
+        // Stale processes will be cleaned up by the periodic cleanup task
+      });
+
+      godotProcess.on('error', (err: Error) => {
+        console.error(`Failed to start Godot process ${instanceId}:`, err);
+        processInfo.errors.push(`Process error: ${err.message}`);
+        processInfo.isRunning = false;
+        processInfo.exitedAt = new Date();
+      });
+
+      this.activeProcesses.set(instanceId, processInfo);
 
       return {
         content: [
           {
             type: 'text',
-            text: `Godot project started in debug mode. Use get_debug_output to see output.`,
+            text: `Godot project started in debug mode with instanceId: ${instanceId}. Use get_debug_output to see output.`,
           },
         ],
       };
@@ -1144,16 +1773,210 @@ class GodotServer {
   /**
    * Handle the get_debug_output tool
    */
-  private async handleGetDebugOutput() {
-    if (!this.activeProcess) {
+  private async handleGetDebugOutput(args: any) {
+    // Normalize parameters to camelCase
+    args = this.normalizeParameters(args || {});
+    
+    if (this.activeProcesses.size === 0) {
       return this.createErrorResponse(
-        'No active Godot process.',
+        'No active Godot processes.',
         [
           'Use run_project to start a Godot project first',
-          'Check if the Godot process crashed unexpectedly',
+          'Check if the Godot processes crashed unexpectedly',
         ]
       );
     }
+
+    // If instanceId is provided, return output for that specific instance
+    if (args.instanceId) {
+      const process = this.activeProcesses.get(args.instanceId);
+      if (!process) {
+        return this.createErrorResponse(
+          `No process found with instanceId: ${args.instanceId}`,
+          [
+            'Use list_processes to see all tracked instances',
+            'The instance may have been cleaned up after being exited for too long',
+          ]
+        );
+      }
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(
+              {
+                instanceId: process.id,
+                projectPath: process.projectPath,
+                scene: process.scene,
+                startedAt: process.startedAt.toISOString(),
+                isRunning: process.isRunning,
+                output: process.output,
+                errors: process.errors,
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    }
+
+    // Return output for all instances
+    const allOutputs: any[] = [];
+    for (const [id, process] of this.activeProcesses.entries()) {
+      allOutputs.push({
+        instanceId: process.id,
+        projectPath: process.projectPath,
+        scene: process.scene,
+        startedAt: process.startedAt.toISOString(),
+        isRunning: process.isRunning,
+        output: process.output,
+        errors: process.errors,
+      });
+    }
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(allOutputs, null, 2),
+        },
+      ],
+    };
+  }
+
+  /**
+   * Handle the stop_project tool
+   */
+  private async handleStopProject(args: any) {
+    // Normalize parameters to camelCase
+    args = this.normalizeParameters(args || {});
+    
+    if (this.activeProcesses.size === 0) {
+      return this.createErrorResponse(
+        'No active Godot processes to stop.',
+        [
+          'Use run_project to start a Godot project first',
+          'The processes may have already terminated',
+        ]
+      );
+    }
+
+    // Helper function to stop a single instance
+    const stopInstance = (instanceId: string): { success: boolean; result?: any; error?: string } => {
+      const process = this.activeProcesses.get(instanceId);
+      if (!process) {
+        return { success: false, error: `No process found with instanceId: ${instanceId}` };
+      }
+
+      this.logDebug(`Stopping Godot process: ${instanceId}`);
+      try {
+        // Only attempt to kill if the process is still running
+        if (process.isRunning) {
+          process.process.kill();
+        }
+        const result = {
+          instanceId: process.id,
+          projectPath: process.projectPath,
+          wasRunning: process.isRunning,
+          finalOutput: process.output,
+          finalErrors: process.errors,
+        };
+        this.activeProcesses.delete(instanceId);
+        return { success: true, result };
+      } catch (error) {
+        this.logDebug(`Error stopping process ${instanceId}: ${error}`);
+        return { success: false, error: `Failed to stop ${instanceId}: ${error}` };
+      }
+    };
+
+    // If instanceIds array is provided, stop those specific instances
+    if (args.instanceIds && Array.isArray(args.instanceIds) && args.instanceIds.length > 0) {
+      this.logDebug(`Stopping multiple Godot processes: ${args.instanceIds.join(', ')}`);
+      const stoppedInstances: any[] = [];
+      const errors: string[] = [];
+
+      for (const instanceId of args.instanceIds) {
+        const result = stopInstance(instanceId);
+        if (result.success && result.result) {
+          stoppedInstances.push(result.result);
+        } else if (result.error) {
+          errors.push(result.error);
+        }
+      }
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(
+              {
+                message: `Stopped ${stoppedInstances.length} of ${args.instanceIds.length} requested instances`,
+                stoppedInstances,
+                errors: errors.length > 0 ? errors : undefined,
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    }
+
+    // If single instanceId is provided, stop that specific instance
+    if (args.instanceId) {
+      const result = stopInstance(args.instanceId);
+      if (!result.success) {
+        return this.createErrorResponse(
+          result.error || `Failed to stop instance: ${args.instanceId}`,
+          [
+            'Use list_processes to see all running instances',
+            'Check if the instance has already exited',
+          ]
+        );
+      }
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(
+              {
+                message: `Godot project instance "${args.instanceId}" stopped`,
+                ...result.result,
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    }
+
+    // Stop all instances (only kill running ones, but remove all from tracking)
+    this.logDebug('Stopping all Godot processes');
+    const stoppedInstances: any[] = [];
+    
+    for (const [id, process] of this.activeProcesses.entries()) {
+      try {
+        // Only attempt to kill if the process is still running
+        if (process.isRunning) {
+          process.process.kill();
+        }
+        stoppedInstances.push({
+          instanceId: process.id,
+          projectPath: process.projectPath,
+          wasRunning: process.isRunning,
+          finalOutput: process.output,
+          finalErrors: process.errors,
+        });
+      } catch (error) {
+        this.logDebug(`Error stopping process ${id}: ${error}`);
+      }
+    }
+    
+    this.activeProcesses.clear();
 
     return {
       content: [
@@ -1161,8 +1984,8 @@ class GodotServer {
           type: 'text',
           text: JSON.stringify(
             {
-              output: this.activeProcess.output,
-              errors: this.activeProcess.errors,
+              message: 'All Godot project instances stopped',
+              stoppedInstances,
             },
             null,
             2
@@ -1173,24 +1996,41 @@ class GodotServer {
   }
 
   /**
-   * Handle the stop_project tool
+   * Handle the list_processes tool
    */
-  private async handleStopProject() {
-    if (!this.activeProcess) {
-      return this.createErrorResponse(
-        'No active Godot process to stop.',
-        [
-          'Use run_project to start a Godot project first',
-          'The process may have already terminated',
-        ]
-      );
+  private async handleListProcesses() {
+    if (this.activeProcesses.size === 0) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(
+              {
+                message: 'No running Godot processes',
+                processes: [],
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
     }
 
-    this.logDebug('Stopping active Godot process');
-    this.activeProcess.process.kill();
-    const output = this.activeProcess.output;
-    const errors = this.activeProcess.errors;
-    this.activeProcess = null;
+    const processes: any[] = [];
+    for (const [id, process] of this.activeProcesses.entries()) {
+      processes.push({
+        instanceId: process.id,
+        projectPath: process.projectPath,
+        scene: process.scene,
+        args: process.args,
+        startedAt: process.startedAt.toISOString(),
+        exitedAt: process.exitedAt?.toISOString(),
+        isRunning: process.isRunning,
+        outputLines: process.output.length,
+        errorLines: process.errors.length,
+      });
+    }
 
     return {
       content: [
@@ -1198,9 +2038,613 @@ class GodotServer {
           type: 'text',
           text: JSON.stringify(
             {
-              message: 'Godot project stopped',
-              finalOutput: output,
-              finalErrors: errors,
+              count: processes.length,
+              processes,
+            },
+            null,
+            2
+          ),
+        },
+      ],
+    };
+  }
+
+  /**
+   * Handle the capture_screenshot tool
+   * Captures a screenshot from a running Godot project instance
+   */
+  private async handleCaptureScreenshot(args: any) {
+    const fs = require('fs');
+    args = this.normalizeParameters(args || {});
+
+    if (!args.instanceId) {
+      return this.createErrorResponse(
+        'instanceId is required',
+        ['Provide the instance ID of the running Godot project']
+      );
+    }
+
+    const process = this.activeProcesses.get(args.instanceId);
+    if (!process) {
+      return this.createErrorResponse(
+        `No process found with instanceId: ${args.instanceId}`,
+        [
+          'Use list_processes to see all tracked instances',
+          'The instance may have been cleaned up after being exited for too long',
+        ]
+      );
+    }
+
+    if (!process.isRunning) {
+      return this.createErrorResponse(
+        `Instance ${args.instanceId} is not running`,
+        ['The Godot project must be running to capture a screenshot']
+      );
+    }
+
+    if (!process.screenshotEnabled) {
+      return this.createErrorResponse(
+        `Instance ${args.instanceId} does not have screenshot support enabled`,
+        [
+          'Restart the instance with enableScreenshot=true',
+          'Use run_project with enableScreenshot parameter to enable screenshot capture',
+        ]
+      );
+    }
+
+    try {
+      // Create trigger file to request screenshot
+      const triggerPath = join(process.projectPath, '.mcp_screenshot_req');
+      const outputPath = join(process.projectPath, '.mcp_screenshot.png');
+      
+      // Remove any existing screenshot
+      if (fs.existsSync(outputPath)) {
+        fs.unlinkSync(outputPath);
+      }
+      
+      // Create trigger file
+      fs.writeFileSync(triggerPath, '', 'utf8');
+      this.logDebug(`Created screenshot trigger file for instance ${args.instanceId}`);
+
+      // Wait for screenshot to be captured (with timeout)
+      const maxWaitMs = 5000;
+      const checkIntervalMs = 100;
+      let elapsed = 0;
+      
+      while (elapsed < maxWaitMs) {
+        await new Promise(resolve => setTimeout(resolve, checkIntervalMs));
+        elapsed += checkIntervalMs;
+        
+        if (fs.existsSync(outputPath)) {
+          this.logDebug(`Screenshot captured for instance ${args.instanceId}`);
+          
+          // Read the screenshot file
+          const imageBuffer = fs.readFileSync(outputPath);
+          const base64Image = imageBuffer.toString('base64');
+          
+          // If outputPath is provided, save to that location
+          if (args.outputPath && this.validatePath(args.outputPath)) {
+            fs.copyFileSync(outputPath, args.outputPath);
+            return {
+              content: [
+                {
+                  type: 'text',
+                  text: JSON.stringify(
+                    {
+                      success: true,
+                      message: `Screenshot saved to ${args.outputPath}`,
+                      instanceId: args.instanceId,
+                      savedPath: args.outputPath,
+                    },
+                    null,
+                    2
+                  ),
+                },
+              ],
+            };
+          }
+          
+          // Return base64 encoded image
+          return {
+            content: [
+              {
+                type: 'image',
+                data: base64Image,
+                mimeType: 'image/png',
+              },
+            ],
+          };
+        }
+      }
+
+      return this.createErrorResponse(
+        'Screenshot capture timed out',
+        [
+          'The Godot project may not be responding',
+          'Ensure the game loop is running (not paused or blocked)',
+          'Try again after the game has fully loaded',
+        ]
+      );
+    } catch (error: unknown) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      return this.createErrorResponse(
+        `Failed to capture screenshot: ${errorMessage}`,
+        [
+          'Ensure the Godot project is running correctly',
+          'Check if the project has write permissions',
+        ]
+      );
+    }
+  }
+
+  /**
+   * Handle the signal_connect tool
+   * Connect a signal from one node to another node's method
+   */
+  private async handleSignalConnect(args: any) {
+    args = this.normalizeParameters(args || {});
+
+    if (!args.projectPath || !args.scenePath || !args.sourceNodePath || 
+        !args.signalName || !args.targetNodePath || !args.methodName) {
+      return this.createErrorResponse(
+        'Missing required parameters for signal_connect',
+        ['Required: projectPath, scenePath, sourceNodePath, signalName, targetNodePath, methodName']
+      );
+    }
+
+    const params = {
+      scene_path: args.scenePath,
+      source_node_path: args.sourceNodePath,
+      signal_name: args.signalName,
+      target_node_path: args.targetNodePath,
+      method_name: args.methodName,
+      flags: args.flags || 0,
+    };
+
+    return await this.executeGodotOperation(args.projectPath, 'signal_connect', params);
+  }
+
+  /**
+   * Handle the signal_disconnect tool
+   * Disconnect a signal connection
+   */
+  private async handleSignalDisconnect(args: any) {
+    args = this.normalizeParameters(args || {});
+
+    if (!args.projectPath || !args.scenePath || !args.sourceNodePath || 
+        !args.signalName || !args.targetNodePath || !args.methodName) {
+      return this.createErrorResponse(
+        'Missing required parameters for signal_disconnect',
+        ['Required: projectPath, scenePath, sourceNodePath, signalName, targetNodePath, methodName']
+      );
+    }
+
+    const params = {
+      scene_path: args.scenePath,
+      source_node_path: args.sourceNodePath,
+      signal_name: args.signalName,
+      target_node_path: args.targetNodePath,
+      method_name: args.methodName,
+    };
+
+    return await this.executeGodotOperation(args.projectPath, 'signal_disconnect', params);
+  }
+
+  /**
+   * Handle the group_add tool
+   * Add a node to a group
+   */
+  private async handleGroupAdd(args: any) {
+    args = this.normalizeParameters(args || {});
+
+    if (!args.projectPath || !args.scenePath || !args.nodePath || !args.groupName) {
+      return this.createErrorResponse(
+        'Missing required parameters for group_add',
+        ['Required: projectPath, scenePath, nodePath, groupName']
+      );
+    }
+
+    const params = {
+      scene_path: args.scenePath,
+      node_path: args.nodePath,
+      group_name: args.groupName,
+    };
+
+    return await this.executeGodotOperation(args.projectPath, 'group_add', params);
+  }
+
+  /**
+   * Handle the group_remove tool
+   * Remove a node from a group
+   */
+  private async handleGroupRemove(args: any) {
+    args = this.normalizeParameters(args || {});
+
+    if (!args.projectPath || !args.scenePath || !args.nodePath || !args.groupName) {
+      return this.createErrorResponse(
+        'Missing required parameters for group_remove',
+        ['Required: projectPath, scenePath, nodePath, groupName']
+      );
+    }
+
+    const params = {
+      scene_path: args.scenePath,
+      node_path: args.nodePath,
+      group_name: args.groupName,
+    };
+
+    return await this.executeGodotOperation(args.projectPath, 'group_remove', params);
+  }
+
+  /**
+   * Handle the list_groups tool
+   * List all groups in a scene
+   */
+  private async handleListGroups(args: any) {
+    args = this.normalizeParameters(args || {});
+
+    if (!args.projectPath || !args.scenePath) {
+      return this.createErrorResponse(
+        'Missing required parameters for list_groups',
+        ['Required: projectPath, scenePath']
+      );
+    }
+
+    const params = {
+      scene_path: args.scenePath,
+    };
+
+    return await this.executeGodotOperation(args.projectPath, 'list_groups', params);
+  }
+
+  /**
+   * Handle the ui_create_button tool
+   * Create a Button node in a scene
+   */
+  private async handleUiCreateButton(args: any) {
+    args = this.normalizeParameters(args || {});
+
+    if (!args.projectPath || !args.scenePath || !args.parentNodePath || 
+        !args.nodeName || !args.text) {
+      return this.createErrorResponse(
+        'Missing required parameters for ui_create_button',
+        ['Required: projectPath, scenePath, parentNodePath, nodeName, text']
+      );
+    }
+
+    const params: any = {
+      scene_path: args.scenePath,
+      parent_node_path: args.parentNodePath,
+      node_name: args.nodeName,
+      text: args.text,
+    };
+
+    if (args.position) {
+      params.position = args.position;
+    }
+    if (args.size) {
+      params.size = args.size;
+    }
+
+    return await this.executeGodotOperation(args.projectPath, 'ui_create_button', params);
+  }
+
+  /**
+   * Handle the ui_create_label tool
+   * Create a Label node in a scene
+   */
+  private async handleUiCreateLabel(args: any) {
+    args = this.normalizeParameters(args || {});
+
+    if (!args.projectPath || !args.scenePath || !args.parentNodePath || 
+        !args.nodeName || !args.text) {
+      return this.createErrorResponse(
+        'Missing required parameters for ui_create_label',
+        ['Required: projectPath, scenePath, parentNodePath, nodeName, text']
+      );
+    }
+
+    const params: any = {
+      scene_path: args.scenePath,
+      parent_node_path: args.parentNodePath,
+      node_name: args.nodeName,
+      text: args.text,
+    };
+
+    if (args.position) {
+      params.position = args.position;
+    }
+    if (args.fontSize) {
+      params.font_size = args.fontSize;
+    }
+
+    return await this.executeGodotOperation(args.projectPath, 'ui_create_label', params);
+  }
+
+  /**
+   * Execute a Godot operation using the operations script
+   */
+  private async executeGodotOperation(projectPath: string, operation: string, params: any) {
+    if (!this.godotPath) {
+      await this.detectGodotPath();
+      if (!this.godotPath) {
+        return this.createErrorResponse(
+          'Could not find a valid Godot executable path',
+          ['Set GODOT_PATH environment variable']
+        );
+      }
+    }
+
+    const operationScript = join(__dirname, 'scripts', 'godot_operations.gd');
+    if (!existsSync(operationScript)) {
+      return this.createErrorResponse(
+        'Godot operations script not found',
+        ['Ensure the MCP server is built correctly']
+      );
+    }
+
+    const args = [
+      '--headless',
+      '--path', projectPath,
+      '-s', operationScript,
+      '--',
+      JSON.stringify({ operation, params }),
+    ];
+
+    return new Promise((resolve) => {
+      const process = spawn(this.godotPath!, args, { stdio: 'pipe' });
+      let output = '';
+      let errors = '';
+
+      process.stdout.on('data', (data: Buffer) => {
+        output += data.toString();
+      });
+
+      process.stderr.on('data', (data: Buffer) => {
+        errors += data.toString();
+      });
+
+      process.on('close', (code: number) => {
+        if (code === 0) {
+          resolve({
+            content: [
+              {
+                type: 'text',
+                text: output || `Operation ${operation} completed successfully`,
+              },
+            ],
+          });
+        } else {
+          resolve(this.createErrorResponse(
+            `Operation ${operation} failed with code ${code}`,
+            [errors || 'Unknown error']
+          ));
+        }
+      });
+
+      process.on('error', (error: Error) => {
+        resolve(this.createErrorResponse(
+          `Failed to execute operation: ${error.message}`,
+          ['Ensure Godot is installed correctly']
+        ));
+      });
+    });
+  }
+
+  /**
+   * Handle the run_multiple_projects tool
+   * Launches multiple Godot instances with optional staggered delays
+   */
+  private async handleRunMultipleProjects(args: any) {
+    // Normalize parameters to camelCase
+    args = this.normalizeParameters(args || {});
+
+    if (!args.instances || !Array.isArray(args.instances) || args.instances.length === 0) {
+      return this.createErrorResponse(
+        'instances array is required and must not be empty',
+        ['Provide an array of instance configurations with at least one entry']
+      );
+    }
+
+    // Ensure godotPath is set
+    if (!this.godotPath) {
+      await this.detectGodotPath();
+      if (!this.godotPath) {
+        return this.createErrorResponse(
+          'Could not find a valid Godot executable path',
+          [
+            'Ensure Godot is installed correctly',
+            'Set GODOT_PATH environment variable to specify the correct path',
+          ]
+        );
+      }
+    }
+
+    // Validate all instances first before launching any
+    const validatedInstances: InstanceConfig[] = [];
+    const validationErrors: string[] = [];
+
+    for (let i = 0; i < args.instances.length; i++) {
+      const instance = this.normalizeParameters(args.instances[i]) as InstanceConfig;
+      
+      if (!instance.projectPath) {
+        validationErrors.push(`Instance ${i}: projectPath is required`);
+        continue;
+      }
+
+      if (!this.validatePath(instance.projectPath)) {
+        validationErrors.push(`Instance ${i}: Invalid project path`);
+        continue;
+      }
+
+      const projectFile = join(instance.projectPath, 'project.godot');
+      if (!existsSync(projectFile)) {
+        validationErrors.push(`Instance ${i}: Not a valid Godot project: ${instance.projectPath}`);
+        continue;
+      }
+
+      // Generate instanceId if not provided
+      if (!instance.instanceId) {
+        instance.instanceId = `instance_${this.nextInstanceId++}`;
+      }
+
+      // Check for duplicate instanceId - only block if process is still running
+      const existingProcess = this.activeProcesses.get(instance.instanceId);
+      if (existingProcess) {
+        if (existingProcess.isRunning) {
+          validationErrors.push(`Instance ${i}: instanceId "${instance.instanceId}" is already in use by a running process`);
+          continue;
+        } else {
+          // Clean up exited process to allow reuse of the ID
+          this.logDebug(`Cleaning up exited process ${instance.instanceId} to allow ID reuse`);
+          this.activeProcesses.delete(instance.instanceId);
+        }
+      }
+
+      // Check for duplicates within this batch
+      if (validatedInstances.some(v => v.instanceId === instance.instanceId)) {
+        validationErrors.push(`Instance ${i}: duplicate instanceId "${instance.instanceId}" in batch`);
+        continue;
+      }
+
+      validatedInstances.push(instance);
+    }
+
+    if (validationErrors.length > 0) {
+      return this.createErrorResponse(
+        `Validation failed for ${validationErrors.length} instance(s):\n${validationErrors.join('\n')}`,
+        [
+          'Fix the validation errors and try again',
+          'Use list_processes to see currently running instances',
+        ]
+      );
+    }
+
+    // Sort instances by delayMs (ascending) for proper staggering
+    validatedInstances.sort((a, b) => (a.delayMs || 0) - (b.delayMs || 0));
+
+    // Launch instances with delays
+    const launchedInstances: any[] = [];
+    const launchErrors: string[] = [];
+
+    const launchInstance = (instance: InstanceConfig): { success: boolean; result?: any; error?: string } => {
+      try {
+        const cmdArgs = ['-d', '--path', instance.projectPath];
+        
+        if (instance.scene && this.validatePath(instance.scene)) {
+          cmdArgs.push(instance.scene);
+        }
+        
+        if (instance.args && Array.isArray(instance.args)) {
+          for (const arg of instance.args) {
+            if (typeof arg === 'string' && arg.trim() !== '') {
+              cmdArgs.push(arg);
+            }
+          }
+        }
+
+        this.logDebug(`Launching Godot instance: ${instance.instanceId} with args: ${cmdArgs.join(' ')}`);
+        const godotProcess = spawn(this.godotPath!, cmdArgs, { stdio: 'pipe' });
+        const output: string[] = [];
+        const errors: string[] = [];
+
+        const processInfo: GodotProcess = {
+          id: instance.instanceId!,
+          process: godotProcess,
+          output,
+          errors,
+          projectPath: instance.projectPath,
+          scene: instance.scene,
+          args: instance.args,
+          startedAt: new Date(),
+          isRunning: true,
+        };
+
+        godotProcess.stdout?.on('data', (data: Buffer) => {
+          const rawLines = data.toString().split('\n');
+          for (const line of rawLines) {
+            const cleaned = line.replace(/\r/g, '').trimEnd();
+            if (cleaned.length > 0) {
+              this.addToBoundedBuffer(processInfo.output, cleaned);
+              this.logDebug(`[Godot ${instance.instanceId} stdout] ${cleaned}`);
+            }
+          }
+        });
+
+        godotProcess.stderr?.on('data', (data: Buffer) => {
+          const rawLines = data.toString().split('\n');
+          for (const line of rawLines) {
+            const cleaned = line.replace(/\r/g, '').trimEnd();
+            if (cleaned.length > 0) {
+              this.addToBoundedBuffer(processInfo.errors, cleaned);
+              this.logDebug(`[Godot ${instance.instanceId} stderr] ${cleaned}`);
+            }
+          }
+        });
+
+        godotProcess.on('exit', (code: number | null) => {
+          this.logDebug(`Godot process ${instance.instanceId} exited with code ${code}`);
+          processInfo.isRunning = false;
+          processInfo.exitedAt = new Date();
+        });
+
+        godotProcess.on('error', (err: Error) => {
+          console.error(`Failed to start Godot process ${instance.instanceId}:`, err);
+          processInfo.errors.push(`Process error: ${err.message}`);
+          processInfo.isRunning = false;
+          processInfo.exitedAt = new Date();
+        });
+
+        this.activeProcesses.set(instance.instanceId!, processInfo);
+
+        return {
+          success: true,
+          result: {
+            instanceId: instance.instanceId,
+            projectPath: instance.projectPath,
+            scene: instance.scene,
+            args: instance.args,
+            delayMs: instance.delayMs || 0,
+          },
+        };
+      } catch (error: unknown) {
+        const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+        return { success: false, error: `Failed to launch ${instance.instanceId}: ${errorMessage}` };
+      }
+    };
+
+    // Launch with delays using async/await
+    const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+    let lastDelay = 0;
+
+    for (const instance of validatedInstances) {
+      const targetDelay = instance.delayMs || 0;
+      const waitTime = targetDelay - lastDelay;
+      
+      if (waitTime > 0) {
+        this.logDebug(`Waiting ${waitTime}ms before launching ${instance.instanceId}`);
+        await sleep(waitTime);
+      }
+      
+      lastDelay = targetDelay;
+
+      const result = launchInstance(instance);
+      if (result.success && result.result) {
+        launchedInstances.push(result.result);
+      } else if (result.error) {
+        launchErrors.push(result.error);
+      }
+    }
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(
+            {
+              message: `Launched ${launchedInstances.length} of ${validatedInstances.length} instances`,
+              launchedInstances,
+              errors: launchErrors.length > 0 ? launchErrors : undefined,
             },
             null,
             2
@@ -2176,14 +3620,173 @@ class GodotServer {
 
       console.error(`[SERVER] Using Godot at: ${this.godotPath}`);
 
-      const transport = new StdioServerTransport();
-      await this.server.connect(transport);
-      console.error('Godot MCP server running on stdio');
+      // Check transport mode
+      const transport = process.env.MCP_TRANSPORT || 'stdio';
+      
+      if (transport === 'http') {
+        await this.runHttpServer();
+      } else {
+        await this.runStdioServer();
+      }
     } catch (error: unknown) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       console.error('[SERVER] Failed to start:', errorMessage);
       process.exit(1);
     }
+  }
+
+  /**
+   * Run the MCP server with stdio transport
+   */
+  private async runStdioServer() {
+    const transport = new StdioServerTransport();
+    await this.server.connect(transport);
+    console.error('Godot MCP server running on stdio');
+  }
+
+  /**
+   * Run the MCP server with HTTP transport
+   */
+  private async runHttpServer() {
+    const http = require('http');
+    const port = parseInt(process.env.MCP_HTTP_PORT || '3000', 10);
+    const host = process.env.MCP_HTTP_HOST || '127.0.0.1';
+    const endpoint = process.env.MCP_HTTP_ENDPOINT || '/mcp';
+
+    const server = http.createServer(async (req: any, res: any) => {
+      // Set CORS headers
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+
+      // Handle preflight requests
+      if (req.method === 'OPTIONS') {
+        res.writeHead(204);
+        res.end();
+        return;
+      }
+
+      // Only accept POST requests to the endpoint
+      if (req.method !== 'POST' || req.url !== endpoint) {
+        res.writeHead(404);
+        res.end(JSON.stringify({ error: 'Not found' }));
+        return;
+      }
+
+      // Read request body
+      let body = '';
+      req.on('data', (chunk: Buffer) => {
+        body += chunk.toString();
+      });
+
+      req.on('end', async () => {
+        try {
+          const request = JSON.parse(body);
+          const response = await this.handleHttpRequest(request);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify(response));
+        } catch (error: unknown) {
+          const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: errorMessage }));
+        }
+      });
+    });
+
+    server.listen(port, host, () => {
+      console.error(`Godot MCP server running on HTTP: http://${host}:${port}${endpoint}`);
+    });
+
+    // Handle server errors
+    server.on('error', (error: Error) => {
+      console.error('[SERVER] HTTP server error:', error.message);
+      process.exit(1);
+    });
+
+    // Keep the process alive
+    await new Promise(() => {}); // Never resolve
+  }
+
+  /**
+   * Handle HTTP requests
+   */
+  private async handleHttpRequest(request: any): Promise<any> {
+    // Handle different request types
+    if (request.method === 'tools/list') {
+      return await this.handleToolsList();
+    } else if (request.method === 'tools/call') {
+      return await this.handleToolCall(request.params);
+    } else if (request.method === 'initialize') {
+      return await this.handleInitialize(request.params);
+    }
+    
+    return { error: `Unknown method: ${request.method}` };
+  }
+
+  /**
+   * Handle tools/list request
+   */
+  private async handleToolsList(): Promise<any> {
+    // Return the list of tools
+    return {
+      tools: [
+        { name: 'launch_editor', description: 'Launch Godot editor for a specific project' },
+        { name: 'run_project', description: 'Run the Godot project and capture output' },
+        { name: 'get_debug_output', description: 'Get the current debug output and errors' },
+        { name: 'stop_project', description: 'Stop running Godot project instance(s)' },
+        { name: 'capture_screenshot', description: 'Capture a screenshot from a running Godot project instance' },
+        { name: 'get_godot_version', description: 'Get the installed Godot version' },
+        { name: 'list_projects', description: 'List Godot projects in a directory' },
+        { name: 'get_project_info', description: 'Retrieve metadata about a Godot project' },
+        { name: 'list_processes', description: 'List all running Godot processes' },
+      ],
+    };
+  }
+
+  /**
+   * Handle tools/call request
+   */
+  private async handleToolCall(params: any): Promise<any> {
+    const { name, arguments: args } = params;
+    
+    switch (name) {
+      case 'launch_editor':
+        return await this.handleLaunchEditor(args);
+      case 'run_project':
+        return await this.handleRunProject(args);
+      case 'get_debug_output':
+        return await this.handleGetDebugOutput(args);
+      case 'stop_project':
+        return await this.handleStopProject(args);
+      case 'capture_screenshot':
+        return await this.handleCaptureScreenshot(args);
+      case 'get_godot_version':
+        return await this.handleGetGodotVersion();
+      case 'list_projects':
+        return await this.handleListProjects(args);
+      case 'get_project_info':
+        return await this.handleGetProjectInfo(args);
+      case 'list_processes':
+        return await this.handleListProcesses();
+      default:
+        return { error: `Unknown tool: ${name}` };
+    }
+  }
+
+  /**
+   * Handle initialize request
+   */
+  private async handleInitialize(params: any): Promise<any> {
+    return {
+      protocolVersion: '2024-11-05',
+      capabilities: {
+        tools: {},
+      },
+      serverInfo: {
+        name: 'godot-mcp',
+        version: '0.1.1',
+      },
+    };
   }
 }
 

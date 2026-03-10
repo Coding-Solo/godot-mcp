@@ -28,18 +28,21 @@
   ],
   "scripts": {
     "build": "tsc && node scripts/build.js",
+    "build:mcpb": "npm run build && node scripts/build-mcpb.js",
     "inspector": "npx @modelcontextprotocol/inspector build/index.js",
     "prepare": "npm run build",
     "watch": "tsc --watch"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "0.6.0",
+    "@modelcontextprotocol/sdk": "^1.26.0",
     "axios": "^1.7.9",
     "fs-extra": "^11.2.0"
   },
   "devDependencies": {
+    "@anthropic-ai/mcpb": "^2.1.2",
     "@types/node": "^20.11.24",
-    "typescript": "^5.3.3"
+    "typescript": "^5.3.3",
+    "esbuild": "^0.27.3"
   },
   "engines": {
     "node": ">=18.0.0"
