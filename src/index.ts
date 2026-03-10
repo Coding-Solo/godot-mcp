@@ -46,6 +46,7 @@ interface GodotProcess {
   startedAt: Date;
   isRunning: boolean;
   exitedAt?: Date;
+  screenshotEnabled?: boolean;
 }
 
 /**
@@ -64,6 +65,47 @@ interface InstanceConfig {
  */
 const OUTPUT_BUFFER_LIMIT = 1000; // Max lines to keep per stream
 const STALE_PROCESS_CLEANUP_MS = 10 * 60 * 1000; // 10 minutes
+
+/**
+ * Screenshot wrapper script for capturing viewport
+ */
+const SCREENSHOT_WRAPPER_SCRIPT = `extends Node
+
+const REAL_MAIN_SCENE = "REPLACE_WITH_MAIN_SCENE_PATH"
+const TRIGGER_FILE = "res://.mcp_screenshot_req"
+const OUTPUT_FILE = "res://.mcp_screenshot.png"
+
+func _ready():
+    print("[MCP] Wrapper loaded. Starting main scene: ", REAL_MAIN_SCENE)
+    if ResourceLoader.exists(REAL_MAIN_SCENE):
+        var main_packed = load(REAL_MAIN_SCENE)
+        var main_inst = main_packed.instantiate()
+        add_child.call_deferred(main_inst)
+    else:
+        printerr("[MCP] Error: Could not find main scene at ", REAL_MAIN_SCENE)
+
+func _process(_delta):
+    if FileAccess.file_exists(TRIGGER_FILE):
+        _take_screenshot()
+        DirAccess.remove_absolute(TRIGGER_FILE)
+
+func _take_screenshot():
+    print("[MCP] Capturing screenshot...")
+    var image = get_viewport().get_texture().get_image()
+    var error = image.save_png(OUTPUT_FILE)
+    if error == OK:
+        print("[MCP] Screenshot saved to ", OUTPUT_FILE)
+    else:
+        printerr("[MCP] Failed to save screenshot. Error code: ", error)
+`;
+
+const SCREENSHOT_WRAPPER_SCENE = `[gd_scene load_steps=2 format=3]
+
+[ext_resource type="Script" path="res://.mcp_wrapper.gd" id="1_mcp"]
+
+[node name="MCPWrapper" type="Node"]
+script = ExtResource("1_mcp")
+`;
 
 /**
  * Interface for server configuration
@@ -465,6 +507,7 @@ class GodotServer {
     for (const [id, godotProcess] of this.activeProcesses.entries()) {
       this.logDebug(`Killing Godot process: ${id}`);
       try {
+        this.cleanupScreenshotArtifacts(godotProcess.projectPath);
         godotProcess.process.kill();
       } catch (error) {
         this.logDebug(`Error killing process ${id}: ${error}`);
@@ -472,6 +515,76 @@ class GodotServer {
     }
     this.activeProcesses.clear();
     await this.server.close();
+  }
+
+  /**
+   * Setup screenshot wrapper files for a project
+   * @param projectPath Path to the Godot project
+   * @param mainScenePath Path to the main scene (relative to project)
+   */
+  private setupScreenshotWrapper(projectPath: string, mainScenePath: string): void {
+    const fs = require('fs');
+    const wrapperScriptPath = join(projectPath, '.mcp_wrapper.gd');
+    const wrapperScenePath = join(projectPath, '.mcp_wrapper.tscn');
+    
+    // Create wrapper script with the main scene path
+    const scriptContent = SCREENSHOT_WRAPPER_SCRIPT.replace(
+      'REPLACE_WITH_MAIN_SCENE_PATH',
+      mainScenePath
+    );
+    
+    fs.writeFileSync(wrapperScriptPath, scriptContent, 'utf8');
+    fs.writeFileSync(wrapperScenePath, SCREENSHOT_WRAPPER_SCENE, 'utf8');
+    
+    this.logDebug(`Created screenshot wrapper files in ${projectPath}`);
+  }
+
+  /**
+   * Clean up screenshot wrapper files from a project
+   * @param projectPath Path to the Godot project
+   */
+  private cleanupScreenshotArtifacts(projectPath: string): void {
+    const fs = require('fs');
+    const filesToRemove = [
+      '.mcp_wrapper.gd',
+      '.mcp_wrapper.tscn',
+      '.mcp_screenshot_req',
+      '.mcp_screenshot.png'
+    ];
+    
+    for (const file of filesToRemove) {
+      const filePath = join(projectPath, file);
+      try {
+        if (fs.existsSync(filePath)) {
+          fs.unlinkSync(filePath);
+          this.logDebug(`Removed screenshot artifact: ${file}`);
+        }
+      } catch (error) {
+        this.logDebug(`Failed to remove ${file}: ${error}`);
+      }
+    }
+  }
+
+  /**
+   * Get the main scene path from project.godot
+   * @param projectPath Path to the Godot project
+   * @returns The main scene path or null if not found
+   */
+  private getMainScenePath(projectPath: string): string | null {
+    const fs = require('fs');
+    const projectFile = join(projectPath, 'project.godot');
+    
+    try {
+      const content = fs.readFileSync(projectFile, 'utf8');
+      const match = content.match(/run\/main_scene="([^"]+)"/);
+      if (match && match[1]) {
+        return match[1];
+      }
+    } catch (error) {
+      this.logDebug(`Failed to read project.godot: ${error}`);
+    }
+    
+    return null;
   }
 
   /**
@@ -779,6 +892,10 @@ class GodotServer {
                 },
                 description: 'Optional: Additional command-line arguments to pass to Godot (e.g., ["--server"] or ["--", "profile=player1"])',
               },
+              enableScreenshot: {
+                type: 'boolean',
+                description: 'Optional: Enable screenshot capture for this instance. When true, a wrapper scene will be used that allows capturing screenshots via capture_screenshot tool.',
+              },
             },
             required: ['projectPath'],
           },
@@ -814,6 +931,42 @@ class GodotServer {
               },
             },
             required: [],
+          },
+        },
+        {
+          name: 'capture_screenshot',
+          description: 'Capture a screenshot from a running Godot project instance. The instance must have been started with enableScreenshot=true.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              instanceId: {
+                type: 'string',
+                description: 'Instance ID of the running Godot project to capture screenshot from.',
+              },
+              outputPath: {
+                type: 'string',
+                description: 'Optional: Path to save the screenshot. If not provided, returns base64 encoded image.',
+              },
+            },
+            required: ['instanceId'],
+          },
+        },
+        {
+          name: 'capture_screenshot',
+          description: 'Capture a screenshot from a running Godot project instance. The instance must have been started with enableScreenshot=true.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              instanceId: {
+                type: 'string',
+                description: 'Instance ID of the running Godot project to capture screenshot from.',
+              },
+              outputPath: {
+                type: 'string',
+                description: 'Optional: Path to save the screenshot. If not provided, returns base64 encoded image.',
+              },
+            },
+            required: ['instanceId'],
           },
         },
         {
@@ -1087,6 +1240,8 @@ class GodotServer {
           return await this.handleGetDebugOutput(request.params.arguments);
         case 'stop_project':
           return await this.handleStopProject(request.params.arguments);
+        case 'capture_screenshot':
+          return await this.handleCaptureScreenshot(request.params.arguments);
         case 'get_godot_version':
           return await this.handleGetGodotVersion();
         case 'list_projects':
@@ -1260,7 +1415,22 @@ class GodotServer {
       }
 
       const cmdArgs = ['-d', '--path', args.projectPath];
-      if (args.scene && this.validatePath(args.scene)) {
+      
+      // Handle screenshot wrapper setup
+      let screenshotEnabled = false;
+      if (args.enableScreenshot === true) {
+        const mainScene = this.getMainScenePath(args.projectPath);
+        if (mainScene) {
+          this.setupScreenshotWrapper(args.projectPath, mainScene);
+          cmdArgs.push('.mcp_wrapper.tscn');
+          screenshotEnabled = true;
+          this.logDebug(`Screenshot wrapper enabled for instance ${instanceId}`);
+        } else {
+          this.logDebug(`Could not determine main scene, screenshot disabled for instance ${instanceId}`);
+        }
+      }
+      
+      if (args.scene && this.validatePath(args.scene) && !screenshotEnabled) {
         this.logDebug(`Adding scene parameter: ${args.scene}`);
         cmdArgs.push(args.scene);
       }
@@ -1289,6 +1459,7 @@ class GodotServer {
         args: args.args,
         startedAt: new Date(),
         isRunning: true,
+        screenshotEnabled,
       };
 
       godotProcess.stdout?.on('data', (data: Buffer) => {
@@ -1632,6 +1803,134 @@ class GodotServer {
         },
       ],
     };
+  }
+
+  /**
+   * Handle the capture_screenshot tool
+   * Captures a screenshot from a running Godot project instance
+   */
+  private async handleCaptureScreenshot(args: any) {
+    const fs = require('fs');
+    args = this.normalizeParameters(args || {});
+
+    if (!args.instanceId) {
+      return this.createErrorResponse(
+        'instanceId is required',
+        ['Provide the instance ID of the running Godot project']
+      );
+    }
+
+    const process = this.activeProcesses.get(args.instanceId);
+    if (!process) {
+      return this.createErrorResponse(
+        `No process found with instanceId: ${args.instanceId}`,
+        [
+          'Use list_processes to see all tracked instances',
+          'The instance may have been cleaned up after being exited for too long',
+        ]
+      );
+    }
+
+    if (!process.isRunning) {
+      return this.createErrorResponse(
+        `Instance ${args.instanceId} is not running`,
+        ['The Godot project must be running to capture a screenshot']
+      );
+    }
+
+    if (!process.screenshotEnabled) {
+      return this.createErrorResponse(
+        `Instance ${args.instanceId} does not have screenshot support enabled`,
+        [
+          'Restart the instance with enableScreenshot=true',
+          'Use run_project with enableScreenshot parameter to enable screenshot capture',
+        ]
+      );
+    }
+
+    try {
+      // Create trigger file to request screenshot
+      const triggerPath = join(process.projectPath, '.mcp_screenshot_req');
+      const outputPath = join(process.projectPath, '.mcp_screenshot.png');
+      
+      // Remove any existing screenshot
+      if (fs.existsSync(outputPath)) {
+        fs.unlinkSync(outputPath);
+      }
+      
+      // Create trigger file
+      fs.writeFileSync(triggerPath, '', 'utf8');
+      this.logDebug(`Created screenshot trigger file for instance ${args.instanceId}`);
+
+      // Wait for screenshot to be captured (with timeout)
+      const maxWaitMs = 5000;
+      const checkIntervalMs = 100;
+      let elapsed = 0;
+      
+      while (elapsed < maxWaitMs) {
+        await new Promise(resolve => setTimeout(resolve, checkIntervalMs));
+        elapsed += checkIntervalMs;
+        
+        if (fs.existsSync(outputPath)) {
+          this.logDebug(`Screenshot captured for instance ${args.instanceId}`);
+          
+          // Read the screenshot file
+          const imageBuffer = fs.readFileSync(outputPath);
+          const base64Image = imageBuffer.toString('base64');
+          
+          // If outputPath is provided, save to that location
+          if (args.outputPath && this.validatePath(args.outputPath)) {
+            fs.copyFileSync(outputPath, args.outputPath);
+            return {
+              content: [
+                {
+                  type: 'text',
+                  text: JSON.stringify(
+                    {
+                      success: true,
+                      message: `Screenshot saved to ${args.outputPath}`,
+                      instanceId: args.instanceId,
+                      savedPath: args.outputPath,
+                    },
+                    null,
+                    2
+                  ),
+                },
+              ],
+            };
+          }
+          
+          // Return base64 encoded image
+          return {
+            content: [
+              {
+                type: 'image',
+                data: base64Image,
+                mimeType: 'image/png',
+              },
+            ],
+          };
+        }
+      }
+
+      return this.createErrorResponse(
+        'Screenshot capture timed out',
+        [
+          'The Godot project may not be responding',
+          'Ensure the game loop is running (not paused or blocked)',
+          'Try again after the game has fully loaded',
+        ]
+      );
+    } catch (error: unknown) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      return this.createErrorResponse(
+        `Failed to capture screenshot: ${errorMessage}`,
+        [
+          'Ensure the Godot project is running correctly',
+          'Check if the project has write permissions',
+        ]
+      );
+    }
   }
 
   /**
