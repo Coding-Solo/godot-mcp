@@ -66,6 +66,7 @@ This direct feedback loop helps AI assistants like Claude understand what works 
 - **Launch Godot Editor**: Open the Godot editor for a specific project
 - **Run Godot Projects**: Execute Godot projects in debug mode
 - **Capture Debug Output**: Retrieve console output and error messages
+- **Capture Screenshots**: Grab the active Godot viewport from a running project
 - **Control Execution**: Start and stop Godot projects programmatically
 - **Get Godot Version**: Retrieve the installed Godot version
 - **List Godot Projects**: Find Godot projects in a specified directory
@@ -123,6 +124,7 @@ Add to your Cline MCP settings file (`~/Library/Application Support/Code/User/gl
         "get_godot_version",
         "list_projects",
         "get_project_info",
+        "capture_screenshot",
         "create_scene",
         "add_node",
         "load_sprite",
@@ -184,6 +186,8 @@ Once configured, your AI assistant will automatically run the MCP server when ne
 "Run my Godot project and show me any errors"
 
 "Get information about my Godot project structure"
+
+"Capture a screenshot of my running Godot project"
 
 "Analyze my Godot project structure and suggest improvements"
 
