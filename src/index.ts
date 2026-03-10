@@ -1185,6 +1185,236 @@ class GodotServer {
           },
         },
         {
+          name: 'signal_connect',
+          description: 'Connect a signal from one node to another node\'s method in a Godot scene',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: {
+                type: 'string',
+                description: 'Path to the Godot project directory',
+              },
+              scenePath: {
+                type: 'string',
+                description: 'Path to the scene file (relative to project)',
+              },
+              sourceNodePath: {
+                type: 'string',
+                description: 'Path to the source node that emits the signal (e.g., "root/Player/Button")',
+              },
+              signalName: {
+                type: 'string',
+                description: 'Name of the signal to connect (e.g., "pressed", "body_entered")',
+              },
+              targetNodePath: {
+                type: 'string',
+                description: 'Path to the target node that will receive the signal (e.g., "root/Player")',
+              },
+              methodName: {
+                type: 'string',
+                description: 'Name of the method to call when the signal is emitted',
+              },
+              flags: {
+                type: 'number',
+                description: 'Optional: Connection flags (default: 0). Common values: 0=DEFERRED, 1=PERSIST, 2=ONE_SHOT',
+              },
+            },
+            required: ['projectPath', 'scenePath', 'sourceNodePath', 'signalName', 'targetNodePath', 'methodName'],
+          },
+        },
+        {
+          name: 'signal_disconnect',
+          description: 'Disconnect a signal connection in a Godot scene',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: {
+                type: 'string',
+                description: 'Path to the Godot project directory',
+              },
+              scenePath: {
+                type: 'string',
+                description: 'Path to the scene file (relative to project)',
+              },
+              sourceNodePath: {
+                type: 'string',
+                description: 'Path to the source node that emits the signal',
+              },
+              signalName: {
+                type: 'string',
+                description: 'Name of the signal to disconnect',
+              },
+              targetNodePath: {
+                type: 'string',
+                description: 'Path to the target node that receives the signal',
+              },
+              methodName: {
+                type: 'string',
+                description: 'Name of the method that was connected to the signal',
+              },
+            },
+            required: ['projectPath', 'scenePath', 'sourceNodePath', 'signalName', 'targetNodePath', 'methodName'],
+          },
+        },
+        {
+          name: 'group_add',
+          description: 'Add a node to a group in a Godot scene',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: {
+                type: 'string',
+                description: 'Path to the Godot project directory',
+              },
+              scenePath: {
+                type: 'string',
+                description: 'Path to the scene file (relative to project)',
+              },
+              nodePath: {
+                type: 'string',
+                description: 'Path to the node to add to the group (e.g., "root/Player")',
+              },
+              groupName: {
+                type: 'string',
+                description: 'Name of the group to add the node to',
+              },
+            },
+            required: ['projectPath', 'scenePath', 'nodePath', 'groupName'],
+          },
+        },
+        {
+          name: 'group_remove',
+          description: 'Remove a node from a group in a Godot scene',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: {
+                type: 'string',
+                description: 'Path to the Godot project directory',
+              },
+              scenePath: {
+                type: 'string',
+                description: 'Path to the scene file (relative to project)',
+              },
+              nodePath: {
+                type: 'string',
+                description: 'Path to the node to remove from the group',
+              },
+              groupName: {
+                type: 'string',
+                description: 'Name of the group to remove the node from',
+              },
+            },
+            required: ['projectPath', 'scenePath', 'nodePath', 'groupName'],
+          },
+        },
+        {
+          name: 'list_groups',
+          description: 'List all groups in a Godot scene',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: {
+                type: 'string',
+                description: 'Path to the Godot project directory',
+              },
+              scenePath: {
+                type: 'string',
+                description: 'Path to the scene file (relative to project)',
+              },
+            },
+            required: ['projectPath', 'scenePath'],
+          },
+        },
+        {
+          name: 'ui_create_button',
+          description: 'Create a Button node in a Godot scene with customizable properties',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: {
+                type: 'string',
+                description: 'Path to the Godot project directory',
+              },
+              scenePath: {
+                type: 'string',
+                description: 'Path to the scene file (relative to project)',
+              },
+              parentNodePath: {
+                type: 'string',
+                description: 'Path to the parent node (e.g., "root/MainMenu")',
+              },
+              nodeName: {
+                type: 'string',
+                description: 'Name for the new button node',
+              },
+              text: {
+                type: 'string',
+                description: 'Text to display on the button',
+              },
+              position: {
+                type: 'object',
+                properties: {
+                  x: { type: 'number', description: 'X position' },
+                  y: { type: 'number', description: 'Y position' },
+                },
+                description: 'Position of the button (x, y)',
+              },
+              size: {
+                type: 'object',
+                properties: {
+                  width: { type: 'number', description: 'Width' },
+                  height: { type: 'number', description: 'Height' },
+                },
+                description: 'Size of the button (width, height)',
+              },
+            },
+            required: ['projectPath', 'scenePath', 'parentNodePath', 'nodeName', 'text'],
+          },
+        },
+        {
+          name: 'ui_create_label',
+          description: 'Create a Label node in a Godot scene with customizable properties',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: {
+                type: 'string',
+                description: 'Path to the Godot project directory',
+              },
+              scenePath: {
+                type: 'string',
+                description: 'Path to the scene file (relative to project)',
+              },
+              parentNodePath: {
+                type: 'string',
+                description: 'Path to the parent node (e.g., "root/MainMenu")',
+              },
+              nodeName: {
+                type: 'string',
+                description: 'Name for the new label node',
+              },
+              text: {
+                type: 'string',
+                description: 'Text to display in the label',
+              },
+              position: {
+                type: 'object',
+                properties: {
+                  x: { type: 'number', description: 'X position' },
+                  y: { type: 'number', description: 'Y position' },
+                },
+                description: 'Position of the label (x, y)',
+              },
+              fontSize: {
+                type: 'number',
+                description: 'Font size for the label text',
+              },
+            },
+            required: ['projectPath', 'scenePath', 'parentNodePath', 'nodeName', 'text'],
+          },
+        },
+        {
           name: 'run_multiple_projects',
           description: 'Launch multiple Godot project instances in a single call. Useful for multiplayer testing (server + clients).',
           inputSchema: {
@@ -3122,14 +3352,173 @@ class GodotServer {
 
       console.error(`[SERVER] Using Godot at: ${this.godotPath}`);
 
-      const transport = new StdioServerTransport();
-      await this.server.connect(transport);
-      console.error('Godot MCP server running on stdio');
+      // Check transport mode
+      const transport = process.env.MCP_TRANSPORT || 'stdio';
+      
+      if (transport === 'http') {
+        await this.runHttpServer();
+      } else {
+        await this.runStdioServer();
+      }
     } catch (error: unknown) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       console.error('[SERVER] Failed to start:', errorMessage);
       process.exit(1);
     }
+  }
+
+  /**
+   * Run the MCP server with stdio transport
+   */
+  private async runStdioServer() {
+    const transport = new StdioServerTransport();
+    await this.server.connect(transport);
+    console.error('Godot MCP server running on stdio');
+  }
+
+  /**
+   * Run the MCP server with HTTP transport
+   */
+  private async runHttpServer() {
+    const http = require('http');
+    const port = parseInt(process.env.MCP_HTTP_PORT || '3000', 10);
+    const host = process.env.MCP_HTTP_HOST || '127.0.0.1';
+    const endpoint = process.env.MCP_HTTP_ENDPOINT || '/mcp';
+
+    const server = http.createServer(async (req: any, res: any) => {
+      // Set CORS headers
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+
+      // Handle preflight requests
+      if (req.method === 'OPTIONS') {
+        res.writeHead(204);
+        res.end();
+        return;
+      }
+
+      // Only accept POST requests to the endpoint
+      if (req.method !== 'POST' || req.url !== endpoint) {
+        res.writeHead(404);
+        res.end(JSON.stringify({ error: 'Not found' }));
+        return;
+      }
+
+      // Read request body
+      let body = '';
+      req.on('data', (chunk: Buffer) => {
+        body += chunk.toString();
+      });
+
+      req.on('end', async () => {
+        try {
+          const request = JSON.parse(body);
+          const response = await this.handleHttpRequest(request);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify(response));
+        } catch (error: unknown) {
+          const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: errorMessage }));
+        }
+      });
+    });
+
+    server.listen(port, host, () => {
+      console.error(`Godot MCP server running on HTTP: http://${host}:${port}${endpoint}`);
+    });
+
+    // Handle server errors
+    server.on('error', (error: Error) => {
+      console.error('[SERVER] HTTP server error:', error.message);
+      process.exit(1);
+    });
+
+    // Keep the process alive
+    await new Promise(() => {}); // Never resolve
+  }
+
+  /**
+   * Handle HTTP requests
+   */
+  private async handleHttpRequest(request: any): Promise<any> {
+    // Handle different request types
+    if (request.method === 'tools/list') {
+      return await this.handleToolsList();
+    } else if (request.method === 'tools/call') {
+      return await this.handleToolCall(request.params);
+    } else if (request.method === 'initialize') {
+      return await this.handleInitialize(request.params);
+    }
+    
+    return { error: `Unknown method: ${request.method}` };
+  }
+
+  /**
+   * Handle tools/list request
+   */
+  private async handleToolsList(): Promise<any> {
+    // Return the list of tools
+    return {
+      tools: [
+        { name: 'launch_editor', description: 'Launch Godot editor for a specific project' },
+        { name: 'run_project', description: 'Run the Godot project and capture output' },
+        { name: 'get_debug_output', description: 'Get the current debug output and errors' },
+        { name: 'stop_project', description: 'Stop running Godot project instance(s)' },
+        { name: 'capture_screenshot', description: 'Capture a screenshot from a running Godot project instance' },
+        { name: 'get_godot_version', description: 'Get the installed Godot version' },
+        { name: 'list_projects', description: 'List Godot projects in a directory' },
+        { name: 'get_project_info', description: 'Retrieve metadata about a Godot project' },
+        { name: 'list_processes', description: 'List all running Godot processes' },
+      ],
+    };
+  }
+
+  /**
+   * Handle tools/call request
+   */
+  private async handleToolCall(params: any): Promise<any> {
+    const { name, arguments: args } = params;
+    
+    switch (name) {
+      case 'launch_editor':
+        return await this.handleLaunchEditor(args);
+      case 'run_project':
+        return await this.handleRunProject(args);
+      case 'get_debug_output':
+        return await this.handleGetDebugOutput(args);
+      case 'stop_project':
+        return await this.handleStopProject(args);
+      case 'capture_screenshot':
+        return await this.handleCaptureScreenshot(args);
+      case 'get_godot_version':
+        return await this.handleGetGodotVersion();
+      case 'list_projects':
+        return await this.handleListProjects(args);
+      case 'get_project_info':
+        return await this.handleGetProjectInfo(args);
+      case 'list_processes':
+        return await this.handleListProcesses();
+      default:
+        return { error: `Unknown tool: ${name}` };
+    }
+  }
+
+  /**
+   * Handle initialize request
+   */
+  private async handleInitialize(params: any): Promise<any> {
+    return {
+      protocolVersion: '2024-11-05',
+      capabilities: {
+        tools: {},
+      },
+      serverInfo: {
+        name: 'godot-mcp',
+        version: '0.1.1',
+      },
+    };
   }
 }
 
