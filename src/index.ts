@@ -515,7 +515,7 @@ class GodotServer {
 
       this.logDebug(`Executing: ${this.godotPath} ${args.join(' ')}`);
 
-      const { stdout, stderr } = await execFileAsync(this.godotPath!, args);
+      const { stdout, stderr } = await execFileAsync(this.godotPath!, args, { cwd: projectPath });
 
       return { stdout: stdout ?? '', stderr: stderr ?? '' };
     } catch (error: unknown) {
@@ -1009,6 +1009,7 @@ class GodotServer {
       this.logDebug(`Launching Godot editor for project: ${args.projectPath}`);
       const process = spawn(this.godotPath, ['-e', '--path', args.projectPath], {
         stdio: 'pipe',
+        cwd: args.projectPath,
       });
 
       process.on('error', (err: Error) => {
@@ -1084,7 +1085,7 @@ class GodotServer {
       }
 
       this.logDebug(`Running Godot project: ${args.projectPath}`);
-      const process = spawn(this.godotPath!, cmdArgs, { stdio: 'pipe' });
+      const process = spawn(this.godotPath!, cmdArgs, { stdio: 'pipe', cwd: args.projectPath });
       const output: string[] = [];
       const errors: string[] = [];
 
