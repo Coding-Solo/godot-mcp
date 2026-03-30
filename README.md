@@ -78,6 +78,10 @@ Godot MCP enables AI agents to launch the Godot editor, run projects, capture de
   - Get UID for specific files
   - Update UID references by resaving resources
 
+## Hosted deployment
+
+A hosted deployment is available on [Fronteir AI](https://fronteir.ai/mcp/coding-solo-godot-mcp).
+
 ## Requirements
 
 - [Godot Engine](https://godotengine.org/download) installed on your system
