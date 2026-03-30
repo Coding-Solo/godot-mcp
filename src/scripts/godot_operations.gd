@@ -528,7 +528,12 @@ func add_node(params):
         for property in properties:
             if debug_mode:
                 print("Setting property: " + property + " = " + str(properties[property]))
-            new_node.set(property, properties[property])
+            var value = properties[property]
+            if typeof(value) == TYPE_STRING and value.begins_with("res://"):
+                value = load(value)
+                if debug_mode:
+                    print("Loaded resource for property: " + property + " -> " + str(value))
+            new_node.set(property, value)
     
     parent.add_child(new_node)
     new_node.owner = scene_root
