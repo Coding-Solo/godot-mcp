@@ -64,6 +64,7 @@ Godot MCP enables AI agents to launch the Godot editor, run projects, capture de
 - **Launch Godot Editor**: Open the Godot editor for a specific project
 - **Run Godot Projects**: Execute Godot projects in debug mode
 - **Capture Debug Output**: Retrieve console output and error messages
+- **Capture Screenshots**: Grab the active Godot viewport from a running project
 - **Control Execution**: Start and stop Godot projects programmatically
 - **Get Godot Version**: Retrieve the installed Godot version
 - **List Godot Projects**: Find Godot projects in a specified directory
@@ -123,6 +124,7 @@ Add to your Cline MCP settings file (`~/Library/Application Support/Code/User/gl
         "get_godot_version",
         "list_projects",
         "get_project_info",
+        "capture_screenshot",
         "create_scene",
         "add_node",
         "load_sprite",
@@ -193,6 +195,38 @@ For any MCP-compatible client, use this configuration:
 ```
 
 </details>
+
+## Example Prompts
+
+Once configured, your AI assistant will automatically run the MCP server when needed. You can use prompts like:
+
+```text
+"Launch the Godot editor for my project at /path/to/project"
+
+"Run my Godot project and show me any errors"
+
+"Get information about my Godot project structure"
+
+"Capture a screenshot of my running Godot project"
+
+"Analyze my Godot project structure and suggest improvements"
+
+"Help me debug this error in my Godot project: [paste error]"
+
+"Write a GDScript for a character controller with double jump and wall sliding"
+
+"Create a new scene with a Player node in my Godot project"
+
+"Add a Sprite2D node to my player scene and load the character texture"
+
+"Export my 3D models as a MeshLibrary for use with GridMap"
+
+"Create a UI scene with buttons and labels for my game's main menu"
+
+"Get the UID for a specific script file in my Godot 4.4 project"
+
+"Update UID references in my Godot project after upgrading to 4.4"
+```
 
 ### Environment Variables
 
