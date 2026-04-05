@@ -1,0 +1,24 @@
+{
+  "name": "godot-mcp",
+  "version": "0.1.0",
+  "description": "Control Godot game engine from Codex via MCP",
+  "author": {
+    "name": "Coding-Solo",
+    "url": "https://github.com/Coding-Solo/godot-mcp"
+  },
+  "homepage": "https://github.com/Coding-Solo/godot-mcp",
+  "repository": "https://github.com/Coding-Solo/godot-mcp",
+  "keywords": [
+    "mcp",
+    "codex"
+  ],
+  "mcpServers": "./.mcp.json",
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Godot MCP",
+    "shortDescription": "Control Godot game engine from Codex via MCP",
+    "longDescription": "MCP server for interfacing with Godot game engine. Launch editor, run projects, capture debug output.",
+    "category": "Game Development",
+    "websiteURL": "https://github.com/Coding-Solo/godot-mcp"
+  }
+}

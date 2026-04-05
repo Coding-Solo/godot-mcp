@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "godot-mcp": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@coding-solo/godot-mcp"
+      ]
+    }
+  }
+}
