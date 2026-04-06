@@ -1,0 +1,3 @@
+[submodule "godot-editor-ops-sdk"]
+	path = godot-editor-ops-sdk
+	url = git@github.com:godot-ai-plugins/godot-editor-ops-sdk.git

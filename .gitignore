@@ -26,3 +26,5 @@ Thumbs.db
 
 # Coverage directory
 coverage/
+
+.claude/

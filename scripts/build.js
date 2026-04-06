@@ -13,14 +13,23 @@ fs.chmodSync(path.join(__dirname, '..', 'build', 'index.js'), '755');
 try {
   // Ensure the build/scripts directory exists
   fs.ensureDirSync(path.join(__dirname, '..', 'build', 'scripts'));
-  
-  // Copy the godot_operations.gd file
+
+  // Copy the Godot operations bridge
   fs.copyFileSync(
     path.join(__dirname, '..', 'src', 'scripts', 'godot_operations.gd'),
     path.join(__dirname, '..', 'build', 'scripts', 'godot_operations.gd')
   );
-  
-  console.log('Successfully copied godot_operations.gd to build/scripts');
+
+  // Copy the bundled SDK runtime required by the bridge script
+  const sdkSourceRoot = path.join(__dirname, '..', 'godot-editor-ops-sdk');
+  const sdkTargetRoot = path.join(__dirname, '..', 'build', 'scripts', 'godot-editor-ops-sdk');
+
+  fs.removeSync(sdkTargetRoot);
+  fs.ensureDirSync(sdkTargetRoot);
+  fs.copySync(path.join(sdkSourceRoot, 'api'), path.join(sdkTargetRoot, 'api'));
+  fs.copySync(path.join(sdkSourceRoot, 'src'), path.join(sdkTargetRoot, 'src'));
+
+  console.log('Successfully copied godot_operations.gd and godot-editor-ops-sdk runtime to build/scripts');
 } catch (error) {
   console.error('Error copying scripts:', error);
   process.exit(1);
