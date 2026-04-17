@@ -102,7 +102,8 @@ The following tools have been recently added:
 - **capture_screenshot**: Renders a Godot project scene and writes a screenshot to disk
   - Uses the provided scene or the project's configured main scene
   - Saves the screenshot to the specified path
-  - Supports absolute paths, `res://`, `user://`, and user-relative output paths
+  - Accepts project-relative or `res://` scene paths only
+  - Supports `res://`, `user://`, and user-relative output paths; rejects absolute filesystem output paths
   - Returns JSON metadata including the saved path and image dimensions
   - Useful for visual debugging and feedback
 

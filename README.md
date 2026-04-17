@@ -232,13 +232,13 @@ The bundled script accepts operation type and parameters as JSON, allowing for f
 The `capture_screenshot` tool renders a Godot scene in a normal Godot process and writes a PNG to disk.
 
 - `projectPath` (required): path to the Godot project directory
-- `scene` (optional): project-relative scene path or `res://...`; defaults to the project's configured `run/main_scene`
+- `scene` (optional): project-relative scene path or `res://...`; `user://...` and absolute filesystem paths are rejected; defaults to the project's configured `run/main_scene`
 - `outputPath` (optional):
-  - absolute path → saved exactly there
   - `res://...` → saved inside the project
   - `user://...` → saved in Godot's user data directory
   - plain relative path → treated as `user://...`
-  - omitted → saved to `user://.godot-mcp-screenshot/YY-MM-DD-HH-MM-SS.png`
+  - absolute filesystem paths are rejected
+  - omitted → saved to `user://.godot-mcp-screenshot/YY-MM-DD-HH-MM-SS.png` and appends `-NN` on same-second collisions
 - `waitFrames` (optional): integer frame count, minimum `1`; increase it for scenes that need more time to finish UI setup before capture
 
 On success the tool returns JSON with:
