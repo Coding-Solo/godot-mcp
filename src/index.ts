@@ -8,7 +8,7 @@
  */
 
 import { fileURLToPath } from 'url';
-import { join, dirname, basename, normalize } from 'path';
+import { join, dirname, basename, normalize, resolve, relative } from 'path';
 import { existsSync, readdirSync, mkdirSync } from 'fs';
 import { spawn, execFile } from 'child_process';
 import { promisify } from 'util';
@@ -65,6 +65,15 @@ interface ProcessExecutionResult {
   signal?: NodeJS.Signals | null;
   timedOut?: boolean;
   errorMessage?: string;
+}
+
+interface ScreenshotMetadata {
+  scene: string;
+  outputPath: string;
+  absolutePath: string;
+  width: number;
+  height: number;
+  warnings?: string;
 }
 
 /**
@@ -653,11 +662,162 @@ class GodotServer {
    * @returns Absolute file path inside the project
    */
   private resolveProjectFilePath(projectPath: string, resourcePath: string): string {
+    const absoluteProjectPath = resolve(projectPath);
     const normalizedResourcePath = resourcePath.startsWith('res://')
       ? resourcePath.slice('res://'.length)
       : resourcePath;
+    const resolvedPath = resolve(absoluteProjectPath, normalizedResourcePath);
+    const relativePath = relative(absoluteProjectPath, resolvedPath);
 
-    return join(projectPath, normalizedResourcePath);
+    if (relativePath.startsWith('..') || relativePath === '') {
+      return resolvedPath;
+    }
+
+    return resolvedPath;
+  }
+
+  /**
+   * Check whether a path is an absolute filesystem path.
+   */
+  private isAbsoluteFilesystemPath(value: string): boolean {
+    return /^(?:[A-Za-z]:[\\/]|\\\\|\/)/.test(value.trim());
+  }
+
+  /**
+   * Check whether a path contains traversal segments.
+   */
+  private hasTraversalSegments(value: string): boolean {
+    return value
+      .replace(/\\/g, '/')
+      .split('/')
+      .some((segment) => segment === '..');
+  }
+
+  /**
+   * Normalize a project-relative resource path.
+   */
+  private normalizeProjectRelativePath(value: string): string {
+    let normalizedValue = value.trim().replace(/\\/g, '/');
+    while (normalizedValue.startsWith('./')) {
+      normalizedValue = normalizedValue.slice(2);
+    }
+
+    return normalizedValue.replace(/^\/+/, '');
+  }
+
+  /**
+   * Validate and normalize screenshot scene input.
+   */
+  private validateScreenshotScenePath(scene: string): { valid: boolean; normalized?: string; message?: string } {
+    const trimmedScene = scene.trim();
+
+    if (!trimmedScene) {
+      return { valid: false, message: 'Scene path cannot be empty' };
+    }
+
+    if (trimmedScene.startsWith('user://') || this.isAbsoluteFilesystemPath(trimmedScene)) {
+      return { valid: false, message: 'Scene must be project-relative or start with res://' };
+    }
+
+    if (this.hasTraversalSegments(trimmedScene)) {
+      return { valid: false, message: 'Scene path must not contain traversal segments' };
+    }
+
+    const relativeScene = trimmedScene.startsWith('res://')
+      ? this.normalizeProjectRelativePath(trimmedScene.slice('res://'.length))
+      : this.normalizeProjectRelativePath(trimmedScene);
+
+    if (!relativeScene) {
+      return { valid: false, message: 'Scene path cannot be empty' };
+    }
+
+    return { valid: true, normalized: `res://${relativeScene}` };
+  }
+
+  /**
+   * Validate and normalize screenshot output path input.
+   */
+  private validateScreenshotOutputPath(outputPath: string): { valid: boolean; normalized?: string; message?: string } {
+    const trimmedOutputPath = outputPath.trim();
+
+    if (!trimmedOutputPath) {
+      return { valid: false, message: 'Output path cannot be empty' };
+    }
+
+    if (this.isAbsoluteFilesystemPath(trimmedOutputPath)) {
+      return {
+        valid: false,
+        message: 'Absolute filesystem output paths are not allowed; use user://, res://, or a relative path',
+      };
+    }
+
+    if (this.hasTraversalSegments(trimmedOutputPath)) {
+      return { valid: false, message: 'Output path must not contain traversal segments' };
+    }
+
+    if (trimmedOutputPath.startsWith('user://') || trimmedOutputPath.startsWith('res://')) {
+      const prefix = trimmedOutputPath.startsWith('user://') ? 'user://' : 'res://';
+      const relativeOutputPath = this.normalizeProjectRelativePath(trimmedOutputPath.slice(prefix.length));
+
+      if (!relativeOutputPath) {
+        return { valid: false, message: 'Output path cannot be empty' };
+      }
+
+      return { valid: true, normalized: `${prefix}${relativeOutputPath}` };
+    }
+
+    const relativeOutputPath = this.normalizeProjectRelativePath(trimmedOutputPath);
+    if (!relativeOutputPath) {
+      return { valid: false, message: 'Output path cannot be empty' };
+    }
+
+    return { valid: true, normalized: `user://${relativeOutputPath}` };
+  }
+
+  /**
+   * Validate screenshot metadata shape.
+   */
+  private isScreenshotMetadata(value: unknown): value is ScreenshotMetadata {
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+      return false;
+    }
+
+    const metadata = value as Record<string, unknown>;
+    return typeof metadata.scene === 'string'
+      && metadata.scene.length > 0
+      && typeof metadata.outputPath === 'string'
+      && metadata.outputPath.length > 0
+      && typeof metadata.absolutePath === 'string'
+      && metadata.absolutePath.length > 0
+      && typeof metadata.width === 'number'
+      && Number.isInteger(metadata.width)
+      && metadata.width > 0
+      && typeof metadata.height === 'number'
+      && Number.isInteger(metadata.height)
+      && metadata.height > 0;
+  }
+
+  /**
+   * Extract validated screenshot metadata from stdout.
+   */
+  private extractScreenshotMetadata(stdout: string): ScreenshotMetadata | null {
+    const lines = stdout
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0);
+
+    for (let index = lines.length - 1; index >= 0; index -= 1) {
+      try {
+        const parsed = JSON.parse(lines[index]);
+        if (this.isScreenshotMetadata(parsed)) {
+          return parsed;
+        }
+      } catch {
+        continue;
+      }
+    }
+
+    return null;
   }
 
   /**
@@ -829,11 +989,11 @@ class GodotServer {
               },
               scene: {
                 type: 'string',
-                description: 'Optional: Specific scene to render instead of the project main scene',
+                description: 'Optional: Specific scene to render instead of the project main scene (project-relative or res:// path)',
               },
               outputPath: {
                 type: 'string',
-                description: 'Optional: Output path for the PNG file (absolute path, res://, user://, or a user://-relative path)',
+                description: 'Optional: Output path for the PNG file (res://, user://, or a relative path that will be saved under user://)',
               },
               waitFrames: {
                 type: 'integer',
@@ -1304,6 +1464,8 @@ class GodotServer {
    */
   private async handleCaptureScreenshot(args: any) {
     args = this.normalizeParameters(args);
+    let normalizedScenePath: string | undefined;
+    let normalizedOutputPath: string | undefined;
 
     if (!args.projectPath) {
       return this.createErrorResponse(
@@ -1319,18 +1481,28 @@ class GodotServer {
       );
     }
 
-    if (args.scene && !this.validatePath(args.scene)) {
-      return this.createErrorResponse(
-        'Invalid scene path',
-        ['Provide a valid scene path without ".." or other potentially unsafe characters']
-      );
+    if (args.scene) {
+      const sceneValidation = this.validateScreenshotScenePath(args.scene);
+      if (!sceneValidation.valid) {
+        return this.createErrorResponse(
+          `Invalid scene path: ${sceneValidation.message}`,
+          ['Provide a project-relative scene path or a res:// scene path']
+        );
+      }
+
+      normalizedScenePath = sceneValidation.normalized;
     }
 
-    if (args.outputPath && !this.validatePath(args.outputPath)) {
-      return this.createErrorResponse(
-        'Invalid output path',
-        ['Provide a valid output path without ".." or other potentially unsafe characters']
-      );
+    if (args.outputPath) {
+      const outputPathValidation = this.validateScreenshotOutputPath(args.outputPath);
+      if (!outputPathValidation.valid) {
+        return this.createErrorResponse(
+          `Invalid output path: ${outputPathValidation.message}`,
+          ['Use user://, res://, or a relative path for the screenshot output']
+        );
+      }
+
+      normalizedOutputPath = outputPathValidation.normalized;
     }
 
     if (
@@ -1368,11 +1540,11 @@ class GodotServer {
         );
       }
 
-      if (args.scene) {
-        const scenePath = this.resolveProjectFilePath(args.projectPath, args.scene);
+      if (normalizedScenePath) {
+        const scenePath = this.resolveProjectFilePath(args.projectPath, normalizedScenePath);
         if (!existsSync(scenePath)) {
           return this.createErrorResponse(
-            `Scene file does not exist: ${args.scene}`,
+            `Scene file does not exist: ${normalizedScenePath}`,
             [
               'Ensure the scene path is correct',
               'Provide a scene relative to the project root or use the project main scene',
@@ -1382,18 +1554,18 @@ class GodotServer {
       }
 
       const params: OperationParams = {};
-      if (args.scene) {
-        params.scene = args.scene;
+      if (normalizedScenePath) {
+        params.scene = normalizedScenePath;
       }
-      if (args.outputPath) {
-        params.outputPath = args.outputPath;
+      if (normalizedOutputPath) {
+        params.outputPath = normalizedOutputPath;
       }
       if (args.waitFrames !== undefined) {
         params.waitFrames = args.waitFrames;
       }
 
       const screenshotExecution = await this.executeScreenshotCapture(params, args.projectPath);
-      const screenshotResult = this.extractJsonFromStdout(screenshotExecution.stdout);
+      const screenshotResult = this.extractScreenshotMetadata(screenshotExecution.stdout);
 
       if (!screenshotResult) {
         const failureDetails: string[] = [];
@@ -1429,7 +1601,7 @@ class GodotServer {
             type: 'text',
             text: JSON.stringify(
               screenshotExecution.stderr.trim().length > 0
-                ? { ...(screenshotResult as Record<string, unknown>), warnings: screenshotExecution.stderr.trim() }
+                ? { ...screenshotResult, warnings: screenshotExecution.stderr.trim() }
                 : screenshotResult,
               null,
               2

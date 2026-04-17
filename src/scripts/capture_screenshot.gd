@@ -45,6 +45,21 @@ func log_debug(message: String):
 func log_error(message: String):
     printerr("[ERROR] " + message)
 
+func _contains_traversal(path: String) -> bool:
+    for segment in path.replace("\\", "/").split("/"):
+        if segment == "..":
+            return true
+    return false
+
+func _is_absolute_filesystem_path(path: String) -> bool:
+    return path.begins_with("/") or path.begins_with("\\") or (path.length() > 1 and path.substr(1, 1) == ":")
+
+func _normalize_relative_path(path: String) -> String:
+    var normalized_path = path.strip_edges().replace("\\", "/")
+    while normalized_path.begins_with("./"):
+        normalized_path = normalized_path.substr(2)
+    return normalized_path.trim_prefix("/")
+
 func _build_default_screenshot_name() -> String:
     var datetime = Time.get_datetime_dict_from_system()
     var year = int(datetime.get("year", 0)) % 100
@@ -56,32 +71,88 @@ func _build_default_screenshot_name() -> String:
 
     return "%02d-%02d-%02d-%02d-%02d-%02d.png" % [year, month, day, hour, minute, second]
 
-func _normalize_scene_path(scene_path: String) -> String:
-    if scene_path.begins_with("res://"):
-        return scene_path
-    return "res://" + scene_path
+func _append_suffix_to_path(path: String, suffix: String) -> String:
+    var extension = path.get_extension()
+    if extension.is_empty():
+        return "%s%s" % [path, suffix]
+    return "%s%s.%s" % [path.get_basename(), suffix, extension]
+
+func _ensure_unique_output_path(output_path: String, absolute_path: String) -> Dictionary:
+    if not FileAccess.file_exists(absolute_path):
+        return {
+            "output_path": output_path,
+            "absolute_path": absolute_path,
+        }
+
+    var counter = 1
+    var candidate_output_path = output_path
+    var candidate_absolute_path = absolute_path
+
+    while FileAccess.file_exists(candidate_absolute_path):
+        var suffix = "-%02d" % counter
+        candidate_output_path = _append_suffix_to_path(output_path, suffix)
+        candidate_absolute_path = _append_suffix_to_path(absolute_path, suffix)
+        counter += 1
+
+    return {
+        "output_path": candidate_output_path,
+        "absolute_path": candidate_absolute_path,
+    }
+
+func _normalize_scene_path(scene_path: String) -> Dictionary:
+    var normalized_scene_path = scene_path.strip_edges()
+
+    if normalized_scene_path.is_empty():
+        return { "error": "Scene path cannot be empty" }
+
+    if normalized_scene_path.begins_with("user://") or _is_absolute_filesystem_path(normalized_scene_path):
+        return { "error": "Scene must be project-relative or start with res://" }
+
+    if _contains_traversal(normalized_scene_path):
+        return { "error": "Scene path must not contain traversal segments" }
+
+    if normalized_scene_path.begins_with("res://"):
+        normalized_scene_path = _normalize_relative_path(normalized_scene_path.substr(6))
+    else:
+        normalized_scene_path = _normalize_relative_path(normalized_scene_path)
+
+    if normalized_scene_path.is_empty():
+        return { "error": "Scene path cannot be empty" }
+
+    return { "scene_path": "res://" + normalized_scene_path }
 
 func _resolve_output_path(output_path: String) -> Dictionary:
     var normalized_output_path = output_path.strip_edges()
 
     if normalized_output_path.is_empty():
         normalized_output_path = "user://.godot-mcp-screenshot/%s" % _build_default_screenshot_name()
-    elif not normalized_output_path.begins_with("res://") and not normalized_output_path.begins_with("user://") and not normalized_output_path.is_absolute_path():
-        normalized_output_path = "user://" + normalized_output_path
+    elif _is_absolute_filesystem_path(normalized_output_path):
+        return { "error": "Absolute filesystem output paths are not allowed" }
+    elif normalized_output_path.begins_with("res://") or normalized_output_path.begins_with("user://"):
+        var prefix = "res://" if normalized_output_path.begins_with("res://") else "user://"
+        normalized_output_path = prefix + _normalize_relative_path(normalized_output_path.substr(prefix.length()))
+    else:
+        normalized_output_path = "user://" + _normalize_relative_path(normalized_output_path)
+
+    if normalized_output_path.ends_with("res://") or normalized_output_path.ends_with("user://"):
+        return { "error": "Output path cannot be empty" }
+
+    if _contains_traversal(normalized_output_path):
+        return { "error": "Output path must not contain traversal segments" }
 
     var absolute_output_path = normalized_output_path
     if normalized_output_path.begins_with("res://") or normalized_output_path.begins_with("user://"):
         absolute_output_path = ProjectSettings.globalize_path(normalized_output_path)
 
-    return {
-        "output_path": normalized_output_path,
-        "absolute_path": absolute_output_path,
-    }
+    return _ensure_unique_output_path(normalized_output_path, absolute_output_path)
 
 func _load_target_scene() -> Dictionary:
     var scene_path = ""
     if capture_params.has("scene"):
-        scene_path = _normalize_scene_path(str(capture_params.scene))
+        var normalized_scene = _normalize_scene_path(str(capture_params.scene))
+        if normalized_scene.has("error"):
+            return normalized_scene
+        scene_path = str(normalized_scene.scene_path)
     else:
         scene_path = str(ProjectSettings.get_setting("application/run/main_scene", ""))
 
@@ -144,6 +215,11 @@ func _capture_screenshot():
         return
 
     var output_result = _resolve_output_path(str(capture_params.get("output_path", "")))
+    if output_result.has("error"):
+        log_error(str(output_result.error))
+        quit(1)
+        return
+
     var absolute_output_path = str(output_result.absolute_path)
     var output_dir = absolute_output_path.get_base_dir()
     var directory_error = DirAccess.make_dir_recursive_absolute(output_dir)
