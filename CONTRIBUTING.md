@@ -99,9 +99,11 @@ The following tools have been recently added:
   - Returns information about scenes, scripts, and assets
   - Helps LLMs understand the organization of Godot projects
   
-- **capture_screenshot**: Takes a screenshot of a running Godot project
-  - Requires an active Godot process
+- **capture_screenshot**: Renders a Godot project scene and writes a screenshot to disk
+  - Uses the provided scene or the project's configured main scene
   - Saves the screenshot to the specified path
+  - Supports absolute paths, `res://`, `user://`, and user-relative output paths
+  - Returns JSON metadata including the saved path and image dimensions
   - Useful for visual debugging and feedback
 
 Example:

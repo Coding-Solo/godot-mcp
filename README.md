@@ -63,6 +63,7 @@ Godot MCP enables AI agents to launch the Godot editor, run projects, capture de
 
 - **Launch Godot Editor**: Open the Godot editor for a specific project
 - **Run Godot Projects**: Execute Godot projects in debug mode
+- **Capture Screenshots**: Render a project scene and save a PNG for UI review or debugging
 - **Capture Debug Output**: Retrieve console output and error messages
 - **Control Execution**: Start and stop Godot projects programmatically
 - **Get Godot Version**: Retrieve the installed Godot version
@@ -118,6 +119,7 @@ Add to your Cline MCP settings file (`~/Library/Application Support/Code/User/gl
       "autoApprove": [
         "launch_editor",
         "run_project",
+        "capture_screenshot",
         "get_debug_output",
         "stop_project",
         "get_godot_version",
@@ -224,6 +226,29 @@ The Godot MCP server uses a bundled GDScript approach for complex operations:
 2. **Bundled Operations Script**: Complex operations like creating scenes or adding nodes use a single, comprehensive GDScript file (`godot_operations.gd`) that handles all operations.
 
 The bundled script accepts operation type and parameters as JSON, allowing for flexible and dynamic operation execution without generating temporary files for each operation.
+
+## Screenshot Capture
+
+The `capture_screenshot` tool renders a Godot scene in a normal Godot process and writes a PNG to disk.
+
+- `projectPath` (required): path to the Godot project directory
+- `scene` (optional): project-relative scene path or `res://...`; defaults to the project's configured `run/main_scene`
+- `outputPath` (optional):
+  - absolute path → saved exactly there
+  - `res://...` → saved inside the project
+  - `user://...` → saved in Godot's user data directory
+  - plain relative path → treated as `user://...`
+  - omitted → saved to `user://.godot-mcp-screenshot/YY-MM-DD-HH-MM-SS.png`
+- `waitFrames` (optional): integer frame count, minimum `1`; increase it for scenes that need more time to finish UI setup before capture
+
+On success the tool returns JSON with:
+
+- `scene`
+- `outputPath`
+- `absolutePath`
+- `width`
+- `height`
+- `warnings` when Godot emitted non-fatal stderr output during capture
 
 ## Troubleshooting
 
