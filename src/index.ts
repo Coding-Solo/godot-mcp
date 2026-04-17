@@ -9,9 +9,19 @@
 
 import { fileURLToPath } from 'url';
 import { join, dirname, basename, normalize } from 'path';
-import { existsSync, readdirSync, mkdirSync } from 'fs';
+import {
+  existsSync,
+  readdirSync,
+  mkdirSync,
+  readFileSync,
+  writeFileSync,
+  unlinkSync,
+  cpSync,
+  rmSync,
+} from 'fs';
 import { spawn, execFile } from 'child_process';
 import { promisify } from 'util';
+import * as net from 'net';
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
@@ -39,7 +49,22 @@ interface GodotProcess {
   process: any;
   output: string[];
   errors: string[];
+  /**
+   * Loopback TCP port passed to the Godot process via `++ --mcp-port N`.
+   * If the user has installed the test harness (see install_test_harness),
+   * the harness binds this port and capture_screenshot connects to it.
+   * Set unconditionally by run_project; projects without the harness
+   * simply ignore the argument.
+   */
+  harnessPort?: number;
 }
+
+/** Autoload name registered in override.cfg for the test harness. */
+const MCP_HARNESS_AUTOLOAD_NAME = 'MCPTestHarness';
+/** Project-relative path of the harness script. */
+const MCP_HARNESS_SCRIPT_RES_PATH = 'res://addons/godot_mcp_harness/mcp_harness.gd';
+/** Directory under the project where the harness addon lives. */
+const MCP_HARNESS_ADDON_DIR = join('addons', 'godot_mcp_harness');
 
 /**
  * Interface for server configuration
@@ -66,6 +91,7 @@ class GodotServer {
   private activeProcess: GodotProcess | null = null;
   private godotPath: string | null = null;
   private operationsScriptPath: string;
+  private harnessAddonSrcPath: string;
   private validatedPaths: Map<string, boolean> = new Map();
   private strictPathValidation: boolean = false;
 
@@ -89,6 +115,7 @@ class GodotServer {
     'directory': 'directory',
     'recursive': 'recursive',
     'scene': 'scene',
+    'save_path': 'savePath',
   };
 
   /**
@@ -133,7 +160,12 @@ class GodotServer {
 
     // Set the path to the operations script
     this.operationsScriptPath = join(__dirname, 'scripts', 'godot_operations.gd');
+    // Bundled test-harness addon source (copied into user projects by
+    // install_test_harness). scripts/build.js copies this tree into
+    // build/scripts/addons/ at package time.
+    this.harnessAddonSrcPath = join(__dirname, 'scripts', 'addons', 'godot_mcp_harness');
     if (debugMode) console.error(`[DEBUG] Operations script path: ${this.operationsScriptPath}`);
+    if (debugMode) console.error(`[DEBUG] Harness addon source: ${this.harnessAddonSrcPath}`);
 
     // Initialize the MCP server
     this.server = new Server(
@@ -923,6 +955,52 @@ class GodotServer {
             required: ['projectPath'],
           },
         },
+        {
+          name: 'install_test_harness',
+          description:
+            'Install the godot-mcp visual-test harness into a Godot project. This copies a small GDScript addon into addons/godot_mcp_harness/ and registers it as an autoload via override.cfg (which Godot excludes from exported builds). Once installed, run_project + capture_screenshot can be used to visually inspect the running game. The harness is guarded by OS.is_debug_build() and will not run in exported release builds. Idempotent.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: {
+                type: 'string',
+                description: 'Path to the Godot project directory',
+              },
+            },
+            required: ['projectPath'],
+          },
+        },
+        {
+          name: 'uninstall_test_harness',
+          description:
+            'Remove the godot-mcp visual-test harness from a Godot project: deletes addons/godot_mcp_harness/ and removes the autoload entry from override.cfg. Idempotent.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: {
+                type: 'string',
+                description: 'Path to the Godot project directory',
+              },
+            },
+            required: ['projectPath'],
+          },
+        },
+        {
+          name: 'capture_screenshot',
+          description:
+            'Capture a PNG screenshot of the currently running Godot project and return it as an image that Claude can see. Requires install_test_harness to have been run on the project beforehand, and requires an active run_project session. The image shows exactly what the game is rendering at the moment of capture — use this to visually verify features that passing tests alone cannot confirm (HUD elements, terrain generation, particle effects, z-order, etc.).',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              savePath: {
+                type: 'string',
+                description:
+                  'Optional: also write the PNG to this filesystem path (absolute or relative to the MCP server cwd). The image is always returned inline regardless of this setting.',
+              },
+            },
+            required: [],
+          },
+        },
       ],
     }));
 
@@ -958,6 +1036,12 @@ class GodotServer {
           return await this.handleGetUid(request.params.arguments);
         case 'update_project_uids':
           return await this.handleUpdateProjectUids(request.params.arguments);
+        case 'install_test_harness':
+          return await this.handleInstallTestHarness(request.params.arguments);
+        case 'uninstall_test_harness':
+          return await this.handleUninstallTestHarness(request.params.arguments);
+        case 'capture_screenshot':
+          return await this.handleCaptureScreenshot(request.params.arguments);
         default:
           throw new McpError(
             ErrorCode.MethodNotFound,
@@ -1093,7 +1177,14 @@ class GodotServer {
         cmdArgs.push(args.scene);
       }
 
-      this.logDebug(`Running Godot project: ${args.projectPath}`);
+      // Reserve a loopback port for the test harness and pass it via user
+      // args (everything after `++` on Godot's command line is passed to
+      // the game as OS.get_cmdline_user_args()). If the harness isn't
+      // installed in this project, the argument is simply unused.
+      const harnessPort = await this.pickFreePort();
+      cmdArgs.push('++', '--mcp-port', String(harnessPort));
+
+      this.logDebug(`Running Godot project: ${args.projectPath} (harness port ${harnessPort})`);
       const process = spawn(this.godotPath!, cmdArgs, { stdio: 'pipe' });
       const output: string[] = [];
       const errors: string[] = [];
@@ -1128,13 +1219,13 @@ class GodotServer {
         }
       });
 
-      this.activeProcess = { process, output, errors };
+      this.activeProcess = { process, output, errors, harnessPort };
 
       return {
         content: [
           {
             type: 'text',
-            text: `Godot project started in debug mode. Use get_debug_output to see output.`,
+            text: `Godot project started in debug mode. Use get_debug_output to see output, or capture_screenshot to see the current frame (requires install_test_harness).`,
           },
         ],
       };
@@ -2166,6 +2257,383 @@ class GodotServer {
         ]
       );
     }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Visual test harness: install / uninstall / capture_screenshot
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Handle the install_test_harness tool.
+   *
+   * Copies the bundled harness addon into the user's project and registers
+   * it as an autoload via override.cfg — not project.godot — so the entry
+   * is automatically excluded from exported builds. Idempotent.
+   */
+  private async handleInstallTestHarness(args: any) {
+    args = this.normalizeParameters(args || {});
+
+    if (!args.projectPath) {
+      return this.createErrorResponse(
+        'Project path is required',
+        ['Provide a valid path to a Godot project directory']
+      );
+    }
+    if (!this.validatePath(args.projectPath)) {
+      return this.createErrorResponse(
+        'Invalid project path',
+        ['Provide a valid path without ".." or other potentially unsafe characters']
+      );
+    }
+
+    const projectFile = join(args.projectPath, 'project.godot');
+    if (!existsSync(projectFile)) {
+      return this.createErrorResponse(
+        `Not a valid Godot project: ${args.projectPath}`,
+        [
+          'Ensure the path points to a directory containing a project.godot file',
+          'Use list_projects to find valid Godot projects',
+        ]
+      );
+    }
+
+    if (!existsSync(this.harnessAddonSrcPath)) {
+      return this.createErrorResponse(
+        `Bundled harness addon not found at ${this.harnessAddonSrcPath}`,
+        [
+          'Re-run `npm run build` in the godot-mcp repo to regenerate bundled assets',
+          'Verify that scripts/build.js ran successfully during install',
+        ]
+      );
+    }
+
+    try {
+      const destDir = join(args.projectPath, MCP_HARNESS_ADDON_DIR);
+      mkdirSync(dirname(destDir), { recursive: true });
+      cpSync(this.harnessAddonSrcPath, destDir, { recursive: true, force: true });
+
+      const cfgResult = this.addAutoloadToOverrideCfg(args.projectPath);
+
+      const lines = [
+        `Installed godot-mcp visual-test harness in ${args.projectPath}.`,
+        `  Addon:        ${join(MCP_HARNESS_ADDON_DIR, 'mcp_harness.gd')}`,
+        `  Autoload:     ${MCP_HARNESS_AUTOLOAD_NAME} (${cfgResult === 'added' ? 'added to' : 'already in'} override.cfg)`,
+        '',
+        'Safety: the autoload entry lives in override.cfg (excluded from exports)',
+        'and the harness script refuses to run in release builds.',
+        '',
+        'Restart the project (stop_project + run_project) to pick up the harness,',
+        'then use capture_screenshot to see what the game is rendering.',
+      ];
+
+      return {
+        content: [{ type: 'text', text: lines.join('\n') }],
+      };
+    } catch (error: any) {
+      return this.createErrorResponse(
+        `Failed to install test harness: ${error?.message || 'Unknown error'}`,
+        [
+          'Verify you have write permissions to the project directory',
+          'Ensure the project directory exists and is accessible',
+        ]
+      );
+    }
+  }
+
+  /**
+   * Handle the uninstall_test_harness tool. Idempotent.
+   */
+  private async handleUninstallTestHarness(args: any) {
+    args = this.normalizeParameters(args || {});
+
+    if (!args.projectPath) {
+      return this.createErrorResponse(
+        'Project path is required',
+        ['Provide a valid path to a Godot project directory']
+      );
+    }
+    if (!this.validatePath(args.projectPath)) {
+      return this.createErrorResponse(
+        'Invalid project path',
+        ['Provide a valid path without ".." or other potentially unsafe characters']
+      );
+    }
+
+    try {
+      const destDir = join(args.projectPath, MCP_HARNESS_ADDON_DIR);
+      let addonRemoved = false;
+      if (existsSync(destDir)) {
+        rmSync(destDir, { recursive: true, force: true });
+        addonRemoved = true;
+      }
+
+      const cfgResult = this.removeAutoloadFromOverrideCfg(args.projectPath);
+
+      const lines = [
+        `Uninstalled godot-mcp visual-test harness from ${args.projectPath}.`,
+        `  Addon:    ${addonRemoved ? 'removed' : 'not present'}`,
+        `  Autoload: ${cfgResult}`,
+      ];
+      return {
+        content: [{ type: 'text', text: lines.join('\n') }],
+      };
+    } catch (error: any) {
+      return this.createErrorResponse(
+        `Failed to uninstall test harness: ${error?.message || 'Unknown error'}`,
+        ['Verify you have write permissions to the project directory']
+      );
+    }
+  }
+
+  /**
+   * Handle the capture_screenshot tool. Returns an MCP image content block.
+   */
+  private async handleCaptureScreenshot(args: any) {
+    args = this.normalizeParameters(args || {});
+
+    if (!this.activeProcess) {
+      return this.createErrorResponse(
+        'No active Godot project. Use run_project first.',
+        ['Call run_project to launch the game before capturing a screenshot']
+      );
+    }
+
+    const port = this.activeProcess.harnessPort;
+    if (!port) {
+      return this.createErrorResponse(
+        'Active Godot process has no harness port.',
+        [
+          'Restart run_project; harness port assignment was added in this version',
+        ]
+      );
+    }
+
+    try {
+      const { status, payload } = await this.sendHarnessRequest(port, 0x01, 10000);
+
+      if (status !== 0x00) {
+        const message = payload.toString('utf8');
+        return this.createErrorResponse(
+          `Harness returned error: ${message || '(no message)'}`,
+          [
+            'Check get_debug_output for harness startup warnings',
+            'Ensure install_test_harness was run on this project',
+            'Ensure the project was restarted after installing the harness',
+          ]
+        );
+      }
+
+      const content: any[] = [
+        {
+          type: 'image',
+          data: payload.toString('base64'),
+          mimeType: 'image/png',
+        },
+      ];
+
+      if (args.savePath && typeof args.savePath === 'string' && this.validatePath(args.savePath)) {
+        try {
+          writeFileSync(args.savePath, payload);
+          content.push({
+            type: 'text',
+            text: `Screenshot also saved to ${args.savePath} (${payload.length} bytes).`,
+          });
+        } catch (writeErr: any) {
+          content.push({
+            type: 'text',
+            text: `Warning: failed to save screenshot to ${args.savePath}: ${writeErr?.message || 'unknown error'}`,
+          });
+        }
+      }
+
+      return { content };
+    } catch (error: any) {
+      const message = error?.message || 'Unknown error';
+      const hints = [
+        'Run install_test_harness on this project if you have not already',
+        'Restart the project with stop_project + run_project after installing',
+        'Check get_debug_output for "[godot-mcp harness] Listening on..." to confirm the harness is running',
+      ];
+      if (message.includes('ECONNREFUSED')) {
+        hints.unshift(
+          'The harness is not listening on the expected port — this usually means install_test_harness has not been run, or the project was started before the harness was installed'
+        );
+      }
+      return this.createErrorResponse(`Failed to capture screenshot: ${message}`, hints);
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Harness helpers: port picking, TCP client, override.cfg editing
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Ask the OS for a free loopback port by binding to port 0 and reading
+   * back the assigned port. The port is released before returning, so
+   * there is a small TOCTOU window before the Godot process binds it,
+   * but for a local-only, single-user tool this is acceptable.
+   */
+  private pickFreePort(): Promise<number> {
+    return new Promise((resolve, reject) => {
+      const srv = net.createServer();
+      srv.once('error', reject);
+      srv.listen(0, '127.0.0.1', () => {
+        const addr = srv.address();
+        if (addr && typeof addr === 'object') {
+          const port = addr.port;
+          srv.close(() => resolve(port));
+        } else {
+          srv.close();
+          reject(new Error('Failed to pick a free port'));
+        }
+      });
+    });
+  }
+
+  /**
+   * Send a single request to the harness and read the length-prefixed
+   * response. Wire format (see mcp_harness.gd for the server side):
+   *   request:  [opcode:u8]
+   *   response: [status:u8][length:u32 BE][payload:length bytes]
+   */
+  private sendHarnessRequest(
+    port: number,
+    opcode: number,
+    timeoutMs: number
+  ): Promise<{ status: number; payload: Buffer }> {
+    return new Promise((resolve, reject) => {
+      const socket = new net.Socket();
+      const chunks: Buffer[] = [];
+      let settled = false;
+
+      const finish = (err: Error | null, value?: { status: number; payload: Buffer }) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        try {
+          socket.destroy();
+        } catch {
+          /* ignore */
+        }
+        if (err) reject(err);
+        else resolve(value!);
+      };
+
+      const timer = setTimeout(
+        () => finish(new Error(`harness request timed out after ${timeoutMs}ms`)),
+        timeoutMs
+      );
+
+      socket.on('data', (chunk) => chunks.push(chunk));
+      socket.on('end', () => {
+        const buf = Buffer.concat(chunks);
+        if (buf.length < 5) {
+          finish(new Error(`harness response too short: ${buf.length} bytes`));
+          return;
+        }
+        const status = buf.readUInt8(0);
+        const length = buf.readUInt32BE(1);
+        if (buf.length < 5 + length) {
+          finish(
+            new Error(`harness response truncated: expected ${5 + length}, got ${buf.length}`)
+          );
+          return;
+        }
+        const payload = buf.subarray(5, 5 + length);
+        finish(null, { status, payload });
+      });
+      socket.on('error', (err) => finish(err));
+
+      socket.connect(port, '127.0.0.1', () => {
+        socket.write(Buffer.from([opcode & 0xff]));
+      });
+    });
+  }
+
+  /**
+   * Add the MCP harness autoload to `<projectPath>/override.cfg`.
+   *
+   * We use override.cfg (not project.godot) because override.cfg is
+   * explicitly excluded from exported Godot projects, so the autoload
+   * entry can never end up in a shipped game.
+   *
+   * The parser is deliberately minimal: it handles the common case of
+   * a plain-text config with `[section]` headers and `key=value` lines,
+   * preserving anything it doesn't recognize.
+   */
+  private addAutoloadToOverrideCfg(projectPath: string): 'added' | 'already_present' {
+    const cfgPath = join(projectPath, 'override.cfg');
+    const key = `autoload/${MCP_HARNESS_AUTOLOAD_NAME}`;
+    const value = `*${MCP_HARNESS_SCRIPT_RES_PATH}`;
+    const entry = `${key}="${value}"`;
+
+    let content = '';
+    if (existsSync(cfgPath)) {
+      content = readFileSync(cfgPath, 'utf8');
+    }
+
+    const lines = content.length > 0 ? content.split(/\r?\n/) : [];
+
+    // Idempotency: skip if this exact key already exists anywhere.
+    for (const line of lines) {
+      if (line.trim().startsWith(`${key}=`)) {
+        return 'already_present';
+      }
+    }
+
+    // Find [autoload] section, or append it at the end.
+    const autoloadIdx = lines.findIndex((l) => l.trim() === '[autoload]');
+    if (autoloadIdx < 0) {
+      if (lines.length > 0 && lines[lines.length - 1].trim() !== '') {
+        lines.push('');
+      }
+      lines.push('[autoload]');
+      lines.push(entry);
+    } else {
+      lines.splice(autoloadIdx + 1, 0, entry);
+    }
+
+    let out = lines.join('\n');
+    if (!out.endsWith('\n')) out += '\n';
+    writeFileSync(cfgPath, out, 'utf8');
+    return 'added';
+  }
+
+  /**
+   * Remove the MCP harness autoload entry from override.cfg. If the file
+   * becomes empty (only whitespace) after removal, delete it entirely so
+   * the project directory stays clean.
+   */
+  private removeAutoloadFromOverrideCfg(
+    projectPath: string
+  ): 'removed' | 'not_present' | 'no_file' {
+    const cfgPath = join(projectPath, 'override.cfg');
+    if (!existsSync(cfgPath)) return 'no_file';
+
+    const content = readFileSync(cfgPath, 'utf8');
+    const lines = content.split(/\r?\n/);
+    const key = `autoload/${MCP_HARNESS_AUTOLOAD_NAME}`;
+    const filtered = lines.filter((l) => !l.trim().startsWith(`${key}=`));
+    if (filtered.length === lines.length) return 'not_present';
+
+    const remaining = filtered.join('\n');
+    // If the only non-empty content was the autoload entry (and maybe
+    // just an [autoload] header), clean up the file entirely.
+    const nonEmpty = filtered
+      .map((l) => l.trim())
+      .filter((l) => l.length > 0 && l !== '[autoload]');
+    if (nonEmpty.length === 0) {
+      try {
+        unlinkSync(cfgPath);
+      } catch {
+        /* ignore */
+      }
+    } else {
+      let out = remaining;
+      if (!out.endsWith('\n')) out += '\n';
+      writeFileSync(cfgPath, out, 'utf8');
+    }
+    return 'removed';
   }
 
   /**

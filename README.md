@@ -64,6 +64,7 @@ Godot MCP enables AI agents to launch the Godot editor, run projects, capture de
 - **Launch Godot Editor**: Open the Godot editor for a specific project
 - **Run Godot Projects**: Execute Godot projects in debug mode
 - **Capture Debug Output**: Retrieve console output and error messages
+- **Visual Testing**: Capture PNG screenshots of a running game and return them directly to the agent, so it can visually verify features that passing tests alone cannot confirm
 - **Control Execution**: Start and stop Godot projects programmatically
 - **Get Godot Version**: Retrieve the installed Godot version
 - **List Godot Projects**: Find Godot projects in a specified directory
@@ -129,7 +130,10 @@ Add to your Cline MCP settings file (`~/Library/Application Support/Code/User/gl
         "export_mesh_library",
         "save_scene",
         "get_uid",
-        "update_project_uids"
+        "update_project_uids",
+        "install_test_harness",
+        "uninstall_test_harness",
+        "capture_screenshot"
       ]
     }
   }
@@ -215,6 +219,37 @@ Then point your MCP client to `build/index.js` instead of using `npx`.
 
 </details>
 
+
+## Visual testing
+
+Passing tests do not prove a feature is visible in the game. A rendering bug, a z-order mistake, or an unlucky default constant can leave a feature invisible while every test still passes at the data layer. To let an agent verify what the player actually sees, this server ships a small optional test harness and a `capture_screenshot` tool.
+
+### Tools
+
+- **`install_test_harness`** — one-time per project. Copies a small GDScript addon into `addons/godot_mcp_harness/` and registers it as an autoload via `override.cfg`. Idempotent.
+- **`capture_screenshot`** — with an active `run_project` session, returns a PNG of the current frame as an MCP image content block. Claude can see the image directly in its reply.
+- **`uninstall_test_harness`** — removes the addon and the `override.cfg` entry. Idempotent.
+
+### Typical agent workflow
+
+1. `install_test_harness { projectPath }` (once per project)
+2. `run_project { projectPath }`
+3. `capture_screenshot` → PNG appears inline, agent visually inspects it
+4. `stop_project` when done
+
+### Export safety
+
+The harness is **guaranteed not to ship in your exported game**, by three independent safeguards:
+
+1. **`override.cfg`, not `project.godot`.** The autoload entry is written to `override.cfg`, which Godot explicitly excludes from exported projects.
+2. **Debug-build guard.** `mcp_harness.gd` calls `queue_free()` and returns on the first frame if `OS.is_debug_build()` is false. Even if the autoload entry somehow reached an export, the script disarms itself.
+3. **Loopback only.** The TCP listener binds `127.0.0.1` — never `0.0.0.0` — so nothing on the network can reach it even in a pathological case where both guards above failed.
+
+The `addons/godot_mcp_harness/` folder itself is just inert GDScript. You can commit it, gitignore it, or delete it with `uninstall_test_harness` — it has no effect on a release build either way.
+
+### How it works
+
+When `run_project` launches Godot, it picks a free loopback port and passes it to the game via `++ --mcp-port <N>` (Godot's `++` separator hands anything after it to the game as `OS.get_cmdline_user_args()`). The harness autoload reads the port and opens a `TCPServer` on `127.0.0.1:<N>`. `capture_screenshot` connects, sends a one-byte opcode, and reads back a length-prefixed PNG encoded from `get_viewport().get_texture().get_image()`. Projects without the harness installed simply ignore the extra argument — no behavior change.
 
 ## Architecture
 
