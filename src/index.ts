@@ -8,7 +8,7 @@
  */
 
 import { fileURLToPath } from 'url';
-import { join, dirname, basename, normalize } from 'path';
+import { join, dirname, basename, normalize, resolve, relative } from 'path';
 import { existsSync, readdirSync, mkdirSync } from 'fs';
 import { spawn, execFile } from 'child_process';
 import { promisify } from 'util';
@@ -58,6 +58,24 @@ interface OperationParams {
   [key: string]: any;
 }
 
+interface ProcessExecutionResult {
+  stdout: string;
+  stderr: string;
+  exitCode?: number | null;
+  signal?: NodeJS.Signals | null;
+  timedOut?: boolean;
+  errorMessage?: string;
+}
+
+interface ScreenshotMetadata {
+  scene: string;
+  outputPath: string;
+  absolutePath: string;
+  width: number;
+  height: number;
+  warnings?: string;
+}
+
 /**
  * Main server class for the Godot MCP server
  */
@@ -66,6 +84,7 @@ class GodotServer {
   private activeProcess: GodotProcess | null = null;
   private godotPath: string | null = null;
   private operationsScriptPath: string;
+  private screenshotScriptPath: string;
   private validatedPaths: Map<string, boolean> = new Map();
   private strictPathValidation: boolean = false;
 
@@ -89,6 +108,7 @@ class GodotServer {
     'directory': 'directory',
     'recursive': 'recursive',
     'scene': 'scene',
+    'wait_frames': 'waitFrames',
   };
 
   /**
@@ -133,7 +153,9 @@ class GodotServer {
 
     // Set the path to the operations script
     this.operationsScriptPath = join(__dirname, 'scripts', 'godot_operations.gd');
+    this.screenshotScriptPath = join(__dirname, 'scripts', 'capture_screenshot.gd');
     if (debugMode) console.error(`[DEBUG] Operations script path: ${this.operationsScriptPath}`);
+    if (debugMode) console.error(`[DEBUG] Screenshot script path: ${this.screenshotScriptPath}`);
 
     // Initialize the MCP server
     this.server = new Server(
@@ -543,6 +565,262 @@ class GodotServer {
   }
 
   /**
+   * Execute the screenshot capture script with rendering enabled.
+   * @param params The parameters for the screenshot operation
+   * @param projectPath The path to the Godot project
+   * @returns The stdout and stderr from the operation
+   */
+  private async executeScreenshotCapture(
+    params: OperationParams,
+    projectPath: string
+  ): Promise<ProcessExecutionResult> {
+    this.logDebug(`Capturing screenshot for project: ${projectPath}`);
+    this.logDebug(`Original screenshot params: ${JSON.stringify(params)}`);
+
+    const snakeCaseParams = this.convertCamelToSnakeCase(params);
+    this.logDebug(`Converted screenshot params: ${JSON.stringify(snakeCaseParams)}`);
+
+    if (!this.godotPath) {
+      await this.detectGodotPath();
+      if (!this.godotPath) {
+        throw new Error('Could not find a valid Godot executable path');
+      }
+    }
+
+    try {
+      const paramsJson = JSON.stringify(snakeCaseParams);
+      const args = [
+        '--path',
+        projectPath,
+        '--script',
+        this.screenshotScriptPath,
+        paramsJson,
+      ];
+
+      if (GODOT_DEBUG_MODE) {
+        args.push('--debug-godot');
+      }
+
+      this.logDebug(`Executing screenshot capture: ${this.godotPath} ${args.join(' ')}`);
+
+      const { stdout, stderr } = await execFileAsync(this.godotPath!, args, {
+        timeout: 60000,
+        maxBuffer: 10 * 1024 * 1024,
+      });
+
+      return { stdout: stdout ?? '', stderr: stderr ?? '' };
+    } catch (error: unknown) {
+      if (error instanceof Error && 'stdout' in error && 'stderr' in error) {
+        const execError = error as Error & {
+          stdout?: string;
+          stderr?: string;
+          code?: number | null;
+          signal?: NodeJS.Signals | null;
+          killed?: boolean;
+        };
+
+        return {
+          stdout: execError.stdout ?? '',
+          stderr: execError.stderr ?? '',
+          exitCode: execError.code,
+          signal: execError.signal,
+          timedOut: execError.killed === true,
+          errorMessage: execError.message,
+        };
+      }
+
+      throw error;
+    }
+  }
+
+  /**
+   * Extract the last JSON object printed to stdout.
+   * @param stdout Process stdout
+   * @returns Parsed JSON object or null
+   */
+  private extractJsonFromStdout(stdout: string): unknown | null {
+    const lines = stdout
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0);
+
+    for (let index = lines.length - 1; index >= 0; index -= 1) {
+      try {
+        return JSON.parse(lines[index]);
+      } catch {
+        continue;
+      }
+    }
+
+    return null;
+  }
+
+  /**
+   * Normalize a project resource path into a local filesystem path.
+   * @param projectPath The Godot project directory
+   * @param resourcePath The resource path to normalize
+   * @returns Absolute file path inside the project
+   */
+  private resolveProjectFilePath(projectPath: string, resourcePath: string): string {
+    const absoluteProjectPath = resolve(projectPath);
+    const normalizedResourcePath = resourcePath.startsWith('res://')
+      ? resourcePath.slice('res://'.length)
+      : resourcePath;
+    const resolvedPath = resolve(absoluteProjectPath, normalizedResourcePath);
+    const relativePath = relative(absoluteProjectPath, resolvedPath);
+
+    if (relativePath.startsWith('..') || relativePath === '') {
+      return resolvedPath;
+    }
+
+    return resolvedPath;
+  }
+
+  /**
+   * Check whether a path is an absolute filesystem path.
+   */
+  private isAbsoluteFilesystemPath(value: string): boolean {
+    return /^(?:[A-Za-z]:[\\/]|\\\\|\/)/.test(value.trim());
+  }
+
+  /**
+   * Check whether a path contains traversal segments.
+   */
+  private hasTraversalSegments(value: string): boolean {
+    return value
+      .replace(/\\/g, '/')
+      .split('/')
+      .some((segment) => segment === '..');
+  }
+
+  /**
+   * Normalize a project-relative resource path.
+   */
+  private normalizeProjectRelativePath(value: string): string {
+    let normalizedValue = value.trim().replace(/\\/g, '/');
+    while (normalizedValue.startsWith('./')) {
+      normalizedValue = normalizedValue.slice(2);
+    }
+
+    return normalizedValue.replace(/^\/+/, '');
+  }
+
+  /**
+   * Validate and normalize screenshot scene input.
+   */
+  private validateScreenshotScenePath(scene: string): { valid: boolean; normalized?: string; message?: string } {
+    const trimmedScene = scene.trim();
+
+    if (!trimmedScene) {
+      return { valid: false, message: 'Scene path cannot be empty' };
+    }
+
+    if (trimmedScene.startsWith('user://') || this.isAbsoluteFilesystemPath(trimmedScene)) {
+      return { valid: false, message: 'Scene must be project-relative or start with res://' };
+    }
+
+    if (this.hasTraversalSegments(trimmedScene)) {
+      return { valid: false, message: 'Scene path must not contain traversal segments' };
+    }
+
+    const relativeScene = trimmedScene.startsWith('res://')
+      ? this.normalizeProjectRelativePath(trimmedScene.slice('res://'.length))
+      : this.normalizeProjectRelativePath(trimmedScene);
+
+    if (!relativeScene) {
+      return { valid: false, message: 'Scene path cannot be empty' };
+    }
+
+    return { valid: true, normalized: `res://${relativeScene}` };
+  }
+
+  /**
+   * Validate and normalize screenshot output path input.
+   */
+  private validateScreenshotOutputPath(outputPath: string): { valid: boolean; normalized?: string; message?: string } {
+    const trimmedOutputPath = outputPath.trim();
+
+    if (!trimmedOutputPath) {
+      return { valid: false, message: 'Output path cannot be empty' };
+    }
+
+    if (this.isAbsoluteFilesystemPath(trimmedOutputPath)) {
+      return {
+        valid: false,
+        message: 'Absolute filesystem output paths are not allowed; use user://, res://, or a relative path',
+      };
+    }
+
+    if (this.hasTraversalSegments(trimmedOutputPath)) {
+      return { valid: false, message: 'Output path must not contain traversal segments' };
+    }
+
+    if (trimmedOutputPath.startsWith('user://') || trimmedOutputPath.startsWith('res://')) {
+      const prefix = trimmedOutputPath.startsWith('user://') ? 'user://' : 'res://';
+      const relativeOutputPath = this.normalizeProjectRelativePath(trimmedOutputPath.slice(prefix.length));
+
+      if (!relativeOutputPath) {
+        return { valid: false, message: 'Output path cannot be empty' };
+      }
+
+      return { valid: true, normalized: `${prefix}${relativeOutputPath}` };
+    }
+
+    const relativeOutputPath = this.normalizeProjectRelativePath(trimmedOutputPath);
+    if (!relativeOutputPath) {
+      return { valid: false, message: 'Output path cannot be empty' };
+    }
+
+    return { valid: true, normalized: `user://${relativeOutputPath}` };
+  }
+
+  /**
+   * Validate screenshot metadata shape.
+   */
+  private isScreenshotMetadata(value: unknown): value is ScreenshotMetadata {
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+      return false;
+    }
+
+    const metadata = value as Record<string, unknown>;
+    return typeof metadata.scene === 'string'
+      && metadata.scene.length > 0
+      && typeof metadata.outputPath === 'string'
+      && metadata.outputPath.length > 0
+      && typeof metadata.absolutePath === 'string'
+      && metadata.absolutePath.length > 0
+      && typeof metadata.width === 'number'
+      && Number.isInteger(metadata.width)
+      && metadata.width > 0
+      && typeof metadata.height === 'number'
+      && Number.isInteger(metadata.height)
+      && metadata.height > 0;
+  }
+
+  /**
+   * Extract validated screenshot metadata from stdout.
+   */
+  private extractScreenshotMetadata(stdout: string): ScreenshotMetadata | null {
+    const lines = stdout
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0);
+
+    for (let index = lines.length - 1; index >= 0; index -= 1) {
+      try {
+        const parsed = JSON.parse(lines[index]);
+        if (this.isScreenshotMetadata(parsed)) {
+          return parsed;
+        }
+      } catch {
+        continue;
+      }
+    }
+
+    return null;
+  }
+
+  /**
    * Get the structure of a Godot project
    * @param projectPath Path to the Godot project
    * @returns Object representing the project structure
@@ -694,6 +972,33 @@ class GodotServer {
               scene: {
                 type: 'string',
                 description: 'Optional: Specific scene to run',
+              },
+            },
+            required: ['projectPath'],
+          },
+        },
+        {
+          name: 'capture_screenshot',
+          description: 'Capture a screenshot from a Godot project render',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: {
+                type: 'string',
+                description: 'Path to the Godot project directory',
+              },
+              scene: {
+                type: 'string',
+                description: 'Optional: Specific scene to render instead of the project main scene (project-relative or res:// path)',
+              },
+              outputPath: {
+                type: 'string',
+                description: 'Optional: Output path for the PNG file (res://, user://, or a relative path that will be saved under user://)',
+              },
+              waitFrames: {
+                type: 'integer',
+                minimum: 1,
+                description: 'Optional: Integer number of frames to wait before capturing (default: 2)',
               },
             },
             required: ['projectPath'],
@@ -934,6 +1239,8 @@ class GodotServer {
           return await this.handleLaunchEditor(request.params.arguments);
         case 'run_project':
           return await this.handleRunProject(request.params.arguments);
+        case 'capture_screenshot':
+          return await this.handleCaptureScreenshot(request.params.arguments);
         case 'get_debug_output':
           return await this.handleGetDebugOutput();
         case 'stop_project':
@@ -1142,6 +1449,169 @@ class GodotServer {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       return this.createErrorResponse(
         `Failed to run Godot project: ${errorMessage}`,
+        [
+          'Ensure Godot is installed correctly',
+          'Check if the GODOT_PATH environment variable is set correctly',
+          'Verify the project path is accessible',
+        ]
+      );
+    }
+  }
+
+  /**
+   * Handle the capture_screenshot tool
+   * @param args Tool arguments
+   */
+  private async handleCaptureScreenshot(args: any) {
+    args = this.normalizeParameters(args);
+    let normalizedScenePath: string | undefined;
+    let normalizedOutputPath: string | undefined;
+
+    if (!args.projectPath) {
+      return this.createErrorResponse(
+        'Project path is required',
+        ['Provide a valid path to a Godot project directory']
+      );
+    }
+
+    if (!this.validatePath(args.projectPath)) {
+      return this.createErrorResponse(
+        'Invalid project path',
+        ['Provide a valid path without ".." or other potentially unsafe characters']
+      );
+    }
+
+    if (args.scene) {
+      const sceneValidation = this.validateScreenshotScenePath(args.scene);
+      if (!sceneValidation.valid) {
+        return this.createErrorResponse(
+          `Invalid scene path: ${sceneValidation.message}`,
+          ['Provide a project-relative scene path or a res:// scene path']
+        );
+      }
+
+      normalizedScenePath = sceneValidation.normalized;
+    }
+
+    if (args.outputPath) {
+      const outputPathValidation = this.validateScreenshotOutputPath(args.outputPath);
+      if (!outputPathValidation.valid) {
+        return this.createErrorResponse(
+          `Invalid output path: ${outputPathValidation.message}`,
+          ['Use user://, res://, or a relative path for the screenshot output']
+        );
+      }
+
+      normalizedOutputPath = outputPathValidation.normalized;
+    }
+
+    if (
+      args.waitFrames !== undefined
+      && (!Number.isInteger(args.waitFrames) || args.waitFrames < 1)
+    ) {
+      return this.createErrorResponse(
+        'Invalid waitFrames value',
+        ['Provide an integer waitFrames value greater than or equal to 1']
+      );
+    }
+
+    try {
+      if (!this.godotPath) {
+        await this.detectGodotPath();
+        if (!this.godotPath) {
+          return this.createErrorResponse(
+            'Could not find a valid Godot executable path',
+            [
+              'Ensure Godot is installed correctly',
+              'Set GODOT_PATH environment variable to specify the correct path',
+            ]
+          );
+        }
+      }
+
+      const projectFile = join(args.projectPath, 'project.godot');
+      if (!existsSync(projectFile)) {
+        return this.createErrorResponse(
+          `Not a valid Godot project: ${args.projectPath}`,
+          [
+            'Ensure the path points to a directory containing a project.godot file',
+            'Use list_projects to find valid Godot projects',
+          ]
+        );
+      }
+
+      if (normalizedScenePath) {
+        const scenePath = this.resolveProjectFilePath(args.projectPath, normalizedScenePath);
+        if (!existsSync(scenePath)) {
+          return this.createErrorResponse(
+            `Scene file does not exist: ${normalizedScenePath}`,
+            [
+              'Ensure the scene path is correct',
+              'Provide a scene relative to the project root or use the project main scene',
+            ]
+          );
+        }
+      }
+
+      const params: OperationParams = {};
+      if (normalizedScenePath) {
+        params.scene = normalizedScenePath;
+      }
+      if (normalizedOutputPath) {
+        params.outputPath = normalizedOutputPath;
+      }
+      if (args.waitFrames !== undefined) {
+        params.waitFrames = args.waitFrames;
+      }
+
+      const screenshotExecution = await this.executeScreenshotCapture(params, args.projectPath);
+      const screenshotResult = this.extractScreenshotMetadata(screenshotExecution.stdout);
+
+      if (!screenshotResult) {
+        const failureDetails: string[] = [];
+        if (screenshotExecution.errorMessage) {
+          failureDetails.push(screenshotExecution.errorMessage);
+        }
+        if (screenshotExecution.exitCode !== undefined) {
+          failureDetails.push(`exit code: ${screenshotExecution.exitCode}`);
+        }
+        if (screenshotExecution.signal) {
+          failureDetails.push(`signal: ${screenshotExecution.signal}`);
+        }
+        if (screenshotExecution.timedOut) {
+          failureDetails.push('process timed out');
+        }
+        if (screenshotExecution.stderr.trim().length > 0) {
+          failureDetails.push(`stderr: ${screenshotExecution.stderr.trim()}`);
+        }
+
+        return this.createErrorResponse(
+          `Failed to capture screenshot: ${failureDetails.join(' | ') || 'screenshot metadata was not returned'}`,
+          [
+            'Ensure the project scene can render in a normal Godot window',
+            'Increase waitFrames if the screenshot is blank or UI appears late',
+            'Verify the output path is writable',
+          ]
+        );
+      }
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(
+              screenshotExecution.stderr.trim().length > 0
+                ? { ...screenshotResult, warnings: screenshotExecution.stderr.trim() }
+                : screenshotResult,
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    } catch (error: any) {
+      return this.createErrorResponse(
+        `Failed to capture screenshot: ${error?.message || 'Unknown error'}`,
         [
           'Ensure Godot is installed correctly',
           'Check if the GODOT_PATH environment variable is set correctly',
