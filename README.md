@@ -194,6 +194,22 @@ For any MCP-compatible client, use this configuration:
 
 </details>
 
+<details>
+<summary><strong>Claude Desktop</strong></summary>
+
+Build and install the Claude Desktop MCPB package:
+
+```bash
+git clone https://github.com/Coding-Solo/godot-mcp.git
+cd godot-mcp
+npm install
+npm run build:mcpb
+```
+
+Double-click the generated `.mcpb` file in the `build` directory to install it in Claude Desktop, then set your Godot executable path in the MCP config.
+
+</details>
+
 ### Environment Variables
 
 | Variable | Description |

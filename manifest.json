@@ -1,0 +1,59 @@
+{
+  "manifest_version": "0.3",
+  "name": "Godot MCP",
+  "version": "0.0.0",
+  "description": "MCP server for interfacing with Godot game engine. Launch editor, run projects, manage scenes, and capture debug output.",
+  "author": {
+    "name": "Solomon Elias",
+    "email": "solomon@sippy.ai"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Coding-Solo/godot-mcp"
+  },
+  "homepage": "https://github.com/Coding-Solo/godot-mcp",
+  "icon": "icon_color.png",
+  "server": {
+    "type": "node",
+    "entry_point": "server/index.js",
+    "mcp_config": {
+      "command": "node",
+      "args": ["${__dirname}/server/index.js"],
+      "env": {
+        "GODOT_PATH": "${user_config.godot_path}"
+      }
+    }
+  },
+  "user_config": {
+    "godot_path": {
+      "type": "file",
+      "title": "Godot Executable Path",
+      "description": "Path to the Godot engine executable. Leave empty for auto-detection from system PATH.",
+      "required": false
+    }
+  },
+  "compatibility": {
+    "platforms": ["darwin", "win32", "linux"],
+    "runtimes": {
+      "node": ">=18.0.0"
+    }
+  },
+  "tools": [
+    { "name": "launch_editor", "description": "Open Godot editor for a project" },
+    { "name": "run_project", "description": "Execute Godot project in debug mode" },
+    { "name": "get_debug_output", "description": "Retrieve captured console output" },
+    { "name": "stop_project", "description": "Terminate running Godot process" },
+    { "name": "get_godot_version", "description": "Get installed Godot version" },
+    { "name": "list_projects", "description": "Find Godot projects in a directory" },
+    { "name": "get_project_info", "description": "Get project metadata and structure" },
+    { "name": "create_scene", "description": "Create new scene files" },
+    { "name": "add_node", "description": "Add nodes to existing scenes" },
+    { "name": "load_sprite", "description": "Load textures into Sprite2D nodes" },
+    { "name": "export_mesh_library", "description": "Export 3D scenes as MeshLibrary" },
+    { "name": "save_scene", "description": "Save scene changes" },
+    { "name": "get_uid", "description": "Get UID for a specific file (Godot 4.4+)" },
+    { "name": "update_project_uids", "description": "Update UID references across project resources" }
+  ],
+  "keywords": ["godot", "game-engine", "game-development"]
+}
