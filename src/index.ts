@@ -2130,12 +2130,15 @@ class GodotServer {
         );
       }
 
-      // Prepare parameters for the operation (already in camelCase)
+      // Execute using the current project root inside Godot.
+      // Passing the absolute host path through to resave_resources() breaks
+      // because the Godot-side script prefixes non-resource paths with res://,
+      // turning /mnt/... into malformed res:///mnt/....
+      // Explicitly pass a resource-root path so the Godot-side operation stays
+      // inside the active project context without tripping its empty-params check.
       const params = {
-        projectPath: args.projectPath,
+        projectPath: 'res://',
       };
-
-      // Execute the operation
       const { stdout, stderr } = await this.executeOperation('resave_resources', params, args.projectPath);
 
       if (stderr && stderr.includes('Failed to')) {
