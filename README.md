@@ -72,6 +72,8 @@ Godot MCP enables AI agents to launch the Godot editor, run projects, capture de
   - Create new scenes with specified root node types
   - Add nodes to existing scenes with customizable properties
   - Load sprites and textures into Sprite2D nodes
+    - Texture files must be valid Godot-loadable image resources
+    - Newly added or generated image files may need to be imported by Godot before `load_sprite` can use them
   - Export 3D scenes as MeshLibrary resources for GridMap
   - Save scenes with options for creating variants
 - **UID Management** (for Godot 4.4+):
@@ -231,6 +233,10 @@ The bundled script accepts operation type and parameters as JSON, allowing for f
 - **Connection Issues**: Ensure the server is running and restart your AI assistant
 - **Invalid Project Path**: Ensure the path points to a directory containing a `project.godot` file
 - **Build Issues**: Make sure all dependencies are installed by running `npm install`
+- **`load_sprite` fails with `No loader found for resource`**:
+  - Verify the image file is not corrupt
+  - Make sure the format is supported by your Godot import pipeline
+  - If the image was newly added or generated outside the editor, run a Godot import pass before calling `load_sprite`
 
 <details>
 <summary><strong>Cursor-Specific Issues</strong></summary>
