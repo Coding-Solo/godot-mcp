@@ -68,6 +68,8 @@ class GodotServer {
   private operationsScriptPath: string;
   private validatedPaths: Map<string, boolean> = new Map();
   private strictPathValidation: boolean = false;
+  // In-memory log buffer for editor console output (shared across launch/run)
+  private editorLogLines: string[] = [];
 
   /**
    * Parameter name mappings between snake_case and camelCase
@@ -923,6 +925,19 @@ class GodotServer {
             required: ['projectPath'],
           },
         },
+        {
+          name: 'view_log',
+          description: 'View recent console output from the last launched editor or running project. Returns the last N lines of captured stdout/stderr.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              lineCount: {
+                type: 'number',
+                description: 'Number of trailing lines to return (default 50, max 1000)',
+              },
+            },
+          },
+        },
       ],
     }));
 
@@ -958,6 +973,8 @@ class GodotServer {
           return await this.handleGetUid(request.params.arguments);
         case 'update_project_uids':
           return await this.handleUpdateProjectUids(request.params.arguments);
+        case 'view_log':
+          return await this.handleViewLog(request.params.arguments);
         default:
           throw new McpError(
             ErrorCode.MethodNotFound,
@@ -1017,19 +1034,56 @@ class GodotServer {
       }
 
       this.logDebug(`Launching Godot editor for project: ${args.projectPath}`);
+
+      // Clear the log buffer on each new launch
+      this.editorLogLines = [];
+
       const process = spawn(this.godotPath, ['-e', '--path', args.projectPath], {
         stdio: 'pipe',
       });
 
+      // Pipe stdout into the shared log buffer (line by line)
+      if (process.stdout) {
+        let partialLine = '';
+        process.stdout.on('data', (chunk: Buffer) => {
+          const text = chunk.toString();
+          partialLine += text;
+          while (true) {
+            const newlineIndex = partialLine.indexOf('\n');
+            if (newlineIndex === -1) break;
+            const line = partialLine.substring(0, newlineIndex);
+            this.editorLogLines.push(`[stdout] ${line}`);
+            partialLine = partialLine.substring(newlineIndex + 1);
+          }
+        });
+      }
+
+      // Pipe stderr into the shared log buffer (line by line) — Godot writes errors here
+      if (process.stderr) {
+        let partialLineErr = '';
+        process.stderr.on('data', (chunk: Buffer) => {
+          const text = chunk.toString();
+          partialLineErr += text;
+          while (true) {
+            const newlineIndex = partialLineErr.indexOf('\n');
+            if (newlineIndex === -1) break;
+            const line = partialLineErr.substring(0, newlineIndex);
+            this.editorLogLines.push(`[stderr] ${line}`);
+            partialLineErr = partialLineErr.substring(newlineIndex + 1);
+          }
+        });
+      }
+
       process.on('error', (err: Error) => {
         console.error('Failed to start Godot editor:', err);
+        this.editorLogLines.push(`[spawn error] ${err.message}`);
       });
 
       return {
         content: [
           {
             type: 'text',
-            text: `Godot editor launched successfully for project at ${args.projectPath}.`,
+            text: `Godot editor launched for project at ${args.projectPath}. Use view_log to check the console output.`,
           },
         ],
       };
@@ -2066,6 +2120,29 @@ class GodotServer {
         ]
       );
     }
+  }
+
+  /**
+   * Handle the view_log tool
+   */
+  private async handleViewLog(args: any) {
+    args = this.normalizeParameters(args);
+
+    let lineCount = 50; // default
+    if (args.lineCount !== undefined && typeof args.lineCount === 'number') {
+      lineCount = Math.max(1, Math.min(1000, Math.floor(args.lineCount)));
+    }
+
+    const lines = this.editorLogLines.slice(-lineCount);
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: lines.length > 0 ? lines.join('\n') : '(no output captured yet)',
+        },
+      ],
+    };
   }
 
   /**
