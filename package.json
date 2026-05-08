@@ -33,8 +33,8 @@
     "watch": "tsc --watch"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "0.6.0",
-    "axios": "^1.7.9",
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "axios": "^1.16.0",
     "fs-extra": "^11.2.0"
   },
   "devDependencies": {
