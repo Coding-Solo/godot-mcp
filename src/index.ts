@@ -205,12 +205,19 @@ class GodotServer {
    * Validate a path to prevent path traversal attacks
    */
   private validatePath(path: string): boolean {
-    // Basic validation to prevent path traversal
-    if (!path || path.includes('..')) {
+    if (!path) {
       return false;
     }
 
-    // Add more validation as needed
+    // Normalize path to resolve '..' and other relative segments
+    const normalizedPath = normalize(path);
+    
+    // Check if the normalized path contains '..' which indicates a traversal attempt
+    // that escaped the intended directory scope
+    if (normalizedPath.split(/[/\\]/).includes('..')) {
+      return false;
+    }
+
     return true;
   }
 
