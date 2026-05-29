@@ -101,6 +101,15 @@ claude mcp add godot -e GODOT_PATH=/path/to/godot -e DEBUG=true -- npx @coding-s
 ```
 
 <details>
+<summary><strong>Codex CLI</strong></summary>
+For Codex it's very similar
+  
+```bash
+codex mcp add godox -e GODOT_PATH="/path/to/godot.exe" -- npx @coding-solo/godot-mcp
+```
+</details>
+
+<details>
 <summary><strong>Cline</strong></summary>
 
 Add to your Cline MCP settings file (`~/Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json`):
