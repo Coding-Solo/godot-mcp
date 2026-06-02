@@ -105,7 +105,7 @@ claude mcp add godot -e GODOT_PATH=/path/to/godot -e DEBUG=true -- npx @coding-s
 For Codex it's very similar
   
 ```bash
-codex mcp add godox -e GODOT_PATH="/path/to/godot.exe" -- npx @coding-solo/godot-mcp
+codex mcp add godot --env GODOT_PATH="/path/to/godot.exe"  -- npx @coding-solo/godot-mcp
 ```
 </details>
 
