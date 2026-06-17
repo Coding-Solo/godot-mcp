@@ -71,10 +71,16 @@ func _init():
             get_uid(params)
         "resave_resources":
             resave_resources(params)
+        "capture_screenshot":
+            _capture_screenshot_async(params)
+            return
+        "capture_scene_screenshot":
+            _capture_scene_screenshot_async(params)
+            return
         _:
             log_error("Unknown operation: " + operation)
             quit(1)
-    
+
     quit()
 
 # Logging functions
@@ -1184,3 +1190,109 @@ func save_scene(params):
             printerr("Failed to save scene: " + str(error))
     else:
         printerr("Failed to pack scene: " + str(result))
+
+# Run the project main scene (or a named scene), wait N frames, capture one frame.
+# This function is a coroutine. Called without await from _init(); the main loop
+# resumes it once _init() returns. Calls quit() when done.
+func _capture_screenshot_async(params: Dictionary) -> void:
+    var output_path: String = params.get("output_path", "")
+    var wait_frames: int = int(params.get("wait_frames", 10))
+    var scene_path: String = params.get("scene_path", "")
+
+    if output_path == "":
+        log_error("output_path is required for capture_screenshot")
+        quit(1)
+        return
+
+    if scene_path != "":
+        if not scene_path.begins_with("res://"):
+            log_error("scene_path must begin with res://: " + scene_path)
+            quit(1)
+            return
+        var packed = load(scene_path)
+        if packed == null:
+            log_error("Failed to load scene: " + scene_path)
+            quit(1)
+            return
+        get_tree().change_scene_to_packed(packed)
+    else:
+        var main_scene: String = ProjectSettings.get_setting("application/run/main_scene", "")
+        if main_scene == "":
+            log_error("No main scene set in project and no scene_path provided")
+            quit(1)
+            return
+        var packed = load(main_scene)
+        if packed == null:
+            log_error("Failed to load main scene: " + main_scene)
+            quit(1)
+            return
+        get_tree().change_scene_to_packed(packed)
+
+    for _i in range(wait_frames):
+        await get_tree().process_frame
+
+    await RenderingServer.frame_post_draw
+
+    var img: Image = root.get_texture().get_image()
+    if img == null or img.is_empty():
+        log_error("Viewport returned an empty image. A real display is required (not --headless).")
+        quit(1)
+        return
+
+    img.flip_y()
+    var err = img.save_png(output_path)
+    if err != OK:
+        log_error("Failed to save PNG to: " + output_path + " (error " + str(err) + ")")
+        quit(1)
+        return
+
+    log_info("Screenshot saved: " + output_path)
+    quit(0)
+
+
+# Load a specific .tscn file, instance it in the viewport, capture one frame.
+# This function is a coroutine. Called without await from _init(); the main loop
+# resumes it once _init() returns. Calls quit() when done.
+func _capture_scene_screenshot_async(params: Dictionary) -> void:
+    var output_path: String = params.get("output_path", "")
+    var scene_path: String = params.get("scene_path", "")
+
+    if output_path == "" or scene_path == "":
+        log_error("output_path and scene_path are both required for capture_scene_screenshot")
+        quit(1)
+        return
+
+    if not scene_path.begins_with("res://"):
+        log_error("scene_path must begin with res://: " + scene_path)
+        quit(1)
+        return
+
+    var packed = load(scene_path)
+    if packed == null:
+        log_error("Failed to load scene: " + scene_path)
+        quit(1)
+        return
+
+    var instance = packed.instantiate()
+    get_tree().root.add_child(instance)
+
+    # Two frames: one for _ready(), one for layout to settle.
+    await get_tree().process_frame
+    await get_tree().process_frame
+    await RenderingServer.frame_post_draw
+
+    var img: Image = root.get_texture().get_image()
+    if img == null or img.is_empty():
+        log_error("Viewport returned an empty image. A real display is required (not --headless).")
+        quit(1)
+        return
+
+    img.flip_y()
+    var err = img.save_png(output_path)
+    if err != OK:
+        log_error("Failed to save PNG to: " + output_path + " (error " + str(err) + ")")
+        quit(1)
+        return
+
+    log_info("Scene screenshot saved: " + output_path)
+    quit(0)

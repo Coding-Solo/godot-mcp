@@ -216,6 +216,71 @@ Then point your MCP client to `build/index.js` instead of using `npx`.
 </details>
 
 
+## Visual Debugging
+
+`capture_screenshot` and `capture_scene_screenshot` return a rendered image directly
+into the agent's context window, closing the visual feedback loop that console logs alone
+cannot provide.
+
+**Example prompts:**
+- "Capture a screenshot of my player scene at res://scenes/player.tscn so I can check the sprite position."
+- "Run the main scene and show me what it looks like."
+- "The enemy isn't showing up. Capture the combat scene and tell me what you see."
+
+### `capture_screenshot`
+
+Run a scene (or the project main scene) and capture one rendered frame.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `projectPath` | string | required | Directory containing `project.godot` |
+| `scenePath` | string | | `res://` path to a `.tscn` to run. Omit to use the project main scene. |
+| `waitFrames` | number | `10` | Frames to render before capture. Lets shaders, physics, and layout settle. |
+| `timeoutMs` | number | `15000` | Hard timeout in ms. Godot is killed if capture takes longer. |
+
+### `capture_scene_screenshot`
+
+Load a specific `.tscn` file and capture one frame without running the full project.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `projectPath` | string | required | Directory containing `project.godot` |
+| `scenePath` | string | required | `res://` path to the `.tscn` file |
+| `timeoutMs` | number | `15000` | Hard timeout in ms. |
+
+### Rendering context requirement
+
+These tools require a **real display**. They run Godot without `--headless` so the
+renderer produces actual pixels.
+
+- **Local dev machine (macOS, Windows, Linux with desktop):** works out of the box.
+- **Headless Linux (CI, SSH):** wrap Godot in `xvfb-run` before the binary path:
+
+  ```bash
+  # Install: sudo apt-get install xvfb
+  xvfb-run -a godot --path /path/to/project ...
+  ```
+
+  Point `GODOT_PATH` to a wrapper script that calls `xvfb-run -a godot`:
+
+  ```bash
+  #!/bin/sh
+  exec xvfb-run -a /usr/bin/godot "$@"
+  ```
+
+  ```bash
+  chmod +x /usr/local/bin/godot-xvfb
+  export GODOT_PATH=/usr/local/bin/godot-xvfb
+  ```
+
+### Troubleshooting capture errors
+
+| Error message | Likely cause | Fix |
+|---------------|--------------|-----|
+| `Viewport returned an empty image` | Headless Linux, no virtual display | Use `xvfb-run` (see above) |
+| `Failed to load scene` | Wrong `scenePath` | Confirm `res://` prefix and that the file exists |
+| `timed out after 15000ms` | Scene loading slowly or crash | Increase `timeoutMs` or run `run_project` first to see errors |
+
 ## Architecture
 
 The Godot MCP server uses a bundled GDScript approach for complex operations:

@@ -1,0 +1,7 @@
+[gd_scene load_steps=1 format=3 uid="uid://capture_test_main"]
+
+[node name="Main" type="Node2D"]
+
+[node name="Background" type="ColorRect" parent="."]
+color = Color(1, 0, 0, 1)
+size = Vector2(1280, 720)

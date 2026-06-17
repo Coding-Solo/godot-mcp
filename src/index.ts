@@ -21,6 +21,7 @@ import {
   ListToolsRequestSchema,
   McpError,
 } from '@modelcontextprotocol/sdk/types.js';
+import { handleCaptureScreenshot, handleCaptureSceneScreenshot } from './tools/capture.js';
 
 // Check if debug mode is enabled
 const DEBUG_MODE: boolean = process.env.DEBUG === 'true';
@@ -89,6 +90,8 @@ class GodotServer {
     'directory': 'directory',
     'recursive': 'recursive',
     'scene': 'scene',
+    'wait_frames': 'waitFrames',
+    'timeout_ms': 'timeoutMs',
   };
 
   /**
@@ -923,6 +926,59 @@ class GodotServer {
             required: ['projectPath'],
           },
         },
+        {
+          name: 'capture_screenshot',
+          description:
+            'Run a Godot scene and capture a screenshot of the rendered output. Returns the image so the agent can visually verify the scene. Requires a real display (not --headless). On headless Linux, wrap Godot with xvfb-run.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: {
+                type: 'string',
+                description: 'Path to the directory containing project.godot',
+              },
+              scenePath: {
+                type: 'string',
+                description:
+                  'Optional res:// path to a .tscn file to run. Defaults to the project main scene.',
+              },
+              waitFrames: {
+                type: 'number',
+                description:
+                  'Number of frames to render before capture (default 10). Lets shaders, physics, and layout settle.',
+              },
+              timeoutMs: {
+                type: 'number',
+                description:
+                  'Hard timeout in milliseconds (default 15000). Godot is killed if the capture takes longer.',
+              },
+            },
+            required: ['projectPath'],
+          },
+        },
+        {
+          name: 'capture_scene_screenshot',
+          description:
+            'Load a specific .tscn scene file and capture one rendered frame without running the full project. Returns the image for visual inspection. Requires a real display (not --headless).',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: {
+                type: 'string',
+                description: 'Path to the directory containing project.godot',
+              },
+              scenePath: {
+                type: 'string',
+                description: 'res:// path to the .tscn file to load and capture.',
+              },
+              timeoutMs: {
+                type: 'number',
+                description: 'Hard timeout in milliseconds (default 15000).',
+              },
+            },
+            required: ['projectPath', 'scenePath'],
+          },
+        },
       ],
     }));
 
@@ -958,6 +1014,32 @@ class GodotServer {
           return await this.handleGetUid(request.params.arguments);
         case 'update_project_uids':
           return await this.handleUpdateProjectUids(request.params.arguments);
+        case 'capture_screenshot': {
+          if (!this.godotPath) await this.detectGodotPath();
+          if (!this.godotPath) {
+            return this.createErrorResponse(
+              'Could not find a valid Godot executable path',
+              ['Ensure Godot is installed correctly', 'Set GODOT_PATH environment variable']
+            );
+          }
+          return await handleCaptureScreenshot(
+            this.normalizeParameters(request.params.arguments as Record<string, unknown>),
+            { godotPath: this.godotPath, operationsScriptPath: this.operationsScriptPath }
+          );
+        }
+        case 'capture_scene_screenshot': {
+          if (!this.godotPath) await this.detectGodotPath();
+          if (!this.godotPath) {
+            return this.createErrorResponse(
+              'Could not find a valid Godot executable path',
+              ['Ensure Godot is installed correctly', 'Set GODOT_PATH environment variable']
+            );
+          }
+          return await handleCaptureSceneScreenshot(
+            this.normalizeParameters(request.params.arguments as Record<string, unknown>),
+            { godotPath: this.godotPath, operationsScriptPath: this.operationsScriptPath }
+          );
+        }
         default:
           throw new McpError(
             ErrorCode.MethodNotFound,
