@@ -39,6 +39,9 @@ interface GodotProcess {
   process: any;
   output: string[];
   errors: string[];
+  // Undefined while running; set when the process exits so the captured
+  // output stays readable via get_debug_output after a clean quit().
+  exitCode?: number | null;
 }
 
 /**
@@ -695,6 +698,16 @@ class GodotServer {
                 type: 'string',
                 description: 'Optional: Specific scene to run',
               },
+              headless: {
+                type: 'boolean',
+                description: 'Optional: Run with --headless (no window)',
+              },
+              args: {
+                type: 'array',
+                items: { type: 'string' },
+                description:
+                  'Optional: User CLI args passed to the project after "--" (e.g. ["--bot=walk_pattern", "--seconds=20"])',
+              },
             },
             required: ['projectPath'],
           },
@@ -1081,16 +1094,30 @@ class GodotServer {
         );
       }
 
-      // Kill any existing process
+      // Kill any existing process (skip if it already exited on its own)
       if (this.activeProcess) {
-        this.logDebug('Killing existing Godot process before starting a new one');
-        this.activeProcess.process.kill();
+        if (this.activeProcess.exitCode === undefined) {
+          this.logDebug('Killing existing Godot process before starting a new one');
+          this.activeProcess.process.kill();
+        }
+        this.activeProcess = null;
       }
 
-      const cmdArgs = ['-d', '--path', args.projectPath];
+      const cmdArgs = ['-d'];
+      if (args.headless) {
+        cmdArgs.push('--headless');
+      }
+      cmdArgs.push('--path', args.projectPath);
       if (args.scene && this.validatePath(args.scene)) {
         this.logDebug(`Adding scene parameter: ${args.scene}`);
         cmdArgs.push(args.scene);
+      }
+      if (Array.isArray(args.args) && args.args.length > 0) {
+        const userArgs = args.args.filter((a: unknown) => typeof a === 'string');
+        if (userArgs.length > 0) {
+          this.logDebug(`Adding user args after --: ${userArgs.join(' ')}`);
+          cmdArgs.push('--', ...userArgs);
+        }
       }
 
       this.logDebug(`Running Godot project: ${args.projectPath}`);
@@ -1117,7 +1144,9 @@ class GodotServer {
       process.on('exit', (code: number | null) => {
         this.logDebug(`Godot process exited with code ${code}`);
         if (this.activeProcess && this.activeProcess.process === process) {
-          this.activeProcess = null;
+          // Keep the record (with its captured output) so get_debug_output
+          // still works after a clean quit(); just mark it as exited.
+          this.activeProcess.exitCode = code;
         }
       });
 
@@ -1171,6 +1200,8 @@ class GodotServer {
           type: 'text',
           text: JSON.stringify(
             {
+              running: this.activeProcess.exitCode === undefined,
+              exitCode: this.activeProcess.exitCode ?? null,
               output: this.activeProcess.output,
               errors: this.activeProcess.errors,
             },
@@ -1196,8 +1227,11 @@ class GodotServer {
       );
     }
 
-    this.logDebug('Stopping active Godot process');
-    this.activeProcess.process.kill();
+    const alreadyExited = this.activeProcess.exitCode !== undefined;
+    if (!alreadyExited) {
+      this.logDebug('Stopping active Godot process');
+      this.activeProcess.process.kill();
+    }
     const output = this.activeProcess.output;
     const errors = this.activeProcess.errors;
     this.activeProcess = null;
@@ -1208,7 +1242,9 @@ class GodotServer {
           type: 'text',
           text: JSON.stringify(
             {
-              message: 'Godot project stopped',
+              message: alreadyExited
+                ? 'Godot project had already exited on its own'
+                : 'Godot project stopped',
               finalOutput: output,
               finalErrors: errors,
             },
