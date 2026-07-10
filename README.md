@@ -100,6 +100,20 @@ With environment variables:
 claude mcp add godot -e GODOT_PATH=/path/to/godot -e DEBUG=true -- npx @coding-solo/godot-mcp
 ```
 
+### Autohand Code
+
+```bash
+autohand mcp add godot npx @coding-solo/godot-mcp
+```
+
+To set a custom Godot path and enable debug logging:
+
+```bash
+autohand mcp add godot env GODOT_PATH=/path/to/godot DEBUG=true npx @coding-solo/godot-mcp
+```
+
+Add `--scope project` after `add` to keep the server configuration in the current project. See [Autohand Code](https://github.com/autohandai/code-cli/) for current installation and CLI details.
+
 <details>
 <summary><strong>Cline</strong></summary>
 
