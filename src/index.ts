@@ -8,9 +8,9 @@
  */
 
 import { fileURLToPath } from 'url';
-import { join, dirname, basename, normalize } from 'path';
-import { existsSync, readdirSync, mkdirSync } from 'fs';
-import { spawn, execFile } from 'child_process';
+import { join, dirname, basename, normalize, isAbsolute, relative, resolve, sep } from 'path';
+import { existsSync, readdirSync, mkdirSync, readFileSync } from 'fs';
+import { spawn, execFile, type ChildProcessWithoutNullStreams } from 'child_process';
 import { promisify } from 'util';
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
@@ -25,6 +25,15 @@ import {
 // Check if debug mode is enabled
 const DEBUG_MODE: boolean = process.env.DEBUG === 'true';
 const GODOT_DEBUG_MODE: boolean = true; // Always use GODOT DEBUG MODE
+const DEFAULT_SCENE_TIMEOUT_MS = 30000;
+const DEFAULT_SCENE_TEST_TIMEOUT_MS = 60000;
+const DEFAULT_SCREENSHOT_DELAY_FRAMES = 30;
+const MAX_SCENE_TIMEOUT_MS = 2147483647;
+const MAX_SCREENSHOT_DELAY_FRAMES = 3600;
+const PROCESS_EXIT_WAIT_MS = 1000;
+const SCREENSHOT_PROCESS_TIMEOUT_MS = 120000;
+const SCENE_TEST_POLL_INTERVAL_MS = 25;
+const SCENE_TEST_RAW_TAIL_LINES = 50;
 
 const execFileAsync = promisify(execFile);
 
@@ -36,9 +45,35 @@ const __dirname = dirname(__filename);
  * Interface representing a running Godot process
  */
 interface GodotProcess {
-  process: any;
+  process: ChildProcessWithoutNullStreams;
   output: string[];
   errors: string[];
+  rawOutput: string;
+  rawErrors: string;
+  rawCombined: string;
+  spawnError?: Error;
+  timeout?: NodeJS.Timeout;
+}
+
+interface SceneTestResult {
+  completed: boolean;
+  passed: number;
+  failed: number;
+  passLines: string[];
+  failLines: string[];
+  rawTail: string[];
+}
+
+interface ScriptValidationError {
+  file: string;
+  line: number;
+  message: string;
+}
+
+interface GodotCheckResult {
+  exitCode: number;
+  stdout: string;
+  stderr: string;
 }
 
 /**
@@ -66,6 +101,7 @@ class GodotServer {
   private activeProcess: GodotProcess | null = null;
   private godotPath: string | null = null;
   private operationsScriptPath: string;
+  private screenshotScriptPath: string;
   private validatedPaths: Map<string, boolean> = new Map();
   private strictPathValidation: boolean = false;
 
@@ -133,6 +169,7 @@ class GodotServer {
 
     // Set the path to the operations script
     this.operationsScriptPath = join(__dirname, 'scripts', 'godot_operations.gd');
+    this.screenshotScriptPath = join(__dirname, 'scripts', 'screenshot_runner.gd');
     if (debugMode) console.error(`[DEBUG] Operations script path: ${this.operationsScriptPath}`);
 
     // Initialize the MCP server
@@ -395,8 +432,7 @@ class GodotServer {
     this.logDebug('Cleaning up resources');
     if (this.activeProcess) {
       this.logDebug('Killing active Godot process');
-      this.activeProcess.process.kill();
-      this.activeProcess = null;
+      await this.stopActiveGodotProcess();
     }
     await this.server.close();
   }
@@ -700,6 +736,153 @@ class GodotServer {
           },
         },
         {
+          name: 'run_scene',
+          description: 'Run a specific Godot scene and capture output',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: {
+                type: 'string',
+                description: 'Path to the Godot project directory',
+              },
+              scenePath: {
+                type: 'string',
+                description: 'Scene to run, as a res:// path or a path relative to the project',
+              },
+              timeoutMs: {
+                type: 'integer',
+                description: 'Time in milliseconds before the scene is stopped automatically (default: 30000)',
+                minimum: 1,
+                maximum: MAX_SCENE_TIMEOUT_MS,
+              },
+            },
+            required: ['projectPath', 'scenePath'],
+          },
+        },
+        {
+          name: 'run_scene_test',
+          description: 'Run a Godot test scene and return structured pass/fail results',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: {
+                type: 'string',
+                description: 'Path to the Godot project directory',
+              },
+              scenePath: {
+                type: 'string',
+                description: 'Test scene to run, as a res:// path or a path relative to the project',
+              },
+              timeoutMs: {
+                type: 'integer',
+                description: 'Maximum time to wait for test completion in milliseconds (default: 60000)',
+                minimum: 1,
+                maximum: MAX_SCENE_TIMEOUT_MS,
+              },
+              passPattern: {
+                type: 'string',
+                description: 'Text identifying a passing test line (default: ✔)',
+              },
+              failPattern: {
+                type: 'string',
+                description: 'Text identifying a failing test line (default: ✘)',
+              },
+              donePattern: {
+                type: 'string',
+                description: 'Text identifying test completion (default: SONUÇ:)',
+              },
+              autoQuit: {
+                type: 'boolean',
+                description: 'Stop the scene when the completion pattern is seen (default: true)',
+              },
+            },
+            required: ['projectPath', 'scenePath'],
+          },
+        },
+        {
+          name: 'export_project',
+          description: 'Export a Godot project using a configured export preset',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: {
+                type: 'string',
+                description: 'Path to the Godot project directory',
+              },
+              preset: {
+                type: 'string',
+                description: 'Name of an export preset configured in export_presets.cfg',
+              },
+              outputPath: {
+                type: 'string',
+                description: 'Export file path, absolute or relative to the project directory',
+              },
+              debug: {
+                type: 'boolean',
+                description: 'Use a debug export instead of a release export (default: false)',
+              },
+            },
+            required: ['projectPath', 'preset', 'outputPath'],
+          },
+        },
+        {
+          name: 'capture_game_screenshot',
+          description: 'Run a Godot scene and save a rendered viewport screenshot as PNG',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: {
+                type: 'string',
+                description: 'Path to the Godot project directory',
+              },
+              scenePath: {
+                type: 'string',
+                description: 'Scene to capture, as a res:// path or a path relative to the project',
+              },
+              outputPath: {
+                type: 'string',
+                description: 'PNG output path, absolute or relative to the project directory',
+              },
+              delayFrames: {
+                type: 'integer',
+                description: 'Rendered frames to wait before capture (default: 30)',
+                minimum: 0,
+                maximum: MAX_SCREENSHOT_DELAY_FRAMES,
+              },
+            },
+            required: ['projectPath', 'scenePath', 'outputPath'],
+          },
+        },
+        {
+          name: 'validate_script',
+          description: 'Validate one or all GDScript files in a Godot project',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: {
+                type: 'string',
+                description: 'Path to the Godot project directory',
+              },
+              scriptPath: {
+                type: 'string',
+                description: 'Single .gd file to validate, as a res:// path or path relative to the project',
+              },
+              all: {
+                type: 'boolean',
+                description: 'Validate every .gd file in the project',
+              },
+            },
+            required: ['projectPath'],
+            oneOf: [
+              { required: ['scriptPath'] },
+              {
+                properties: { all: { const: true } },
+                required: ['all'],
+              },
+            ],
+          },
+        },
+        {
           name: 'get_debug_output',
           description: 'Get the current debug output and errors',
           inputSchema: {
@@ -934,6 +1117,16 @@ class GodotServer {
           return await this.handleLaunchEditor(request.params.arguments);
         case 'run_project':
           return await this.handleRunProject(request.params.arguments);
+        case 'run_scene':
+          return await this.handleRunScene(request.params.arguments);
+        case 'run_scene_test':
+          return await this.handleRunSceneTest(request.params.arguments);
+        case 'export_project':
+          return await this.handleExportProject(request.params.arguments);
+        case 'capture_game_screenshot':
+          return await this.handleCaptureGameScreenshot(request.params.arguments);
+        case 'validate_script':
+          return await this.handleValidateScript(request.params.arguments);
         case 'get_debug_output':
           return await this.handleGetDebugOutput();
         case 'stop_project':
@@ -1081,12 +1274,6 @@ class GodotServer {
         );
       }
 
-      // Kill any existing process
-      if (this.activeProcess) {
-        this.logDebug('Killing existing Godot process before starting a new one');
-        this.activeProcess.process.kill();
-      }
-
       const cmdArgs = ['-d', '--path', args.projectPath];
       if (args.scene && this.validatePath(args.scene)) {
         this.logDebug(`Adding scene parameter: ${args.scene}`);
@@ -1094,41 +1281,7 @@ class GodotServer {
       }
 
       this.logDebug(`Running Godot project: ${args.projectPath}`);
-      const process = spawn(this.godotPath!, cmdArgs, { stdio: 'pipe' });
-      const output: string[] = [];
-      const errors: string[] = [];
-
-      process.stdout?.on('data', (data: Buffer) => {
-        const lines = data.toString().split('\n');
-        output.push(...lines);
-        lines.forEach((line: string) => {
-          if (line.trim()) this.logDebug(`[Godot stdout] ${line}`);
-        });
-      });
-
-      process.stderr?.on('data', (data: Buffer) => {
-        const lines = data.toString().split('\n');
-        errors.push(...lines);
-        lines.forEach((line: string) => {
-          if (line.trim()) this.logDebug(`[Godot stderr] ${line}`);
-        });
-      });
-
-      process.on('exit', (code: number | null) => {
-        this.logDebug(`Godot process exited with code ${code}`);
-        if (this.activeProcess && this.activeProcess.process === process) {
-          this.activeProcess = null;
-        }
-      });
-
-      process.on('error', (err: Error) => {
-        console.error('Failed to start Godot process:', err);
-        if (this.activeProcess && this.activeProcess.process === process) {
-          this.activeProcess = null;
-        }
-      });
-
-      this.activeProcess = { process, output, errors };
+      await this.startGodotProcess(cmdArgs, 'project');
 
       return {
         content: [
@@ -1152,6 +1305,1141 @@ class GodotServer {
   }
 
   /**
+   * Handle the run_scene tool
+   * @param args Tool arguments
+   */
+  private async handleRunScene(args: unknown) {
+    if (!args || typeof args !== 'object' || Array.isArray(args)) {
+      return this.createErrorResponse(
+        'Project path and scene path are required',
+        ['Provide projectPath and scenePath']
+      );
+    }
+
+    const rawArgs = args as Record<string, unknown>;
+    const projectPath = rawArgs.projectPath ?? rawArgs.project_path;
+    const scenePath = rawArgs.scenePath ?? rawArgs.scene_path;
+    const rawTimeoutMs = rawArgs.timeoutMs ?? rawArgs.timeout_ms;
+    const timeoutMs = rawTimeoutMs === undefined ? DEFAULT_SCENE_TIMEOUT_MS : rawTimeoutMs;
+
+    if (typeof projectPath !== 'string' || !projectPath.trim()) {
+      return this.createErrorResponse(
+        'Project path is required',
+        ['Provide a valid path to a Godot project directory']
+      );
+    }
+
+    if (typeof scenePath !== 'string' || !scenePath.trim()) {
+      return this.createErrorResponse(
+        'Scene path is required',
+        ['Provide a res:// scene path or a path relative to the project']
+      );
+    }
+
+    if (
+      typeof timeoutMs !== 'number'
+      || !Number.isInteger(timeoutMs)
+      || timeoutMs <= 0
+      || timeoutMs > MAX_SCENE_TIMEOUT_MS
+    ) {
+      return this.createErrorResponse(
+        `timeoutMs must be an integer between 1 and ${MAX_SCENE_TIMEOUT_MS}`,
+        [`Provide timeoutMs in milliseconds, or omit it to use ${DEFAULT_SCENE_TIMEOUT_MS}`]
+      );
+    }
+
+    if (!this.validatePath(projectPath)) {
+      return this.createErrorResponse(
+        'Invalid project path',
+        ['Provide a valid path without ".." or other potentially unsafe characters']
+      );
+    }
+
+    if (!this.validatePath(scenePath) || isAbsolute(scenePath)) {
+      return this.createErrorResponse(
+        'Invalid scene path',
+        ['Provide a res:// scene path or a path relative to the project without ".."']
+      );
+    }
+
+    if (!/\.(tscn|scn)$/i.test(scenePath)) {
+      return this.createErrorResponse(
+        'scenePath must point to a Godot scene file',
+        ['Provide a .tscn or .scn file']
+      );
+    }
+
+    try {
+      const projectFile = join(projectPath, 'project.godot');
+      if (!existsSync(projectFile)) {
+        return this.createErrorResponse(
+          `Not a valid Godot project: ${projectPath}`,
+          [
+            'Ensure the path points to a directory containing a project.godot file',
+            'Use list_projects to find valid Godot projects',
+          ]
+        );
+      }
+
+      const projectRelativeScenePath = scenePath.startsWith('res://')
+        ? scenePath.slice('res://'.length)
+        : scenePath;
+      const normalizedResourcePath = projectRelativeScenePath.split('\\').join('/');
+      const sceneFile = join(projectPath, ...normalizedResourcePath.split('/'));
+      if (!existsSync(sceneFile)) {
+        return this.createErrorResponse(
+          `Scene does not exist: ${scenePath}`,
+          ['Ensure scenePath points to an existing scene in the project']
+        );
+      }
+
+      const godotScenePath = `res://${normalizedResourcePath}`;
+      const cmdArgs = ['-d', '--path', projectPath, godotScenePath];
+      this.logDebug(`Running Godot scene: ${godotScenePath} in project: ${projectPath}`);
+      await this.startGodotProcess(cmdArgs, `scene ${godotScenePath}`, timeoutMs);
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `Godot scene ${scenePath} started in debug mode. Use get_debug_output to see output or stop_project to stop it. The scene will stop automatically after ${timeoutMs} ms.`,
+          },
+        ],
+      };
+    } catch (error: unknown) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      return this.createErrorResponse(
+        `Failed to run Godot scene: ${errorMessage}`,
+        [
+          'Ensure Godot is installed correctly',
+          'Check if the GODOT_PATH environment variable is set correctly',
+          'Verify the project and scene paths are accessible',
+        ]
+      );
+    }
+  }
+
+  /**
+   * Handle the run_scene_test tool
+   * @param args Tool arguments
+   */
+  private async handleRunSceneTest(args: unknown) {
+    if (!args || typeof args !== 'object' || Array.isArray(args)) {
+      return this.createErrorResponse(
+        'Project path and scene path are required',
+        ['Provide projectPath and scenePath']
+      );
+    }
+
+    const rawArgs = args as Record<string, unknown>;
+    const projectPath = rawArgs.projectPath ?? rawArgs.project_path;
+    const scenePath = rawArgs.scenePath ?? rawArgs.scene_path;
+    const rawTimeoutMs = rawArgs.timeoutMs ?? rawArgs.timeout_ms;
+    const timeoutMs = rawTimeoutMs === undefined ? DEFAULT_SCENE_TEST_TIMEOUT_MS : rawTimeoutMs;
+    const rawPassPattern = rawArgs.passPattern !== undefined
+      ? rawArgs.passPattern
+      : rawArgs.pass_pattern;
+    const rawFailPattern = rawArgs.failPattern !== undefined
+      ? rawArgs.failPattern
+      : rawArgs.fail_pattern;
+    const rawDonePattern = rawArgs.donePattern !== undefined
+      ? rawArgs.donePattern
+      : rawArgs.done_pattern;
+    const rawAutoQuit = rawArgs.autoQuit !== undefined ? rawArgs.autoQuit : rawArgs.auto_quit;
+    const passPattern = rawPassPattern === undefined ? '✔' : rawPassPattern;
+    const failPattern = rawFailPattern === undefined ? '✘' : rawFailPattern;
+    const donePattern = rawDonePattern === undefined ? 'SONUÇ:' : rawDonePattern;
+    const autoQuit = rawAutoQuit === undefined ? true : rawAutoQuit;
+
+    if (typeof projectPath !== 'string' || !projectPath.trim()) {
+      return this.createErrorResponse(
+        'Project path is required',
+        ['Provide a valid path to a Godot project directory']
+      );
+    }
+
+    if (typeof scenePath !== 'string' || !scenePath.trim()) {
+      return this.createErrorResponse(
+        'Scene path is required',
+        ['Provide a res:// scene path or a path relative to the project']
+      );
+    }
+
+    if (
+      typeof timeoutMs !== 'number'
+      || !Number.isInteger(timeoutMs)
+      || timeoutMs <= 0
+      || timeoutMs > MAX_SCENE_TIMEOUT_MS
+    ) {
+      return this.createErrorResponse(
+        `timeoutMs must be an integer between 1 and ${MAX_SCENE_TIMEOUT_MS}`,
+        [`Provide timeoutMs in milliseconds, or omit it to use ${DEFAULT_SCENE_TEST_TIMEOUT_MS}`]
+      );
+    }
+
+    if (typeof passPattern !== 'string' || !passPattern) {
+      return this.createErrorResponse(
+        'passPattern must be a non-empty string',
+        ['Provide literal text that appears in a passing test line']
+      );
+    }
+
+    if (typeof failPattern !== 'string' || !failPattern) {
+      return this.createErrorResponse(
+        'failPattern must be a non-empty string',
+        ['Provide literal text that appears in a failing test line']
+      );
+    }
+
+    if (typeof donePattern !== 'string' || !donePattern) {
+      return this.createErrorResponse(
+        'donePattern must be a non-empty string',
+        ['Provide literal text that appears in the test output']
+      );
+    }
+
+    if (typeof autoQuit !== 'boolean') {
+      return this.createErrorResponse(
+        'autoQuit must be a boolean',
+        ['Use true to stop the scene when donePattern is seen, or false to leave it running']
+      );
+    }
+
+    if (!this.validatePath(projectPath)) {
+      return this.createErrorResponse(
+        'Invalid project path',
+        ['Provide a valid path without ".." or other potentially unsafe characters']
+      );
+    }
+
+    if (!this.validatePath(scenePath) || isAbsolute(scenePath)) {
+      return this.createErrorResponse(
+        'Invalid scene path',
+        ['Provide a res:// scene path or a path relative to the project without ".."']
+      );
+    }
+
+    if (!/\.(tscn|scn)$/i.test(scenePath)) {
+      return this.createErrorResponse(
+        'scenePath must point to a Godot scene file',
+        ['Provide a .tscn or .scn file']
+      );
+    }
+
+    try {
+      const projectFile = join(projectPath, 'project.godot');
+      if (!existsSync(projectFile)) {
+        return this.createErrorResponse(
+          `Not a valid Godot project: ${projectPath}`,
+          [
+            'Ensure the path points to a directory containing a project.godot file',
+            'Use list_projects to find valid Godot projects',
+          ]
+        );
+      }
+
+      const projectRelativeScenePath = scenePath.startsWith('res://')
+        ? scenePath.slice('res://'.length)
+        : scenePath;
+      const normalizedResourcePath = projectRelativeScenePath.split('\\').join('/');
+      const sceneFile = join(projectPath, ...normalizedResourcePath.split('/'));
+      if (!existsSync(sceneFile)) {
+        return this.createErrorResponse(
+          `Scene does not exist: ${scenePath}`,
+          ['Ensure scenePath points to an existing scene in the project']
+        );
+      }
+
+      const godotScenePath = `res://${normalizedResourcePath}`;
+      const cmdArgs = ['-d', '--path', projectPath, godotScenePath];
+      this.logDebug(`Running Godot test scene: ${godotScenePath} in project: ${projectPath}`);
+      const godotProcess = await this.startGodotProcess(cmdArgs, `test scene ${godotScenePath}`);
+      const deadline = Date.now() + timeoutMs;
+      let completed = false;
+
+      while (Date.now() < deadline) {
+        if (godotProcess.rawOutput.includes(donePattern)) {
+          completed = true;
+          break;
+        }
+
+        if (
+          godotProcess.spawnError
+          ||
+          godotProcess.process.exitCode !== null
+          || godotProcess.process.signalCode !== null
+        ) {
+          break;
+        }
+
+        await new Promise<void>((resolve) => setTimeout(resolve, SCENE_TEST_POLL_INTERVAL_MS));
+      }
+
+      completed = completed || godotProcess.rawOutput.includes(donePattern);
+
+      if (autoQuit || !completed) {
+        await this.stopGodotProcess(godotProcess);
+      }
+
+      if (godotProcess.spawnError) {
+        throw godotProcess.spawnError;
+      }
+
+      const stdoutLines = godotProcess.rawOutput.split(/\r?\n/);
+      const passLines = stdoutLines.filter((line) => line.includes(passPattern));
+      const failLines = stdoutLines.filter((line) => line.includes(failPattern));
+      const rawTail = godotProcess.rawCombined
+        .split(/\r?\n/)
+        .filter((line) => line.length > 0)
+        .slice(-SCENE_TEST_RAW_TAIL_LINES);
+      const result: SceneTestResult = {
+        completed,
+        passed: passLines.length,
+        failed: failLines.length,
+        passLines,
+        failLines,
+        rawTail,
+      };
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(result, null, 2),
+          },
+        ],
+      };
+    } catch (error: unknown) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      return this.createErrorResponse(
+        `Failed to run Godot test scene: ${errorMessage}`,
+        [
+          'Ensure Godot is installed correctly',
+          'Check if the GODOT_PATH environment variable is set correctly',
+          'Verify the project and scene paths are accessible',
+        ]
+      );
+    }
+  }
+
+  /**
+   * Handle the export_project tool
+   * @param args Tool arguments
+   */
+  private async handleExportProject(args: unknown) {
+    if (!args || typeof args !== 'object' || Array.isArray(args)) {
+      return this.createErrorResponse(
+        'Project path, preset, and output path are required',
+        ['Provide projectPath, preset, and outputPath']
+      );
+    }
+
+    const rawArgs = args as Record<string, unknown>;
+    const projectPath = rawArgs.projectPath ?? rawArgs.project_path;
+    const preset = rawArgs.preset;
+    const outputPath = rawArgs.outputPath ?? rawArgs.output_path;
+    const debug = rawArgs.debug === undefined ? false : rawArgs.debug;
+
+    if (typeof projectPath !== 'string' || !projectPath.trim()) {
+      return this.createErrorResponse(
+        'Project path is required',
+        ['Provide a valid path to a Godot project directory']
+      );
+    }
+
+    if (typeof preset !== 'string' || !preset.trim()) {
+      return this.createErrorResponse(
+        'Export preset is required',
+        ['Provide the exact name of a preset from export_presets.cfg']
+      );
+    }
+
+    if (typeof outputPath !== 'string' || !outputPath.trim()) {
+      return this.createErrorResponse(
+        'Output path is required',
+        ['Provide an export file path, such as export/web/index.html']
+      );
+    }
+
+    if (typeof debug !== 'boolean') {
+      return this.createErrorResponse(
+        'debug must be a boolean',
+        ['Use true for a debug export or false for a release export']
+      );
+    }
+
+    if (!this.validatePath(projectPath) || !this.validatePath(outputPath)) {
+      return this.createErrorResponse(
+        'Invalid path',
+        ['Provide project and output paths without ".." or other potentially unsafe characters']
+      );
+    }
+
+    try {
+      const projectFile = join(projectPath, 'project.godot');
+      if (!existsSync(projectFile)) {
+        return this.createErrorResponse(
+          `Not a valid Godot project: ${projectPath}`,
+          [
+            'Ensure the path points to a directory containing a project.godot file',
+            'Use list_projects to find valid Godot projects',
+          ]
+        );
+      }
+
+      const resolvedOutputPath = isAbsolute(outputPath)
+        ? normalize(outputPath)
+        : resolve(projectPath, outputPath);
+      mkdirSync(dirname(resolvedOutputPath), { recursive: true });
+
+      const exportFlag = debug ? '--export-debug' : '--export-release';
+      const cmdArgs = [
+        '--headless',
+        '--path',
+        projectPath,
+        exportFlag,
+        preset,
+        resolvedOutputPath,
+      ];
+      this.logDebug(
+        `Exporting Godot project with preset ${preset} to ${resolvedOutputPath}`
+      );
+
+      const { stdout, stderr } = await execFileAsync(this.godotPath!, cmdArgs);
+      if (!existsSync(resolvedOutputPath)) {
+        return this.createErrorResponse(
+          `Godot finished without creating the expected export: ${resolvedOutputPath}`,
+          [
+            'Check the export preset output type and destination',
+            'Open Project > Export in Godot and verify the preset configuration',
+          ]
+        );
+      }
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(
+              {
+                success: true,
+                preset,
+                outputPath: resolvedOutputPath,
+                debug,
+                output: stdout.trim(),
+                warnings: stderr.trim(),
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    } catch (error: unknown) {
+      const execError = error instanceof Error
+        ? error as Error & { stdout?: string | Buffer; stderr?: string | Buffer }
+        : null;
+      const stdout = execError?.stdout?.toString().trim() ?? '';
+      const stderr = execError?.stderr?.toString().trim() ?? '';
+      const errorMessage = execError?.message ?? 'Unknown error';
+      const details = [stderr, stdout, errorMessage]
+        .filter((value, index, values) => value && values.indexOf(value) === index)
+        .join('\n');
+
+      if (/doesn'?t have an? [`']?export_presets\.cfg|no export presets/i.test(details)) {
+        return this.createErrorResponse(
+          'No export presets are configured for this project',
+          [
+            'Open the project in Godot and create a preset under Project > Export',
+            'Commit export_presets.cfg if the preset should be shared with the project',
+          ]
+        );
+      }
+
+      if (
+        /preset.*(?:not found|does not exist)|couldn'?t find.*preset|invalid export preset name/i
+          .test(details)
+      ) {
+        return this.createErrorResponse(
+          `Export preset "${preset}" was not found`,
+          [
+            'Open the project in Godot and create the preset under Project > Export',
+            'Use the preset name exactly as it appears in export_presets.cfg',
+          ]
+        );
+      }
+
+      if (/export template|templates.*(?:missing|not found|not installed)/i.test(details)) {
+        return this.createErrorResponse(
+          `Export templates required by preset "${preset}" are not installed`,
+          [
+            'Install the matching templates from Editor > Manage Export Templates in Godot',
+            'Retry the export after the templates are installed',
+          ]
+        );
+      }
+
+      return this.createErrorResponse(
+        `Failed to export project with preset "${preset}": ${details}`,
+        [
+          'Open Project > Export in Godot and verify the preset configuration',
+          'Ensure the output directory is writable',
+          'Check if the GODOT_PATH environment variable is set correctly',
+        ]
+      );
+    }
+  }
+
+  /**
+   * Handle the capture_game_screenshot tool
+   * @param args Tool arguments
+   */
+  private async handleCaptureGameScreenshot(args: unknown) {
+    if (!args || typeof args !== 'object' || Array.isArray(args)) {
+      return this.createErrorResponse(
+        'Project path, scene path, and output path are required',
+        ['Provide projectPath, scenePath, and outputPath']
+      );
+    }
+
+    const rawArgs = args as Record<string, unknown>;
+    const projectPath = rawArgs.projectPath ?? rawArgs.project_path;
+    const scenePath = rawArgs.scenePath ?? rawArgs.scene_path;
+    const outputPath = rawArgs.outputPath ?? rawArgs.output_path;
+    const rawDelayFrames = rawArgs.delayFrames !== undefined
+      ? rawArgs.delayFrames
+      : rawArgs.delay_frames;
+    const delayFrames = rawDelayFrames === undefined
+      ? DEFAULT_SCREENSHOT_DELAY_FRAMES
+      : rawDelayFrames;
+
+    if (typeof projectPath !== 'string' || !projectPath.trim()) {
+      return this.createErrorResponse(
+        'Project path is required',
+        ['Provide a valid path to a Godot project directory']
+      );
+    }
+
+    if (typeof scenePath !== 'string' || !scenePath.trim()) {
+      return this.createErrorResponse(
+        'Scene path is required',
+        ['Provide a res:// scene path or a path relative to the project']
+      );
+    }
+
+    if (typeof outputPath !== 'string' || !outputPath.trim()) {
+      return this.createErrorResponse(
+        'Output path is required',
+        ['Provide an absolute path or a path relative to the project ending in .png']
+      );
+    }
+
+    if (
+      typeof delayFrames !== 'number'
+      || !Number.isInteger(delayFrames)
+      || delayFrames < 0
+      || delayFrames > MAX_SCREENSHOT_DELAY_FRAMES
+    ) {
+      return this.createErrorResponse(
+        `delayFrames must be an integer between 0 and ${MAX_SCREENSHOT_DELAY_FRAMES}`,
+        [`Provide delayFrames, or omit it to use ${DEFAULT_SCREENSHOT_DELAY_FRAMES}`]
+      );
+    }
+
+    if (!this.validatePath(projectPath) || !this.validatePath(outputPath)) {
+      return this.createErrorResponse(
+        'Invalid path',
+        ['Provide project and output paths without ".." or other potentially unsafe characters']
+      );
+    }
+
+    if (!this.validatePath(scenePath) || isAbsolute(scenePath)) {
+      return this.createErrorResponse(
+        'Invalid scene path',
+        ['Provide a res:// scene path or a path relative to the project without ".."']
+      );
+    }
+
+    if (!/\.(tscn|scn)$/i.test(scenePath)) {
+      return this.createErrorResponse(
+        'scenePath must point to a Godot scene file',
+        ['Provide a .tscn or .scn file']
+      );
+    }
+
+    if (!/\.png$/i.test(outputPath)) {
+      return this.createErrorResponse(
+        'outputPath must end in .png',
+        ['Provide a PNG destination path']
+      );
+    }
+
+    try {
+      const projectFile = join(projectPath, 'project.godot');
+      if (!existsSync(projectFile)) {
+        return this.createErrorResponse(
+          `Not a valid Godot project: ${projectPath}`,
+          [
+            'Ensure the path points to a directory containing a project.godot file',
+            'Use list_projects to find valid Godot projects',
+          ]
+        );
+      }
+
+      const projectRelativeScenePath = scenePath.startsWith('res://')
+        ? scenePath.slice('res://'.length)
+        : scenePath;
+      const normalizedResourcePath = projectRelativeScenePath.split('\\').join('/');
+      const sceneFile = join(projectPath, ...normalizedResourcePath.split('/'));
+      if (!existsSync(sceneFile)) {
+        return this.createErrorResponse(
+          `Scene does not exist: ${scenePath}`,
+          ['Ensure scenePath points to an existing scene in the project']
+        );
+      }
+
+      if (!existsSync(this.screenshotScriptPath)) {
+        return this.createErrorResponse(
+          `Screenshot runner is missing: ${this.screenshotScriptPath}`,
+          ['Run npm run build before starting the MCP server']
+        );
+      }
+
+      const resolvedOutputPath = isAbsolute(outputPath)
+        ? normalize(outputPath)
+        : resolve(projectPath, outputPath);
+      mkdirSync(dirname(resolvedOutputPath), { recursive: true });
+      const godotScenePath = `res://${normalizedResourcePath}`;
+      const cmdArgs = [
+        '--path',
+        projectPath,
+        '--script',
+        this.screenshotScriptPath,
+        '--',
+        godotScenePath,
+        resolvedOutputPath,
+        String(delayFrames),
+      ];
+      this.logDebug(`Capturing ${godotScenePath} to ${resolvedOutputPath}`);
+
+      const { stdout, stderr } = await execFileAsync(this.godotPath!, cmdArgs, {
+        timeout: SCREENSHOT_PROCESS_TIMEOUT_MS,
+        maxBuffer: 4 * 1024 * 1024,
+      });
+      if (!stdout.includes('SCREENSHOT_SAVED:')) {
+        return this.createErrorResponse(
+          'Godot exited without confirming that the screenshot was saved',
+          [
+            'Check the Godot output for viewport or image encoding errors',
+            'Ensure screenshot_runner.gd matches the installed MCP build',
+          ]
+        );
+      }
+
+      if (!existsSync(resolvedOutputPath)) {
+        return this.createErrorResponse(
+          `Godot finished without creating a screenshot: ${resolvedOutputPath}`,
+          [
+            'Ensure the scene can run with the configured display driver',
+            'Increase delayFrames if the scene needs more time to render',
+          ]
+        );
+      }
+
+      const pngData = readFileSync(resolvedOutputPath);
+      const pngSignature = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+      if (pngData.length < 24 || !pngData.subarray(0, 8).equals(pngSignature)) {
+        return this.createErrorResponse(
+          `Screenshot output is not a valid PNG: ${resolvedOutputPath}`,
+          ['Check the Godot output for viewport or image encoding errors']
+        );
+      }
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(
+              {
+                success: true,
+                scenePath: godotScenePath,
+                outputPath: resolvedOutputPath,
+                delayFrames,
+                width: pngData.readUInt32BE(16),
+                height: pngData.readUInt32BE(20),
+                bytes: pngData.length,
+                output: stdout.trim(),
+                warnings: stderr.trim(),
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    } catch (error: unknown) {
+      const execError = error instanceof Error
+        ? error as Error & { stdout?: string | Buffer; stderr?: string | Buffer; killed?: boolean }
+        : null;
+      const stdout = execError?.stdout?.toString().trim() ?? '';
+      const stderr = execError?.stderr?.toString().trim() ?? '';
+      const errorMessage = execError?.message ?? 'Unknown error';
+      const details = [stderr, stdout, errorMessage]
+        .filter((value, index, values) => value && values.indexOf(value) === index)
+        .join('\n');
+
+      if (execError?.killed) {
+        return this.createErrorResponse(
+          `Screenshot capture timed out after ${SCREENSHOT_PROCESS_TIMEOUT_MS} ms`,
+          [
+            'Ensure the scene starts without blocking dialogs',
+            'Reduce delayFrames or inspect the scene for startup errors',
+          ]
+        );
+      }
+
+      return this.createErrorResponse(
+        `Failed to capture game screenshot: ${details}`,
+        [
+          'Ensure Godot can open a rendered window in the current environment',
+          'Verify the project and scene paths are accessible',
+          'Check if the GODOT_PATH environment variable is set correctly',
+        ]
+      );
+    }
+  }
+
+  /**
+   * Handle the validate_script tool
+   * @param args Tool arguments
+   */
+  private async handleValidateScript(args: unknown) {
+    if (!args || typeof args !== 'object' || Array.isArray(args)) {
+      return this.createErrorResponse(
+        'Project path and a validation mode are required',
+        ['Provide projectPath with either scriptPath or all: true']
+      );
+    }
+
+    const rawArgs = args as Record<string, unknown>;
+    const projectPath = rawArgs.projectPath ?? rawArgs.project_path;
+    const scriptPath = rawArgs.scriptPath ?? rawArgs.script_path;
+    const validateAll = rawArgs.all;
+
+    if (typeof projectPath !== 'string' || !projectPath.trim()) {
+      return this.createErrorResponse(
+        'Project path is required',
+        ['Provide a valid path to a Godot project directory']
+      );
+    }
+
+    if (scriptPath !== undefined && (typeof scriptPath !== 'string' || !scriptPath.trim())) {
+      return this.createErrorResponse(
+        'scriptPath must be a non-empty string',
+        ['Provide a res:// .gd path or a path relative to the project']
+      );
+    }
+
+    if (validateAll !== undefined && typeof validateAll !== 'boolean') {
+      return this.createErrorResponse(
+        'all must be a boolean',
+        ['Use all: true to validate every .gd file in the project']
+      );
+    }
+
+    const hasScriptPath = typeof scriptPath === 'string';
+    if (hasScriptPath === (validateAll === true)) {
+      return this.createErrorResponse(
+        'Choose exactly one validation mode',
+        ['Provide either scriptPath or all: true, but not both']
+      );
+    }
+
+    if (!this.validatePath(projectPath)) {
+      return this.createErrorResponse(
+        'Invalid project path',
+        ['Provide a valid path without ".." or other potentially unsafe characters']
+      );
+    }
+
+    const projectFile = join(projectPath, 'project.godot');
+    if (!existsSync(projectFile)) {
+      return this.createErrorResponse(
+        `Not a valid Godot project: ${projectPath}`,
+        [
+          'Ensure the path points to a directory containing a project.godot file',
+          'Use list_projects to find valid Godot projects',
+        ]
+      );
+    }
+
+    try {
+      const autoloadNames = this.getProjectAutoloadNames(projectFile);
+      let scripts: string[];
+
+      if (hasScriptPath) {
+        if (!this.validatePath(scriptPath) || isAbsolute(scriptPath)) {
+          return this.createErrorResponse(
+            'Invalid script path',
+            ['Provide a res:// .gd path or a path relative to the project without ".."']
+          );
+        }
+
+        const resourcePath = this.toGodotResourcePath(scriptPath);
+        if (!resourcePath.toLowerCase().endsWith('.gd')) {
+          return this.createErrorResponse(
+            'scriptPath must point to a .gd file',
+            ['Provide the path of a GDScript file']
+          );
+        }
+
+        const filePath = join(projectPath, resourcePath.slice('res://'.length));
+        if (!existsSync(filePath)) {
+          return this.createErrorResponse(
+            `Script does not exist: ${scriptPath}`,
+            ['Ensure scriptPath is correct and belongs to the project']
+          );
+        }
+        scripts = [resourcePath];
+      } else {
+        scripts = this.findGodotScripts(projectPath);
+      }
+
+      const errors: ScriptValidationError[] = [];
+      for (const resourcePath of scripts) {
+        const result = await this.runGodotScriptCheck(projectPath, resourcePath);
+        errors.push(...this.parseGodotScriptErrors(result, resourcePath, autoloadNames));
+      }
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(
+              {
+                valid: errors.length === 0,
+                errors,
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    } catch (error: unknown) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      return this.createErrorResponse(
+        `Failed to validate GDScript: ${errorMessage}`,
+        [
+          'Ensure Godot is installed correctly',
+          'Check if the GODOT_PATH environment variable is set correctly',
+          'Verify the project and script paths are accessible',
+        ]
+      );
+    }
+  }
+
+  /**
+   * Convert a project-relative script path to Godot's res:// format.
+   */
+  private toGodotResourcePath(scriptPath: string): string {
+    const relativePath = scriptPath.startsWith('res://')
+      ? scriptPath.slice('res://'.length)
+      : scriptPath;
+    return `res://${relativePath.split('\\').join('/')}`;
+  }
+
+  /**
+   * Find GDScript files in a project, excluding generated metadata directories.
+   */
+  private findGodotScripts(projectPath: string): string[] {
+    const scripts: string[] = [];
+
+    const scanDirectory = (directory: string): void => {
+      const entries = readdirSync(directory, { withFileTypes: true })
+        .sort((left, right) => left.name.localeCompare(right.name));
+
+      for (const entry of entries) {
+        if (entry.name === '.git' || entry.name === '.godot') {
+          continue;
+        }
+
+        const entryPath = join(directory, entry.name);
+        if (entry.isDirectory()) {
+          scanDirectory(entryPath);
+        } else if (entry.isFile() && entry.name.toLowerCase().endsWith('.gd')) {
+          const projectRelativePath = relative(projectPath, entryPath).split(sep).join('/');
+          scripts.push(`res://${projectRelativePath}`);
+        }
+      }
+    };
+
+    scanDirectory(projectPath);
+    return scripts;
+  }
+
+  /**
+   * Read configured autoload singleton names from project.godot.
+   */
+  private getProjectAutoloadNames(projectFile: string): Set<string> {
+    const autoloadNames = new Set<string>();
+    const lines = readFileSync(projectFile, 'utf8').split(/\r?\n/);
+    let inAutoloadSection = false;
+
+    for (const line of lines) {
+      const trimmedLine = line.trim();
+      if (trimmedLine.startsWith('[') && trimmedLine.endsWith(']')) {
+        inAutoloadSection = trimmedLine === '[autoload]';
+        continue;
+      }
+
+      if (!inAutoloadSection || !trimmedLine || trimmedLine.startsWith(';')) {
+        continue;
+      }
+
+      const separatorIndex = trimmedLine.indexOf('=');
+      if (separatorIndex > 0) {
+        const name = trimmedLine.slice(0, separatorIndex).trim();
+        if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) {
+          autoloadNames.add(name);
+        }
+      }
+    }
+
+    return autoloadNames;
+  }
+
+  /**
+   * Run Godot's check-only mode for a single GDScript file.
+   */
+  private runGodotScriptCheck(projectPath: string, resourcePath: string): Promise<GodotCheckResult> {
+    return new Promise((resolve, reject) => {
+      const childProcess = spawn(
+        this.godotPath!,
+        ['--headless', '--path', projectPath, '--check-only', '--script', resourcePath],
+        { stdio: 'pipe' }
+      );
+      const stdout: Buffer[] = [];
+      const stderr: Buffer[] = [];
+
+      childProcess.stdout.on('data', (data: Buffer) => stdout.push(data));
+      childProcess.stderr.on('data', (data: Buffer) => stderr.push(data));
+      childProcess.on('error', reject);
+      childProcess.on('close', (exitCode: number | null) => {
+        resolve({
+          exitCode: exitCode ?? -1,
+          stdout: Buffer.concat(stdout).toString(),
+          stderr: Buffer.concat(stderr).toString(),
+        });
+      });
+    });
+  }
+
+  /**
+   * Parse Godot script errors and ignore check-only autoload resolution false positives.
+   */
+  private parseGodotScriptErrors(
+    result: GodotCheckResult,
+    fallbackFile: string,
+    autoloadNames: Set<string>
+  ): ScriptValidationError[] {
+    const errors: ScriptValidationError[] = [];
+    const lines = `${result.stdout}\n${result.stderr}`.split(/\r?\n/);
+    let pendingError: { kind: string; message: string } | null = null;
+
+    for (const line of lines) {
+      const errorMatch = line.match(/^SCRIPT ERROR:\s+(Parse|Compile) Error:\s*(.+)$/);
+      if (errorMatch) {
+        pendingError = { kind: errorMatch[1], message: errorMatch[2].trim() };
+        continue;
+      }
+
+      const locationMatch = line.match(/GDScript::reload\s+\((res:\/\/.+):(\d+)\)/);
+      if (!pendingError || !locationMatch) {
+        continue;
+      }
+
+      const missingIdentifier = pendingError.message.match(/^Identifier not found:\s*([A-Za-z_][A-Za-z0-9_]*)$/);
+      const isAutoloadFalsePositive = pendingError.kind === 'Compile'
+        && missingIdentifier !== null
+        && autoloadNames.has(missingIdentifier[1]);
+
+      if (!isAutoloadFalsePositive) {
+        errors.push({
+          file: locationMatch[1],
+          line: Number.parseInt(locationMatch[2], 10),
+          message: pendingError.message,
+        });
+      }
+      pendingError = null;
+    }
+
+    if (pendingError) {
+      errors.push({ file: fallbackFile, line: 0, message: pendingError.message });
+    } else if (result.exitCode !== 0 && errors.length === 0) {
+      const fallbackMessage = result.stderr
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .find((line) => line && !line.startsWith('WARNING:'));
+
+      if (fallbackMessage && !fallbackMessage.startsWith('SCRIPT ERROR:')) {
+        errors.push({ file: fallbackFile, line: 0, message: fallbackMessage });
+      }
+    }
+
+    return errors;
+  }
+
+  /**
+   * Start a Godot process and capture its output for the debug tools.
+   */
+  private async startGodotProcess(
+    cmdArgs: string[],
+    description: string,
+    timeoutMs?: number
+  ): Promise<GodotProcess> {
+    if (this.activeProcess) {
+      this.logDebug('Killing existing Godot process before starting a new one');
+      await this.stopActiveGodotProcess();
+    }
+
+    const childProcess = spawn(this.godotPath!, cmdArgs, { stdio: 'pipe' });
+    const output: string[] = [];
+    const errors: string[] = [];
+    const godotProcess: GodotProcess = {
+      process: childProcess,
+      output,
+      errors,
+      rawOutput: '',
+      rawErrors: '',
+      rawCombined: '',
+    };
+    this.activeProcess = godotProcess;
+
+    childProcess.stdout?.on('data', (data: Buffer) => {
+      const chunk = data.toString();
+      godotProcess.rawOutput += chunk;
+      godotProcess.rawCombined += chunk;
+      const lines = chunk.split('\n');
+      output.push(...lines);
+      lines.forEach((line: string) => {
+        if (line.trim()) this.logDebug(`[Godot stdout] ${line}`);
+      });
+    });
+
+    childProcess.stderr?.on('data', (data: Buffer) => {
+      const chunk = data.toString();
+      godotProcess.rawErrors += chunk;
+      godotProcess.rawCombined += chunk;
+      const lines = chunk.split('\n');
+      errors.push(...lines);
+      lines.forEach((line: string) => {
+        if (line.trim()) this.logDebug(`[Godot stderr] ${line}`);
+      });
+    });
+
+    childProcess.on('exit', (code: number | null) => {
+      this.logDebug(`Godot ${description} process exited with code ${code}`);
+      if (godotProcess.timeout) {
+        clearTimeout(godotProcess.timeout);
+      }
+      if (this.activeProcess?.process === childProcess) {
+        this.activeProcess = null;
+      }
+    });
+
+    childProcess.on('error', (err: Error) => {
+      godotProcess.spawnError = err;
+      console.error(`Failed to start Godot ${description} process:`, err);
+      if (godotProcess.timeout) {
+        clearTimeout(godotProcess.timeout);
+      }
+      if (this.activeProcess?.process === childProcess) {
+        this.activeProcess = null;
+      }
+    });
+
+    if (timeoutMs !== undefined) {
+      godotProcess.timeout = setTimeout(() => {
+        if (this.activeProcess?.process === childProcess) {
+          this.logDebug(`Stopping Godot ${description} process after ${timeoutMs} ms timeout`);
+          childProcess.kill();
+        }
+      }, timeoutMs);
+    }
+
+    return godotProcess;
+  }
+
+  /**
+   * Stop a specific Godot process without affecting a newer active process.
+   */
+  private async stopGodotProcess(godotProcess: GodotProcess): Promise<void> {
+    if (this.activeProcess === godotProcess) {
+      await this.stopActiveGodotProcess();
+      return;
+    }
+
+    const childProcess = godotProcess.process;
+    if (childProcess.exitCode === null && childProcess.signalCode === null) {
+      try {
+        childProcess.kill();
+      } catch {
+        // The process may have exited between the state check and kill call.
+      }
+    }
+  }
+
+  /**
+   * Stop the active Godot process and wait briefly for it to release resources.
+   */
+  private async stopActiveGodotProcess(): Promise<void> {
+    const godotProcess = this.activeProcess;
+    if (!godotProcess) {
+      return;
+    }
+
+    if (godotProcess.timeout) {
+      clearTimeout(godotProcess.timeout);
+    }
+
+    const childProcess = godotProcess.process;
+    if (childProcess.exitCode === null && childProcess.signalCode === null) {
+      await new Promise<void>((resolve) => {
+        let settled = false;
+        let waitTimeout: NodeJS.Timeout | undefined;
+
+        const finish = (): void => {
+          if (settled) {
+            return;
+          }
+          settled = true;
+          if (waitTimeout) {
+            clearTimeout(waitTimeout);
+          }
+          childProcess.removeListener('exit', finish);
+          resolve();
+        };
+
+        waitTimeout = setTimeout(finish, PROCESS_EXIT_WAIT_MS);
+        childProcess.once('exit', finish);
+
+        try {
+          if (!childProcess.kill()) {
+            finish();
+          }
+        } catch {
+          finish();
+        }
+      });
+    }
+
+    if (this.activeProcess === godotProcess) {
+      this.activeProcess = null;
+    }
+  }
+
+  /**
    * Handle the get_debug_output tool
    */
   private async handleGetDebugOutput() {
@@ -1159,7 +2447,7 @@ class GodotServer {
       return this.createErrorResponse(
         'No active Godot process.',
         [
-          'Use run_project to start a Godot project first',
+          'Use run_project or run_scene to start a Godot process first',
           'Check if the Godot process crashed unexpectedly',
         ]
       );
@@ -1190,17 +2478,16 @@ class GodotServer {
       return this.createErrorResponse(
         'No active Godot process to stop.',
         [
-          'Use run_project to start a Godot project first',
+          'Use run_project or run_scene to start a Godot process first',
           'The process may have already terminated',
         ]
       );
     }
 
     this.logDebug('Stopping active Godot process');
-    this.activeProcess.process.kill();
     const output = this.activeProcess.output;
     const errors = this.activeProcess.errors;
-    this.activeProcess = null;
+    await this.stopActiveGodotProcess();
 
     return {
       content: [

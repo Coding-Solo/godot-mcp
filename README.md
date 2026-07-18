@@ -63,6 +63,11 @@ Godot MCP enables AI agents to launch the Godot editor, run projects, capture de
 
 - **Launch Godot Editor**: Open the Godot editor for a specific project
 - **Run Godot Projects**: Execute Godot projects in debug mode
+- **Run Godot Scenes**: Execute a specific scene with configurable timeout and captured output
+- **Run Scene Tests**: Execute a test scene and return structured pass/fail results
+- **Export Projects**: Build release or debug exports from configured Godot presets
+- **Capture Game Screenshots**: Render a scene and save its viewport as a validated PNG
+- **Validate GDScript**: Check one or all project scripts and return structured errors
 - **Capture Debug Output**: Retrieve console output and error messages
 - **Control Execution**: Start and stop Godot projects programmatically
 - **Get Godot Version**: Retrieve the installed Godot version
@@ -77,6 +82,96 @@ Godot MCP enables AI agents to launch the Godot editor, run projects, capture de
 - **UID Management** (for Godot 4.4+):
   - Get UID for specific files
   - Update UID references by resaving resources
+
+### Run a Specific Scene
+
+Use `run_scene` for an F6-style run of one scene while keeping output compatible with `get_debug_output` and `stop_project`.
+
+| Parameter | Required | Description |
+| --- | --- | --- |
+| `projectPath` | Yes | Path to the directory containing `project.godot` |
+| `scenePath` | Yes | A `res://` path or path relative to the project; `.tscn` and `.scn` are supported |
+| `timeoutMs` | No | Stops the scene automatically after this many milliseconds; defaults to `30000` |
+
+```json
+{
+  "projectPath": "/path/to/project",
+  "scenePath": "res://tests/smoke_test.tscn",
+  "timeoutMs": 30000
+}
+```
+
+### Run a Scene Test
+
+Use `run_scene_test` when an agent needs structured test results instead of raw console output. Matching is literal and configurable, so the tool is not tied to a specific test framework.
+
+| Parameter | Required | Description |
+| --- | --- | --- |
+| `projectPath` | Yes | Path to the directory containing `project.godot` |
+| `scenePath` | Yes | A `res://` path or path relative to the project |
+| `timeoutMs` | No | Maximum wait time; defaults to `60000` milliseconds |
+| `passPattern` | No | Text identifying a passing line; defaults to `✔` |
+| `failPattern` | No | Text identifying a failing line; defaults to `✘` |
+| `donePattern` | No | Text identifying completion; defaults to `SONUÇ:` |
+| `autoQuit` | No | Stops the scene when completion is detected; defaults to `true` |
+
+```json
+{
+  "projectPath": "/path/to/project",
+  "scenePath": "res://tests/smoke_test.tscn",
+  "timeoutMs": 60000,
+  "passPattern": "PASS:",
+  "failPattern": "FAIL:",
+  "donePattern": "RESULT:",
+  "autoQuit": true
+}
+```
+
+The response includes `completed`, pass/fail counts, matching lines, and the last 50 output lines in `rawTail`.
+
+### Export a Project
+
+Use `export_project` to run a configured Godot export preset. Relative output paths are resolved from the project directory, and missing output directories are created automatically.
+
+| Parameter | Required | Description |
+| --- | --- | --- |
+| `projectPath` | Yes | Path to the directory containing `project.godot` |
+| `preset` | Yes | Exact preset name from `export_presets.cfg`, such as `Web` |
+| `outputPath` | Yes | Absolute path or path relative to the project directory |
+| `debug` | No | Uses `--export-debug` when true; defaults to a release export |
+
+```json
+{
+  "projectPath": "/path/to/project",
+  "preset": "Web",
+  "outputPath": "export/web/index.html",
+  "debug": false
+}
+```
+
+The response reports the resolved output path and any Godot warnings. If the preset or matching export templates are missing, the tool explains how to configure them in the editor.
+
+### Capture a Game Screenshot
+
+Use `capture_game_screenshot` to launch a scene with rendering enabled, wait for it to settle, and save the viewport as a PNG. This tool requires a graphical display and does not use Godot's headless mode.
+
+| Parameter | Required | Description |
+| --- | --- | --- |
+| `projectPath` | Yes | Path to the directory containing `project.godot` |
+| `scenePath` | Yes | A `res://` path or path relative to the project |
+| `outputPath` | Yes | Absolute `.png` path or path relative to the project directory |
+| `delayFrames` | No | Rendered frames to wait before capture; defaults to `30` |
+
+```json
+{
+  "projectPath": "/path/to/project",
+  "scenePath": "res://scenes/main.tscn",
+  "outputPath": "screenshots/main.png",
+  "delayFrames": 30
+}
+```
+
+The response includes the resolved output path, PNG dimensions, byte size, and Godot output. The destination directory is created automatically.
 
 ## Requirements
 
@@ -118,6 +213,11 @@ Add to your Cline MCP settings file (`~/Library/Application Support/Code/User/gl
       "autoApprove": [
         "launch_editor",
         "run_project",
+        "run_scene",
+        "run_scene_test",
+        "export_project",
+        "capture_game_screenshot",
+        "validate_script",
         "get_debug_output",
         "stop_project",
         "get_godot_version",
