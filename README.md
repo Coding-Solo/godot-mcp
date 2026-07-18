@@ -63,6 +63,7 @@ Godot MCP enables AI agents to launch the Godot editor, run projects, capture de
 
 - **Launch Godot Editor**: Open the Godot editor for a specific project
 - **Run Godot Projects**: Execute Godot projects in debug mode
+- **Run Godot Scenes**: Execute a specific scene with configurable timeout and captured output
 - **Capture Debug Output**: Retrieve console output and error messages
 - **Control Execution**: Start and stop Godot projects programmatically
 - **Get Godot Version**: Retrieve the installed Godot version
@@ -77,6 +78,24 @@ Godot MCP enables AI agents to launch the Godot editor, run projects, capture de
 - **UID Management** (for Godot 4.4+):
   - Get UID for specific files
   - Update UID references by resaving resources
+
+### Run a Specific Scene
+
+Use `run_scene` for an F6-style run of one scene while keeping output compatible with `get_debug_output` and `stop_project`.
+
+| Parameter | Required | Description |
+| --- | --- | --- |
+| `projectPath` | Yes | Path to the directory containing `project.godot` |
+| `scenePath` | Yes | A `res://` path or path relative to the project; `.tscn` and `.scn` are supported |
+| `timeoutMs` | No | Stops the scene automatically after this many milliseconds; defaults to `30000` |
+
+```json
+{
+  "projectPath": "/path/to/project",
+  "scenePath": "res://tests/smoke_test.tscn",
+  "timeoutMs": 30000
+}
+```
 
 ## Requirements
 
@@ -118,6 +137,7 @@ Add to your Cline MCP settings file (`~/Library/Application Support/Code/User/gl
       "autoApprove": [
         "launch_editor",
         "run_project",
+        "run_scene",
         "get_debug_output",
         "stop_project",
         "get_godot_version",
