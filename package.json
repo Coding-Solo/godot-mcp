@@ -30,6 +30,7 @@
     "build": "tsc && node scripts/build.js",
     "inspector": "npx @modelcontextprotocol/inspector build/index.js",
     "prepare": "npm run build",
+    "test": "npm run build && node --test tests/project-files.test.mjs",
     "watch": "tsc --watch"
   },
   "dependencies": {

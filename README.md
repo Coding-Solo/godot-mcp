@@ -68,6 +68,7 @@ Godot MCP enables AI agents to launch the Godot editor, run projects, capture de
 - **Get Godot Version**: Retrieve the installed Godot version
 - **List Godot Projects**: Find Godot projects in a specified directory
 - **Project Analysis**: Get detailed information about project structure
+- **Project File Discovery**: Enumerate scenes, scripts, resources, and shaders with optional filters
 - **Scene Management**:
   - Create new scenes with specified root node types
   - Add nodes to existing scenes with customizable properties
@@ -77,6 +78,24 @@ Godot MCP enables AI agents to launch the Godot editor, run projects, capture de
 - **UID Management** (for Godot 4.4+):
   - Get UID for specific files
   - Update UID references by resaving resources
+
+### List Project Files
+
+Use `list_project_files` to inspect a project's Godot-relevant files without direct filesystem access. Paths are returned relative to the project, `.godot/` metadata is ignored, and shader files are grouped with resources.
+
+| Parameter | Required | Description |
+| --- | --- | --- |
+| `projectPath` | Yes | Path to the directory containing `project.godot` |
+| `pattern` | No | Project-relative glob such as `enemies/**` or `**/*.tscn` |
+| `type` | No | `scene`, `script`, `resource`, or `all` (default) |
+
+```json
+{
+  "projectPath": "/path/to/project",
+  "pattern": "actors/**",
+  "type": "script"
+}
+```
 
 ## Requirements
 
@@ -123,6 +142,7 @@ Add to your Cline MCP settings file (`~/Library/Application Support/Code/User/gl
         "get_godot_version",
         "list_projects",
         "get_project_info",
+        "list_project_files",
         "create_scene",
         "add_node",
         "load_sprite",
