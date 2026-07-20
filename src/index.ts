@@ -21,6 +21,7 @@ import {
   ListToolsRequestSchema,
   McpError,
 } from '@modelcontextprotocol/sdk/types.js';
+import { listProjectFiles, type ProjectFileType } from './project-files.js';
 
 // Check if debug mode is enabled
 const DEBUG_MODE: boolean = process.env.DEBUG === 'true';
@@ -759,6 +760,29 @@ class GodotServer {
           },
         },
         {
+          name: 'list_project_files',
+          description: 'List Godot scenes, scripts, resources, and shaders in a project',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: {
+                type: 'string',
+                description: 'Path to the Godot project directory',
+              },
+              pattern: {
+                type: 'string',
+                description: 'Optional project-relative glob filter (for example, "enemies/**")',
+              },
+              type: {
+                type: 'string',
+                enum: ['scene', 'script', 'resource', 'all'],
+                description: 'Optional file category filter (default: all)',
+              },
+            },
+            required: ['projectPath'],
+          },
+        },
+        {
           name: 'create_scene',
           description: 'Create a new Godot scene file',
           inputSchema: {
@@ -944,6 +968,8 @@ class GodotServer {
           return await this.handleListProjects(request.params.arguments);
         case 'get_project_info':
           return await this.handleGetProjectInfo(request.params.arguments);
+        case 'list_project_files':
+          return await this.handleListProjectFiles(request.params.arguments);
         case 'create_scene':
           return await this.handleCreateScene(request.params.arguments);
         case 'add_node':
@@ -1471,6 +1497,79 @@ class GodotServer {
           'Ensure Godot is installed correctly',
           'Check if the GODOT_PATH environment variable is set correctly',
           'Verify the project path is accessible',
+        ]
+      );
+    }
+  }
+
+  /**
+   * Handle the list_project_files tool
+   */
+  private async handleListProjectFiles(args: any) {
+    args = this.normalizeParameters(args);
+
+    if (!args.projectPath) {
+      return this.createErrorResponse(
+        'Project path is required',
+        ['Provide a valid path to a Godot project directory']
+      );
+    }
+
+    if (!this.validatePath(args.projectPath)) {
+      return this.createErrorResponse(
+        'Invalid project path',
+        ['Provide a valid path without ".." or other potentially unsafe characters']
+      );
+    }
+
+    if (args.pattern !== undefined && typeof args.pattern !== 'string') {
+      return this.createErrorResponse(
+        'Pattern must be a string',
+        ['Provide a project-relative glob such as "enemies/**"']
+      );
+    }
+
+    const fileType = args.type ?? 'all';
+    const validTypes: ProjectFileType[] = ['scene', 'script', 'resource', 'all'];
+    if (!validTypes.includes(fileType)) {
+      return this.createErrorResponse(
+        'Invalid file type',
+        ['Use one of: scene, script, resource, all']
+      );
+    }
+
+    try {
+      const projectFile = join(args.projectPath, 'project.godot');
+      if (!existsSync(projectFile)) {
+        return this.createErrorResponse(
+          `Not a valid Godot project: ${args.projectPath}`,
+          [
+            'Ensure the path points to a directory containing a project.godot file',
+            'Use list_projects to find valid Godot projects',
+          ]
+        );
+      }
+
+      const projectFiles = listProjectFiles(args.projectPath, {
+        pattern: args.pattern || undefined,
+        type: fileType,
+      });
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(projectFiles, null, 2),
+          },
+        ],
+      };
+    } catch (error: unknown) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      return this.createErrorResponse(
+        `Failed to list project files: ${errorMessage}`,
+        [
+          'Ensure the project directory is readable',
+          'Use a project-relative glob without ".."',
         ]
       );
     }
