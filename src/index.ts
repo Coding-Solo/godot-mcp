@@ -202,15 +202,22 @@ class GodotServer {
   }
 
   /**
-   * Validate a path to prevent path traversal attacks
+   * Validate a path to prevent path traversal attacks.
+   *
+   * Rejects parent-directory traversal ("..") and embedded NUL bytes. A NUL byte
+   * can truncate the path in downstream native calls, letting an attacker smuggle
+   * a different effective path past this check (CWE-158 / poison-null-byte).
+   *
+   * Absolute paths are intentionally allowed: `projectPath` is an absolute
+   * location on the user's machine. Resource paths (scene/texture/output) are
+   * re-rooted under `res://` by the GDScript layer, so blocking ".." here is the
+   * primary defense against escaping the project directory.
    */
   private validatePath(path: string): boolean {
-    // Basic validation to prevent path traversal
-    if (!path || path.includes('..')) {
+    if (!path || path.includes('\0') || path.includes('..')) {
       return false;
     }
 
-    // Add more validation as needed
     return true;
   }
 
