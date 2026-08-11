@@ -9,7 +9,7 @@
 
 import { fileURLToPath } from 'url';
 import { join, dirname, basename, normalize } from 'path';
-import { existsSync, readdirSync, mkdirSync } from 'fs';
+import { existsSync, readdirSync, mkdirSync, readFileSync } from 'fs';
 import { spawn, execFile } from 'child_process';
 import { promisify } from 'util';
 
@@ -1435,8 +1435,7 @@ class GodotServer {
       // Extract project name from project.godot file
       let projectName = basename(args.projectPath);
       try {
-        const fs = require('fs');
-        const projectFileContent = fs.readFileSync(projectFile, 'utf8');
+        const projectFileContent = readFileSync(projectFile, 'utf8');
         const configNameMatch = projectFileContent.match(/config\/name="([^"]+)"/);
         if (configNameMatch && configNameMatch[1]) {
           projectName = configNameMatch[1];

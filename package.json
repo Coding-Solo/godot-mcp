@@ -28,6 +28,7 @@
   ],
   "scripts": {
     "build": "tsc && node scripts/build.js",
+    "test": "npm run build && node --test tests/get-project-info.test.mjs",
     "inspector": "npx @modelcontextprotocol/inspector build/index.js",
     "prepare": "npm run build",
     "watch": "tsc --watch"
