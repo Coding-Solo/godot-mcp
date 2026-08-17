@@ -4,6 +4,12 @@ extends SceneTree
 # Debug mode flag
 var debug_mode = false
 
+# batch_author state — when active, the authoring ops share ONE loaded scene and defer
+# the save, so N ops cost ONE Godot boot instead of N. See batch_author() + _dispatch().
+var _batch_active = false
+var _batch_root = null
+var _batch_abs = ""
+
 func _init():
     var args = OS.get_cmdline_args()
     
@@ -49,14 +55,33 @@ func _init():
         log_error("Failed to parse JSON parameters: " + params_json)
         log_error("JSON Error: " + json.get_error_message() + " at line " + str(json.get_error_line()))
         quit(1)
-    
+        return
+
+    # Resident op-server — checked BEFORE the empty-params guard (its params are legitimately
+    # {}). Stays warm and serves ops over TCP so N ops cost ONE Godot boot (no reboot per op).
+    # Blocks until the client disconnects / shuts down.
+    if operation == "__serve":
+        _serve(params if params != null else {})
+        quit()
+        return
+
     if not params:
         log_error("Failed to parse JSON parameters: " + params_json)
         quit(1)
-    
+        return
+
     log_info("Executing operation: " + operation)
-    
+
+    _dispatch(operation, params)
+
+    quit()
+
+# Route an operation name to its handler. Factored out of _init so batch_author can
+# replay the same handlers against one shared, already-loaded scene.
+func _dispatch(operation, params):
     match operation:
+        "batch_author":
+            batch_author(params)
         "create_scene":
             create_scene(params)
         "add_node":
@@ -71,11 +96,39 @@ func _init():
             get_uid(params)
         "resave_resources":
             resave_resources(params)
+        "add_animation":
+            add_animation(params)
+        "add_collision_shape":
+            add_collision_shape(params)
+        "set_camera_limits":
+            set_camera_limits(params)
+        "connect_signal":
+            connect_signal(params)
+        "add_animated_sprite":
+            add_animated_sprite(params)
+        "paint_tilemap":
+            paint_tilemap(params)
+        "add_area2d":
+            add_area2d(params)
+        "add_particles":
+            add_particles(params)
+        "attach_script":
+            attach_script(params)
+        "set_node_property":
+            set_node_property(params)
+        "remove_node":
+            remove_node(params)
+        "instance_scene":
+            instance_scene(params)
+        "get_scene_tree":
+            get_scene_tree(params)
+        "add_input_action":
+            add_input_action(params)
+        "set_project_setting":
+            set_project_setting(params)
         _:
             log_error("Unknown operation: " + operation)
             quit(1)
-    
-    quit()
 
 # Logging functions
 func log_debug(message):
@@ -1184,3 +1237,728 @@ func save_scene(params):
             printerr("Failed to save scene: " + str(error))
     else:
         printerr("Failed to pack scene: " + str(result))
+
+# ─────────────────────────────────────────────────────────────────────────────
+# AUTHORING LAYER (Studio Leon) — drive Godot's real node systems headlessly, so
+# agents stop hand-rolling movement/animation on a bare canvas. Each op: load the
+# scene -> modify via the engine's own APIs -> pack -> save.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Apply an ORDERED list of authoring ops against ONE scene loaded ONCE, saving ONCE at the
+# end — so a scene authored with K ops costs a single Godot boot, not K. On any op's internal
+# failure the op quits the process before the final save, so the .tscn on disk is left
+# unchanged (no partial writes). params: { scene_path, ops:[{op, ...opParams}] }.
+func batch_author(params):
+    if not params.has("scene_path"):
+        printerr("batch_author requires scene_path")
+        quit(1)
+        return
+    var full = str(params.scene_path)
+    if not full.begins_with("res://"):
+        full = "res://" + full
+    var abs_path = ProjectSettings.globalize_path(full)
+    if not FileAccess.file_exists(abs_path):
+        printerr("Scene file does not exist at: " + abs_path)
+        quit(1)
+        return
+    var scene = load(full)
+    if not scene:
+        printerr("Failed to load scene: " + full)
+        quit(1)
+        return
+    var ops = params.get("ops", [])
+    if not (ops is Array) or ops.size() == 0:
+        printerr("batch_author requires a non-empty 'ops' array")
+        quit(1)
+        return
+
+    _batch_root = scene.instantiate()
+    _batch_abs = abs_path
+    _batch_active = true
+
+    var applied = 0
+    for i in range(ops.size()):
+        var raw = ops[i]
+        if not (raw is Dictionary) or not raw.has("op"):
+            _batch_active = false
+            printerr("batch_author: op #" + str(i) + " must be an object with an 'op' field")
+            quit(1)
+            return
+        # The TS camel->snake converter doesn't recurse into arrays, so batched op entries
+        # arrive camelCase — normalize each entry's keys here so the handlers find them.
+        var entry = _snakeify(raw)
+        var op_name = str(entry.op)
+        if op_name == "batch_author":
+            _batch_active = false
+            printerr("batch_author cannot be nested")
+            quit(1)
+            return
+        log_info("[batch] op " + str(i + 1) + "/" + str(ops.size()) + ": " + op_name)
+        # A failing handler calls quit() itself -> process ends before the save below,
+        # leaving the scene file untouched.
+        _dispatch(op_name, entry)
+        applied += 1
+
+    # All ops applied against the in-memory tree — pack + save exactly once.
+    _batch_active = false
+    var packed = PackedScene.new()
+    var result = packed.pack(_batch_root)
+    if result != OK:
+        printerr("batch_author: failed to pack scene: " + str(result))
+        quit(1)
+        return
+    var err = ResourceSaver.save(packed, _batch_abs)
+    if err != OK:
+        printerr("batch_author: failed to save scene: " + str(err))
+        quit(1)
+        return
+    print("batch_author applied " + str(applied) + " op(s) to " + str(params.scene_path))
+
+# Recursively convert Dictionary keys from camelCase to snake_case (and descend into
+# nested arrays/dicts), so batched op params match what the handlers read.
+func _snakeify(v):
+    if v is Dictionary:
+        var out = {}
+        for k in v.keys():
+            out[_to_snake(str(k))] = _snakeify(v[k])
+        return out
+    elif v is Array:
+        var arr = []
+        for e in v:
+            arr.append(_snakeify(e))
+        return arr
+    return v
+
+func _to_snake(s):
+    var r = ""
+    for i in range(s.length()):
+        var c = s[i]
+        if c >= "A" and c <= "Z":
+            if i > 0:
+                r += "_"
+            r += c.to_lower()
+        else:
+            r += c
+    return r
+
+# Resident op-server. Opens a TCP listener on an ephemeral port, prints it (so the MCP
+# server can connect), then serves newline-delimited JSON requests { id, op, params } ->
+# { id, ok, result|error } by replaying the SAME _dispatch handlers — no reboot per op.
+# One request at a time (the TS side serializes). A handler that hits a hard error still
+# quit()s the process; the TS side detects the exit and restarts the resident.
+func _serve(params):
+    var server = TCPServer.new()
+    var err = server.listen(0)
+    if err != OK:
+        printerr("op-server: listen failed: " + str(err))
+        return
+    var port = server.get_local_port()
+    # This exact marker is how the MCP server learns the port. Keep it stable.
+    print("LEON_OP_SERVER_PORT " + str(port))
+
+    # Wait (bounded) for the MCP server to connect.
+    var peer = null
+    var waited = 0
+    while peer == null:
+        if server.is_connection_available():
+            peer = server.take_connection()
+        else:
+            OS.delay_msec(5)
+            waited += 5
+            if waited > 30000:
+                printerr("op-server: no client connected within 30s")
+                server.stop()
+                return
+    peer.set_no_delay(true)
+    print("LEON_OP_SERVER_READY")
+
+    var buf = ""
+    while true:
+        peer.poll()
+        if peer.get_status() != StreamPeerTCP.STATUS_CONNECTED:
+            break
+        var avail = peer.get_available_bytes()
+        if avail > 0:
+            buf += peer.get_utf8_string(avail)
+            while buf.find("\n") != -1:
+                var idx = buf.find("\n")
+                var line = buf.substr(0, idx)
+                buf = buf.substr(idx + 1)
+                if line.strip_edges() != "":
+                    _handle_request(peer, line)
+        else:
+            OS.delay_msec(3)
+    server.stop()
+
+func _handle_request(peer, line):
+    var json = JSON.new()
+    if json.parse(line) != OK:
+        _reply(peer, {"id": null, "ok": false, "error": "bad json"})
+        return
+    var req = json.get_data()
+    if not (req is Dictionary):
+        _reply(peer, {"id": null, "ok": false, "error": "request must be an object"})
+        return
+    var id = req.get("id", null)
+    var op = str(req.get("op", ""))
+    if op == "__ping":
+        _reply(peer, {"id": id, "ok": true, "result": "pong"})
+        return
+    if op == "__shutdown":
+        _reply(peer, {"id": id, "ok": true, "result": "bye"})
+        _reply_flush(peer)
+        quit()
+        return
+    if op == "__serve" or op == "":
+        _reply(peer, {"id": id, "ok": false, "error": "invalid op"})
+        return
+    var op_params = _snakeify(req.get("params", {}))
+    # A failing handler prints the error + quit()s the process; the client then sees the
+    # socket close and treats this request as failed. On success it prints to stdout and
+    # we ack over TCP (mutating ops persist their own .tscn via _authoring_save).
+    _dispatch(op, op_params)
+    _reply(peer, {"id": id, "ok": true})
+
+func _reply(peer, obj):
+    var data = (JSON.stringify(obj) + "\n").to_utf8_buffer()
+    peer.put_data(data)
+
+func _reply_flush(peer):
+    # best-effort: make sure the reply bytes go out before we quit
+    peer.poll()
+
+func _authoring_load(params):
+    # In a batch, every op shares the ONE scene loaded by batch_author — don't reload.
+    if _batch_active:
+        return {"root": _batch_root, "abs": _batch_abs}
+    var full = params.scene_path
+    if not full.begins_with("res://"):
+        full = "res://" + full
+    var abs_path = ProjectSettings.globalize_path(full)
+    if not FileAccess.file_exists(abs_path):
+        printerr("Scene file does not exist at: " + abs_path)
+        quit(1)
+        return null
+    var scene = load(full)
+    if not scene:
+        printerr("Failed to load scene: " + full)
+        quit(1)
+        return null
+    return {"root": scene.instantiate(), "abs": abs_path}
+
+func _authoring_find(root, path):
+    if path == null or path == "" or path == "root":
+        return root
+    var p = str(path).replace("root/", "")
+    var n = root.get_node_or_null(p)
+    if n == null:
+        printerr("Node not found: " + str(path))
+    return n
+
+func _authoring_save(root, abs_path, msg):
+    # In a batch, defer the real save — batch_author packs + saves ONCE at the end, so a
+    # mid-batch failure (which quits) leaves the .tscn on disk untouched. Just log progress.
+    if _batch_active:
+        print("[batch] " + msg)
+        return
+    var packed = PackedScene.new()
+    var result = packed.pack(root)
+    if result != OK:
+        printerr("Failed to pack scene: " + str(result))
+        quit(1)
+        return
+    var err = ResourceSaver.save(packed, abs_path)
+    if err != OK:
+        printerr("Failed to save scene: " + str(err))
+        quit(1)
+        return
+    print(msg)
+
+# Add an AnimationPlayer (if needed) + a value-track Animation built from keys.
+# params: scene_path, animation_name, player_parent?, player_path?, length?, loop?,
+#   tracks:[{path:"NodeName:property", keys:[{time,value}], interp?:"nearest"}]
+func add_animation(params):
+    var ctx = _authoring_load(params)
+    if ctx == null:
+        return
+    var root = ctx.root
+    var player = null
+    if params.has("player_path"):
+        player = _authoring_find(root, params.player_path)
+    var player_parent = _authoring_find(root, params.get("player_parent", "root"))
+    if player_parent == null:
+        quit(1)
+        return
+    if player == null:
+        player = player_parent.get_node_or_null("AnimationPlayer")
+    if player == null:
+        player = AnimationPlayer.new()
+        player.name = "AnimationPlayer"
+        player_parent.add_child(player)
+        player.owner = root
+    var anim = Animation.new()
+    anim.length = float(params.get("length", 1.0))
+    if bool(params.get("loop", true)):
+        anim.loop_mode = Animation.LOOP_LINEAR
+    else:
+        anim.loop_mode = Animation.LOOP_NONE
+    for track in params.get("tracks", []):
+        var ti = anim.add_track(Animation.TYPE_VALUE)
+        anim.track_set_path(ti, NodePath(track.path))
+        if track.get("interp", "") == "nearest":
+            anim.track_set_interpolation_type(ti, Animation.INTERPOLATION_NEAREST)
+        for key in track.get("keys", []):
+            anim.track_insert_key(ti, float(key.time), key.value)
+    var lib
+    if player.has_animation_library(""):
+        lib = player.get_animation_library("")
+    else:
+        lib = AnimationLibrary.new()
+        player.add_animation_library("", lib)
+    var an = params.get("animation_name", "anim")
+    if lib.has_animation(an):
+        lib.remove_animation(an)
+    lib.add_animation(an, anim)
+    _authoring_save(root, ctx.abs, "Animation '" + str(an) + "' added to " + str(player.name))
+
+# Add a CollisionShape2D with a real shape to a body — fixes floating / no-collision.
+# params: scene_path, parent_path (the body), shape:"rectangle"|"circle"|"capsule",
+#   size:[w,h] | radius | height, position?:[x,y], name?
+func add_collision_shape(params):
+    var ctx = _authoring_load(params)
+    if ctx == null:
+        return
+    var root = ctx.root
+    var parent = _authoring_find(root, params.get("parent_path", "root"))
+    if parent == null:
+        quit(1)
+        return
+    var cs = CollisionShape2D.new()
+    cs.name = params.get("name", "CollisionShape2D")
+    var kind = params.get("shape", "rectangle")
+    var shape
+    if kind == "circle":
+        shape = CircleShape2D.new()
+        shape.radius = float(params.get("radius", 16))
+    elif kind == "capsule":
+        shape = CapsuleShape2D.new()
+        shape.radius = float(params.get("radius", 12))
+        shape.height = float(params.get("height", 40))
+    else:
+        shape = RectangleShape2D.new()
+        shape.size = _to_size(params.get("size", null))
+    cs.shape = shape
+    if params.has("position"):
+        var pos = params.position
+        cs.position = Vector2(float(pos[0]), float(pos[1]))
+    parent.add_child(cs)
+    cs.owner = root
+    _authoring_save(root, ctx.abs, "CollisionShape2D (" + str(kind) + ") added to " + str(parent.name))
+
+# Set Camera2D limits (clamp to the map), creating the camera if needed.
+# params: scene_path, camera_path? | camera_parent?, limits:{left,top,right,bottom}, smoothing?
+func set_camera_limits(params):
+    var ctx = _authoring_load(params)
+    if ctx == null:
+        return
+    var root = ctx.root
+    var cam = null
+    if params.has("camera_path"):
+        cam = _authoring_find(root, params.camera_path)
+    if cam == null:
+        var parent = _authoring_find(root, params.get("camera_parent", "root"))
+        if parent == null:
+            quit(1)
+            return
+        cam = parent.get_node_or_null("Camera2D")
+        if cam == null:
+            cam = Camera2D.new()
+            cam.name = "Camera2D"
+            parent.add_child(cam)
+            cam.owner = root
+    var lim = params.get("limits", {})
+    if lim.has("left"):
+        cam.limit_left = int(lim.left)
+    if lim.has("top"):
+        cam.limit_top = int(lim.top)
+    if lim.has("right"):
+        cam.limit_right = int(lim.right)
+    if lim.has("bottom"):
+        cam.limit_bottom = int(lim.bottom)
+    if params.has("smoothing"):
+        cam.position_smoothing_enabled = true
+        cam.position_smoothing_speed = float(params.smoothing)
+    _authoring_save(root, ctx.abs, "Camera2D limits set on " + str(cam.name))
+
+# Persistently connect a signal (serialized into the scene) — wire, don't hand-poll.
+# params: scene_path, from_path, signal, to_path, method
+func connect_signal(params):
+    var ctx = _authoring_load(params)
+    if ctx == null:
+        return
+    var root = ctx.root
+    var from_node = _authoring_find(root, params.from_path)
+    var to_node = _authoring_find(root, params.to_path)
+    if from_node == null or to_node == null:
+        quit(1)
+        return
+    var sig = params["signal"]
+    if not from_node.has_signal(sig):
+        printerr("Node has no signal: " + str(sig))
+        quit(1)
+        return
+    var err = from_node.connect(sig, Callable(to_node, params.method), CONNECT_PERSIST)
+    if err != OK:
+        printerr("Failed to connect signal: " + str(err))
+        quit(1)
+        return
+    _authoring_save(root, ctx.abs, "Connected " + str(from_node.name) + "." + str(sig) + " -> " + str(to_node.name) + "." + str(params.method))
+
+# ── AUTHORING LAYER batch 2 — animated sprites, tilemaps, areas, particles ──────
+
+# Robustly read a 2D size from agent-supplied params. Callers pass it as a dict {x,y}
+# (or {w,h}), an array [w,h], a single number (square), or omit it (default). The old code
+# assumed an array and crashed on the dict form ("Invalid access to key '0'").
+func _to_size(v, def_w := 32.0, def_h := 32.0) -> Vector2:
+    if v is Dictionary:
+        return Vector2(float(v.get("x", v.get("w", def_w))), float(v.get("y", v.get("h", def_h))))
+    if v is Array:
+        if v.size() >= 2:
+            return Vector2(float(v[0]), float(v[1]))
+        if v.size() == 1:
+            return Vector2(float(v[0]), float(v[0]))
+    if v is float or v is int:
+        return Vector2(float(v), float(v))
+    return Vector2(def_w, def_h)
+
+func _make_shape(params):
+    var kind = params.get("shape", "rectangle")
+    var shape
+    if kind == "circle":
+        shape = CircleShape2D.new()
+        shape.radius = float(params.get("radius", 16))
+    elif kind == "capsule":
+        shape = CapsuleShape2D.new()
+        shape.radius = float(params.get("radius", 12))
+        shape.height = float(params.get("height", 40))
+    else:
+        shape = RectangleShape2D.new()
+        shape.size = _to_size(params.get("size", null))
+    return shape
+
+# AnimatedSprite2D + SpriteFrames built from a sprite sheet (grid of frames).
+# params: scene_path, parent_path, name?, texture (res:// sheet), frame_width, frame_height,
+#   animations:[{name, frames:[frame_index,...], fps?, loop?}], autoplay?
+func add_animated_sprite(params):
+    var ctx = _authoring_load(params)
+    if ctx == null:
+        return
+    var root = ctx.root
+    var parent = _authoring_find(root, params.get("parent_path", "root"))
+    if parent == null:
+        quit(1)
+        return
+    var tex = load(params.texture)
+    if tex == null:
+        printerr("Texture not found: " + str(params.texture))
+        quit(1)
+        return
+    var fw = int(params.get("frame_width", 16))
+    var fh = int(params.get("frame_height", 16))
+    var cols = int(tex.get_width() / fw)
+    if cols < 1:
+        cols = 1
+    var sf = SpriteFrames.new()
+    if sf.has_animation("default"):
+        sf.remove_animation("default")
+    for a in params.get("animations", []):
+        var aname = a.name
+        if not sf.has_animation(aname):
+            sf.add_animation(aname)
+        sf.set_animation_speed(aname, float(a.get("fps", 8)))
+        sf.set_animation_loop(aname, bool(a.get("loop", true)))
+        for idx in a.get("frames", []):
+            var at = AtlasTexture.new()
+            at.atlas = tex
+            var fx = (int(idx) % cols) * fw
+            var fy = int(int(idx) / cols) * fh
+            at.region = Rect2(fx, fy, fw, fh)
+            sf.add_frame(aname, at)
+    var spr = AnimatedSprite2D.new()
+    spr.name = params.get("name", "AnimatedSprite2D")
+    spr.sprite_frames = sf
+    if params.has("autoplay"):
+        spr.autoplay = params.autoplay
+    parent.add_child(spr)
+    spr.owner = root
+    _authoring_save(root, ctx.abs, "AnimatedSprite2D added to " + str(parent.name))
+
+# A TileMapLayer with a TileSet built from an atlas texture, then painted cells.
+# params: scene_path, parent_path, name?, texture (res:// atlas), tile_size,
+#   cells:[{x,y,atlas_x,atlas_y}]
+func paint_tilemap(params):
+    var ctx = _authoring_load(params)
+    if ctx == null:
+        return
+    var root = ctx.root
+    var parent = _authoring_find(root, params.get("parent_path", "root"))
+    if parent == null:
+        quit(1)
+        return
+    var tex = load(params.texture)
+    if tex == null:
+        printerr("Texture not found: " + str(params.texture))
+        quit(1)
+        return
+    var tile = int(params.get("tile_size", 16))
+    var ts = TileSet.new()
+    ts.tile_size = Vector2i(tile, tile)
+    var src = TileSetAtlasSource.new()
+    src.texture = tex
+    src.texture_region_size = Vector2i(tile, tile)
+    var cols = int(tex.get_width() / tile)
+    var rows = int(tex.get_height() / tile)
+    for ty in rows:
+        for tx in cols:
+            src.create_tile(Vector2i(tx, ty))
+    var src_id = ts.add_source(src)
+    var layer = TileMapLayer.new()
+    layer.name = params.get("name", "TileMapLayer")
+    layer.tile_set = ts
+    for cell in params.get("cells", []):
+        # tolerate both snake_case and camelCase for the atlas coords (array items
+        # aren't key-converted by the MCP layer)
+        var ax = cell.get("atlas_x", cell.get("atlasX", 0))
+        var ay = cell.get("atlas_y", cell.get("atlasY", 0))
+        layer.set_cell(Vector2i(int(cell.x), int(cell.y)), src_id, Vector2i(int(ax), int(ay)))
+    parent.add_child(layer)
+    layer.owner = root
+    _authoring_save(root, ctx.abs, "TileMapLayer painted (" + str(params.get("cells", []).size()) + " cells)")
+
+# An Area2D + CollisionShape2D — hitboxes/hurtboxes/triggers/pickups.
+# params: scene_path, parent_path, name?, shape/size/radius/height, position?,
+#   collision_layer?, collision_mask?
+func add_area2d(params):
+    var ctx = _authoring_load(params)
+    if ctx == null:
+        return
+    var root = ctx.root
+    var parent = _authoring_find(root, params.get("parent_path", "root"))
+    if parent == null:
+        quit(1)
+        return
+    var area = Area2D.new()
+    area.name = params.get("name", "Area2D")
+    if params.has("collision_layer"):
+        area.collision_layer = int(params.collision_layer)
+    if params.has("collision_mask"):
+        area.collision_mask = int(params.collision_mask)
+    var cs = CollisionShape2D.new()
+    cs.shape = _make_shape(params)
+    if params.has("position"):
+        var pos = params.position
+        cs.position = Vector2(float(pos[0]), float(pos[1]))
+    parent.add_child(area)
+    area.owner = root
+    area.add_child(cs)
+    cs.owner = root
+    _authoring_save(root, ctx.abs, "Area2D added to " + str(parent.name))
+
+# GPUParticles2D + ParticleProcessMaterial — cheap juice (bursts, trails, dust).
+# params: scene_path, parent_path, name?, amount?, lifetime?, texture?, gravity?,
+#   spread?, velocity?, one_shot?, explosiveness?
+func add_particles(params):
+    var ctx = _authoring_load(params)
+    if ctx == null:
+        return
+    var root = ctx.root
+    var parent = _authoring_find(root, params.get("parent_path", "root"))
+    if parent == null:
+        quit(1)
+        return
+    var p = GPUParticles2D.new()
+    p.name = params.get("name", "GPUParticles2D")
+    p.amount = int(params.get("amount", 16))
+    p.lifetime = float(params.get("lifetime", 1.0))
+    if params.has("one_shot"):
+        p.one_shot = bool(params.one_shot)
+    if params.has("explosiveness"):
+        p.explosiveness = float(params.explosiveness)
+    if params.has("texture"):
+        var tex = load(params.texture)
+        if tex != null:
+            p.texture = tex
+    var mat = ParticleProcessMaterial.new()
+    mat.gravity = Vector3(0, float(params.get("gravity", 98)), 0)
+    if params.has("spread"):
+        mat.spread = float(params.spread)
+    if params.has("velocity"):
+        mat.initial_velocity_min = float(params.velocity)
+        mat.initial_velocity_max = float(params.velocity)
+    p.process_material = mat
+    parent.add_child(p)
+    p.owner = root
+    _authoring_save(root, ctx.abs, "GPUParticles2D added to " + str(parent.name))
+
+# ── AUTHORING LAYER batch 3 — behavior, input, project config, composition, edit ─
+
+# Attach an existing GDScript (write the .gd first) to a node in the scene.
+# params: scene_path, node_path, script_path (res://...)
+func attach_script(params):
+    var ctx = _authoring_load(params)
+    if ctx == null:
+        return
+    var root = ctx.root
+    var node = _authoring_find(root, params.node_path)
+    if node == null:
+        quit(1)
+        return
+    var sp = params.script_path
+    if not sp.begins_with("res://"):
+        sp = "res://" + sp
+    var scr = load(sp)
+    if scr == null:
+        printerr("Script not found: " + str(sp))
+        quit(1)
+        return
+    node.set_script(scr)
+    _authoring_save(root, ctx.abs, "Script " + str(sp) + " attached to " + str(node.name))
+
+# Set properties on an EXISTING node (add_node sets them at creation; use this to tweak).
+# params: scene_path, node_path, properties:{...}   (res:// values are loaded)
+func set_node_property(params):
+    var ctx = _authoring_load(params)
+    if ctx == null:
+        return
+    var root = ctx.root
+    var node = _authoring_find(root, params.node_path)
+    if node == null:
+        quit(1)
+        return
+    for property in params.get("properties", {}):
+        var value = params.properties[property]
+        if typeof(value) == TYPE_STRING and value.begins_with("res://"):
+            value = load(value)
+        node.set(property, value)
+    _authoring_save(root, ctx.abs, "Properties set on " + str(node.name))
+
+# Remove a node from the scene.
+# params: scene_path, node_path
+func remove_node(params):
+    var ctx = _authoring_load(params)
+    if ctx == null:
+        return
+    var root = ctx.root
+    var node = _authoring_find(root, params.node_path)
+    if node == null:
+        quit(1)
+        return
+    if node == root:
+        printerr("Cannot remove the scene root")
+        quit(1)
+        return
+    var parent = node.get_parent()
+    parent.remove_child(node)
+    node.free()
+    _authoring_save(root, ctx.abs, "Removed node " + str(params.node_path))
+
+# Instance a sub-scene (a PackedScene / prefab) as a child — the Godot way to compose.
+# params: scene_path, sub_scene (res:// .tscn), parent_path?, name?, position?:[x,y]
+func instance_scene(params):
+    var ctx = _authoring_load(params)
+    if ctx == null:
+        return
+    var root = ctx.root
+    var parent = _authoring_find(root, params.get("parent_path", "root"))
+    if parent == null:
+        quit(1)
+        return
+    var sub = params.sub_scene
+    if not sub.begins_with("res://"):
+        sub = "res://" + sub
+    var packed = load(sub)
+    if packed == null:
+        printerr("Sub-scene not found: " + str(sub))
+        quit(1)
+        return
+    var inst = packed.instantiate()
+    if params.has("name"):
+        inst.name = params.name
+    if params.has("position") and inst is Node2D:
+        var pos = params.position
+        inst.position = Vector2(float(pos[0]), float(pos[1]))
+    parent.add_child(inst)
+    inst.owner = root
+    _authoring_save(root, ctx.abs, "Instanced " + str(sub) + " under " + str(parent.name))
+
+# Print the scene tree (name : type per node) to stdout — inspection for the agent.
+# params: scene_path
+func get_scene_tree(params):
+    var ctx = _authoring_load(params)
+    if ctx == null:
+        return
+    _print_tree(ctx.root, 0)
+    print("SCENE TREE OK")
+
+func _print_tree(node, depth):
+    var pad = ""
+    for i in depth:
+        pad += "  "
+    var scr = ""
+    if node.get_script() != null:
+        scr = " [script]"
+    print(pad + str(node.name) + " : " + node.get_class() + scr)
+    for child in node.get_children():
+        _print_tree(child, depth + 1)
+
+# ── PROJECT-LEVEL ops (operate on project.godot, no scene) ──────────────────────
+
+# Define an InputMap action (so Input.is_action_pressed works — the missing-binding fix).
+# params: action, deadzone?, events:[{type:"key"|"joy_button"|"mouse_button", key?:"X", button?:0}]
+func add_input_action(params):
+    var action = "input/" + str(params.action)
+    var events = []
+    for e in params.get("events", []):
+        var t = e.get("type", "key")
+        if t == "key":
+            var ev = InputEventKey.new()
+            var code = OS.find_keycode_from_string(str(e.get("key", "")))
+            ev.physical_keycode = code
+            ev.keycode = code
+            events.append(ev)
+        elif t == "joy_button":
+            var jb = InputEventJoypadButton.new()
+            jb.button_index = int(e.get("button", 0))
+            events.append(jb)
+        elif t == "mouse_button":
+            var mb = InputEventMouseButton.new()
+            mb.button_index = int(e.get("button", 1))
+            events.append(mb)
+    var entry = {"deadzone": float(params.get("deadzone", 0.5)), "events": events}
+    ProjectSettings.set_setting(action, entry)
+    var err = ProjectSettings.save()
+    if err != OK:
+        printerr("Failed to save project settings: " + str(err))
+        quit(1)
+        return
+    print("Input action '" + str(params.action) + "' defined with " + str(events.size()) + " event(s)")
+
+# Set arbitrary project settings (main scene, window size, stretch, physics tick...).
+# params: settings:{ "application/run/main_scene":"res://main.tscn",
+#   "display/window/size/viewport_width":1280, "display/window/stretch/mode":"canvas_items", ... }
+func set_project_setting(params):
+    var settings = params.get("settings", {})
+    var count = 0
+    for key in settings:
+        var value = settings[key]
+        # main_scene wants a res:// path string
+        if typeof(value) == TYPE_STRING and (key as String).ends_with("main_scene") and not value.begins_with("res://"):
+            value = "res://" + value
+        ProjectSettings.set_setting(key, value)
+        count += 1
+    var err = ProjectSettings.save()
+    if err != OK:
+        printerr("Failed to save project settings: " + str(err))
+        quit(1)
+        return
+    print("Set " + str(count) + " project setting(s)")

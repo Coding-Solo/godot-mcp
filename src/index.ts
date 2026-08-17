@@ -8,8 +8,9 @@
  */
 
 import { fileURLToPath } from 'url';
-import { join, dirname, basename, normalize } from 'path';
-import { existsSync, readdirSync, mkdirSync } from 'fs';
+import { GodotOpServer } from './godotOpServer.js';
+import { join, dirname, basename, normalize, isAbsolute } from 'path';
+import { existsSync, readdirSync, mkdirSync, writeFileSync, unlinkSync } from 'fs';
 import { spawn, execFile } from 'child_process';
 import { promisify } from 'util';
 
@@ -65,6 +66,126 @@ class GodotServer {
   private server: Server;
   private activeProcess: GodotProcess | null = null;
   private godotPath: string | null = null;
+  /** Warm resident-process pool for authoring ops (opt-in via GODOT_RESIDENT=1). */
+  private opServer: GodotOpServer | null = null;
+
+  /**
+   * GDScript template for capture_level_overview. Tokens (__TARGET__, __OUT__,
+   * __MAXW__, __MAXH__, __PAD__) are substituted at runtime. Instances the target
+   * scene, computes the level's world AABB, frames a fitted Camera2D, and saves one
+   * real rendered frame. Lines are flush-left on purpose — GDScript is
+   * indentation-sensitive, so no host-code indentation may leak in.
+   */
+  private static readonly CAPTURE_GD = String.raw`extends Node2D
+# Studio Leon — whole-level overview capture (auto-generated; safe to delete).
+const TARGET_SCENE := "__TARGET__"
+const OUT_PATH := "__OUT__"
+const MAX_W := __MAXW__
+const MAX_H := __MAXH__
+const PAD := __PAD__
+
+func _ready() -> void:
+    var packed = ResourceLoader.load(TARGET_SCENE)
+    if packed == null or not (packed is PackedScene):
+        push_error("LEON_CAPTURE: cannot load scene " + TARGET_SCENE)
+        get_tree().quit(2)
+        return
+    var inst = packed.instantiate()
+    add_child(inst)
+    # let the instanced scene's _ready run and tilemaps populate
+    await get_tree().process_frame
+    await get_tree().process_frame
+    var b := _bounds(inst)
+    if b.size.x <= 1.0 or b.size.y <= 1.0:
+        b = Rect2(Vector2.ZERO, Vector2(1152.0, 648.0))
+    b = b.grow(maxf(b.size.x, b.size.y) * PAD)
+    var ar := b.size.x / b.size.y
+    var ow := MAX_W
+    var oh := int(round(float(MAX_W) / ar))
+    if oh > MAX_H:
+        oh = MAX_H
+        ow = int(round(float(MAX_H) * ar))
+    ow = maxi(ow, 16)
+    oh = maxi(oh, 16)
+    DisplayServer.window_set_size(Vector2i(ow, oh))
+    var vp := get_viewport()
+    var cam := Camera2D.new()
+    add_child(cam)
+    cam.position = b.position + b.size * 0.5
+    var z: float = minf(float(ow) / b.size.x, float(oh) / b.size.y)
+    cam.zoom = Vector2(z, z)
+    cam.make_current()
+    # settle the window resize + camera, then grab exactly one drawn frame
+    for i in range(5):
+        await get_tree().process_frame
+    await RenderingServer.frame_post_draw
+    var img := vp.get_texture().get_image()
+    if img == null:
+        push_error("LEON_CAPTURE: viewport image was null")
+        get_tree().quit(4)
+        return
+    var err := img.save_png(OUT_PATH)
+    if err != OK:
+        push_error("LEON_CAPTURE: save_png failed err=" + str(err))
+        get_tree().quit(3)
+        return
+    print("LEON_CAPTURE_DONE ", OUT_PATH, " ", ow, "x", oh, " bounds=", b)
+    get_tree().quit(0)
+
+func _xf_rect(xf: Transform2D, r: Rect2) -> Rect2:
+    var p0 := xf * r.position
+    var p1 := xf * (r.position + Vector2(r.size.x, 0.0))
+    var p2 := xf * (r.position + Vector2(0.0, r.size.y))
+    var p3 := xf * (r.position + r.size)
+    var mn := Vector2(minf(minf(p0.x, p1.x), minf(p2.x, p3.x)), minf(minf(p0.y, p1.y), minf(p2.y, p3.y)))
+    var mx := Vector2(maxf(maxf(p0.x, p1.x), maxf(p2.x, p3.x)), maxf(maxf(p0.y, p1.y), maxf(p2.y, p3.y)))
+    return Rect2(mn, mx - mn)
+
+func _bounds(root: Node) -> Rect2:
+    var acc := Rect2()
+    var has := false
+    var stack: Array = [root]
+    while not stack.is_empty():
+        var n = stack.pop_back()
+        # a level overview is the world, not the HUD — skip UI overlays
+        if n is CanvasLayer:
+            continue
+        for c in n.get_children():
+            stack.push_back(c)
+        var rr := Rect2()
+        var ok := false
+        if n is Camera2D:
+            var cam := n as Camera2D
+            if cam.limit_left > -10000000 and cam.limit_right < 10000000 and cam.limit_right > cam.limit_left and cam.limit_bottom > cam.limit_top:
+                rr = Rect2(Vector2(cam.limit_left, cam.limit_top), Vector2(cam.limit_right - cam.limit_left, cam.limit_bottom - cam.limit_top))
+                ok = true
+        elif n is TileMapLayer:
+            var tl := n as TileMapLayer
+            var used := tl.get_used_rect()
+            if used.size.x > 0 and used.size.y > 0 and tl.tile_set != null:
+                var ts := Vector2(tl.tile_set.tile_size)
+                var local := Rect2(Vector2(used.position) * ts, Vector2(used.size) * ts)
+                rr = _xf_rect(tl.global_transform, local)
+                ok = true
+        elif n is Sprite2D:
+            var sp := n as Sprite2D
+            if sp.texture != null:
+                rr = _xf_rect(sp.global_transform, sp.get_rect())
+                ok = true
+        elif n is AnimatedSprite2D:
+            var asp := n as AnimatedSprite2D
+            var fr := asp.sprite_frames
+            if fr != null and asp.animation != "" and fr.get_frame_count(asp.animation) > 0:
+                var tex := fr.get_frame_texture(asp.animation, asp.frame)
+                if tex != null:
+                    var sz := tex.get_size()
+                    rr = _xf_rect(asp.global_transform, Rect2(-sz * 0.5, sz))
+                    ok = true
+        if ok:
+            acc = rr if not has else acc.merge(rr)
+            has = true
+    return acc if has else Rect2()
+`;
   private operationsScriptPath: string;
   private validatedPaths: Map<string, boolean> = new Map();
   private strictPathValidation: boolean = false;
@@ -134,6 +255,18 @@ class GodotServer {
     // Set the path to the operations script
     this.operationsScriptPath = join(__dirname, 'scripts', 'godot_operations.gd');
     if (debugMode) console.error(`[DEBUG] Operations script path: ${this.operationsScriptPath}`);
+
+    // Warm resident pool for authoring ops — opt-in (GODOT_RESIDENT=1) so it never changes
+    // behavior unless enabled; when on, authoring ops reuse a warm process and fall back to
+    // spawn-per-op on any resident failure.
+    if (process.env.GODOT_RESIDENT === '1') {
+      this.opServer = new GodotOpServer(
+        () => this.godotPath,
+        this.operationsScriptPath,
+        (m) => this.logDebug(m),
+      );
+      if (debugMode) console.error('[DEBUG] Resident op-server ENABLED (GODOT_RESIDENT=1)');
+    }
 
     // Initialize the MCP server
     this.server = new Server(
@@ -398,6 +531,7 @@ class GodotServer {
       this.activeProcess.process.kill();
       this.activeProcess = null;
     }
+    this.opServer?.killAll();
     await this.server.close();
   }
 
@@ -700,6 +834,45 @@ class GodotServer {
           },
         },
         {
+          name: 'batch_author',
+          description:
+            "Apply an ORDERED list of authoring ops against ONE scene in a SINGLE Godot boot (instead of one boot per op) — the fast path for authoring a whole scene. The scene is loaded once and saved once; if any op fails, the process aborts BEFORE saving so the .tscn is left unchanged (no partial writes). Each ops[] entry is { op: <tool name>, ...that tool's params } (e.g. {op:'add_collision_shape', parentPath:'Player', shape:'rectangle', size:{x:16,y:24}}). Use it for the scene-authoring ops (add_node, add_collision_shape, add_animation, add_animated_sprite, paint_tilemap, add_area2d, set_camera_limits, add_particles, connect_signal, attach_script, set_node_property, instance_scene, remove_node).",
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: { type: 'string', description: 'Path to the Godot project directory' },
+              scenePath: { type: 'string', description: 'The .tscn all ops target (res:// or project-relative). Loaded once, saved once.' },
+              ops: {
+                type: 'array',
+                description: "Ordered ops. Each is an object: { op: '<tool name>', ...that op's params }. Applied in order against the one loaded scene.",
+                items: {
+                  type: 'object',
+                  properties: { op: { type: 'string', description: 'The authoring op name, e.g. "add_collision_shape"' } },
+                  required: ['op'],
+                },
+              },
+            },
+            required: ['projectPath', 'scenePath', 'ops'],
+          },
+        },
+        {
+          name: 'capture_level_overview',
+          description:
+            "Render a whole-LEVEL overview PNG of a scene — the top-down \"level-designer's view\" of the entire level (all tilemaps/sprites framed to fit), NOT the in-game camera. Computes the level's world bounds (Camera2D limits if authored, else the union of TileMapLayer/Sprite2D extents), frames an orthographic camera to fit, and captures one real (non-headless) rendered frame. Use it to eyeball level layout, coverage, and composition the way you would in the Godot editor.",
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: { type: 'string', description: 'Path to the Godot project directory' },
+              scene: { type: 'string', description: 'Scene to capture — a res:// path or project-relative .tscn (e.g. "res://levels/level1.tscn")' },
+              outputPath: { type: 'string', description: 'Where to write the PNG (absolute, or relative to the project). Default: <project>/.studio/shots/level-overview.png' },
+              maxWidth: { type: 'number', description: 'Max output width in px (default 1920). The level aspect is preserved within maxWidth×maxHeight.' },
+              maxHeight: { type: 'number', description: 'Max output height in px (default 1080).' },
+              padding: { type: 'number', description: 'Fractional margin around the level bounds, 0–0.5 (default 0.06).' },
+            },
+            required: ['projectPath', 'scene'],
+          },
+        },
+        {
           name: 'get_debug_output',
           description: 'Get the current debug output and errors',
           inputSchema: {
@@ -812,6 +985,248 @@ class GodotServer {
               },
             },
             required: ['projectPath', 'scenePath', 'nodeType', 'nodeName'],
+          },
+        },
+        {
+          name: 'add_animation',
+          description: 'Author an AnimationPlayer + a keyframed value-track Animation (walk/idle/attack). Use this instead of hand-rolling animation in _process.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: { type: 'string', description: 'Path to the Godot project directory' },
+              scenePath: { type: 'string', description: 'Scene file (relative to project)' },
+              animationName: { type: 'string', description: 'Name of the animation (e.g. "walk")' },
+              playerParent: { type: 'string', description: 'Node to hold the AnimationPlayer (default "root")' },
+              length: { type: 'number', description: 'Animation length in seconds' },
+              loop: { type: 'boolean' },
+              tracks: { type: 'array', description: 'Value tracks: [{ path: "Node:property" e.g. ".:position:y", keys: [{time, value}], interp?: "nearest" }]' },
+            },
+            required: ['projectPath', 'scenePath', 'animationName'],
+          },
+        },
+        {
+          name: 'add_collision_shape',
+          description: 'Add a CollisionShape2D with a real shape to a body (CharacterBody2D/StaticBody2D/RigidBody2D). Fixes floating/no-collision characters.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: { type: 'string' },
+              scenePath: { type: 'string' },
+              parentPath: { type: 'string', description: 'The body to attach the shape to' },
+              shape: { type: 'string', enum: ['rectangle', 'circle', 'capsule'] },
+              size: { type: 'array', description: '[w,h] for rectangle' },
+              radius: { type: 'number' },
+              height: { type: 'number' },
+              position: { type: 'array', description: '[x,y] offset' },
+              name: { type: 'string' },
+            },
+            required: ['projectPath', 'scenePath', 'parentPath'],
+          },
+        },
+        {
+          name: 'set_camera_limits',
+          description: 'Set Camera2D limits (clamp the view to the map so it never scrolls past the edge). Creates the Camera2D if absent.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: { type: 'string' },
+              scenePath: { type: 'string' },
+              cameraPath: { type: 'string' },
+              cameraParent: { type: 'string', description: 'where to create the Camera2D if none (default root)' },
+              limits: { type: 'object', description: '{ left, top, right, bottom }' },
+              smoothing: { type: 'number', description: 'position smoothing speed (optional)' },
+            },
+            required: ['projectPath', 'scenePath'],
+          },
+        },
+        {
+          name: 'connect_signal',
+          description: 'Persistently connect a signal into the scene (serialized to the .tscn) — wire nodes, do not hand-poll.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: { type: 'string' },
+              scenePath: { type: 'string' },
+              fromPath: { type: 'string', description: 'node emitting the signal' },
+              signal: { type: 'string' },
+              toPath: { type: 'string', description: 'node with the handler method' },
+              method: { type: 'string' },
+            },
+            required: ['projectPath', 'scenePath', 'fromPath', 'signal', 'toPath', 'method'],
+          },
+        },
+        {
+          name: 'add_animated_sprite',
+          description: 'Add an AnimatedSprite2D + SpriteFrames built from a sprite-sheet grid — real frame animation from an atlas.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: { type: 'string' },
+              scenePath: { type: 'string' },
+              parentPath: { type: 'string' },
+              texture: { type: 'string', description: 'res:// path to the sprite sheet' },
+              frameWidth: { type: 'number' },
+              frameHeight: { type: 'number' },
+              animations: { type: 'array', description: '[{ name, frames: [frameIndex,...], fps?, loop? }]' },
+              autoplay: { type: 'string' },
+              name: { type: 'string' },
+            },
+            required: ['projectPath', 'scenePath', 'parentPath', 'texture'],
+          },
+        },
+        {
+          name: 'paint_tilemap',
+          description: 'Add a TileMapLayer with a TileSet built from an atlas texture, and paint cells. Use for levels instead of hand-placing sprites.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: { type: 'string' },
+              scenePath: { type: 'string' },
+              parentPath: { type: 'string' },
+              texture: { type: 'string', description: 'res:// path to the tileset atlas' },
+              tileSize: { type: 'number' },
+              cells: { type: 'array', description: '[{ x, y, atlasX, atlasY }]' },
+              name: { type: 'string' },
+            },
+            required: ['projectPath', 'scenePath', 'parentPath', 'texture'],
+          },
+        },
+        {
+          name: 'add_area2d',
+          description: 'Add an Area2D + nested CollisionShape2D — hitboxes, hurtboxes, triggers, pickups (with collision layer/mask).',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: { type: 'string' },
+              scenePath: { type: 'string' },
+              parentPath: { type: 'string' },
+              shape: { type: 'string', enum: ['rectangle', 'circle', 'capsule'] },
+              size: { type: 'array' },
+              radius: { type: 'number' },
+              height: { type: 'number' },
+              position: { type: 'array' },
+              collisionLayer: { type: 'number' },
+              collisionMask: { type: 'number' },
+              name: { type: 'string' },
+            },
+            required: ['projectPath', 'scenePath', 'parentPath'],
+          },
+        },
+        {
+          name: 'add_particles',
+          description: 'Add a GPUParticles2D + ParticleProcessMaterial — cheap juice (bursts, trails, dust).',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: { type: 'string' },
+              scenePath: { type: 'string' },
+              parentPath: { type: 'string' },
+              amount: { type: 'number' },
+              lifetime: { type: 'number' },
+              texture: { type: 'string' },
+              gravity: { type: 'number' },
+              spread: { type: 'number' },
+              velocity: { type: 'number' },
+              oneShot: { type: 'boolean' },
+              explosiveness: { type: 'number' },
+              name: { type: 'string' },
+            },
+            required: ['projectPath', 'scenePath', 'parentPath'],
+          },
+        },
+        {
+          name: 'attach_script',
+          description: 'Attach an existing GDScript (write the .gd first) to a node — this is where game behavior lives.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: { type: 'string' },
+              scenePath: { type: 'string' },
+              nodePath: { type: 'string', description: 'e.g. "root" or "root/Player"' },
+              scriptPath: { type: 'string', description: 'res:// path to the .gd file' },
+            },
+            required: ['projectPath', 'scenePath', 'nodePath', 'scriptPath'],
+          },
+        },
+        {
+          name: 'set_node_property',
+          description: 'Set properties on an existing node (res:// values are loaded as resources).',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: { type: 'string' },
+              scenePath: { type: 'string' },
+              nodePath: { type: 'string' },
+              properties: { type: 'object' },
+            },
+            required: ['projectPath', 'scenePath', 'nodePath', 'properties'],
+          },
+        },
+        {
+          name: 'remove_node',
+          description: 'Remove a node from a scene.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: { type: 'string' },
+              scenePath: { type: 'string' },
+              nodePath: { type: 'string' },
+            },
+            required: ['projectPath', 'scenePath', 'nodePath'],
+          },
+        },
+        {
+          name: 'instance_scene',
+          description: 'Instance a sub-scene (a PackedScene / prefab .tscn) as a child — the Godot way to compose (e.g. drop a Player prefab into a Level).',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: { type: 'string' },
+              scenePath: { type: 'string', description: 'the parent scene to add into' },
+              subScene: { type: 'string', description: 'res:// path to the .tscn to instance' },
+              parentPath: { type: 'string' },
+              name: { type: 'string' },
+              position: { type: 'array', description: '[x,y]' },
+            },
+            required: ['projectPath', 'scenePath', 'subScene'],
+          },
+        },
+        {
+          name: 'get_scene_tree',
+          description: 'Print a scene\'s node tree (name : type, + [script] markers) — inspect what exists before editing.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: { type: 'string' },
+              scenePath: { type: 'string' },
+            },
+            required: ['projectPath', 'scenePath'],
+          },
+        },
+        {
+          name: 'add_input_action',
+          description: 'Define an InputMap action in project.godot (so Input.is_action_pressed works). Fixes the "verb bound to nothing" bug — declare move/jump/attack here.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: { type: 'string' },
+              action: { type: 'string', description: 'action name, e.g. "jump"' },
+              events: { type: 'array', description: '[{type:"key", key:"Z"} | {type:"joy_button", button:0} | {type:"mouse_button", button:1}]' },
+              deadzone: { type: 'number' },
+            },
+            required: ['projectPath', 'action'],
+          },
+        },
+        {
+          name: 'set_project_setting',
+          description: 'Set project.godot settings — main scene (application/run/main_scene), window size, stretch mode, physics tick, etc. Run this so the game actually launches at a modern resolution.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: { type: 'string' },
+              settings: { type: 'object', description: '{ "application/run/main_scene":"res://main.tscn", "display/window/size/viewport_width":1280, ... }' },
+            },
+            required: ['projectPath', 'settings'],
           },
         },
         {
@@ -934,6 +1349,8 @@ class GodotServer {
           return await this.handleLaunchEditor(request.params.arguments);
         case 'run_project':
           return await this.handleRunProject(request.params.arguments);
+        case 'capture_level_overview':
+          return await this.handleCaptureLevelOverview(request.params.arguments);
         case 'get_debug_output':
           return await this.handleGetDebugOutput();
         case 'stop_project':
@@ -948,6 +1365,39 @@ class GodotServer {
           return await this.handleCreateScene(request.params.arguments);
         case 'add_node':
           return await this.handleAddNode(request.params.arguments);
+        case 'add_animation':
+          return await this.handleAuthoringOp('add_animation', request.params.arguments, ['animationName']);
+        case 'add_collision_shape':
+          return await this.handleAuthoringOp('add_collision_shape', request.params.arguments, ['parentPath']);
+        case 'set_camera_limits':
+          return await this.handleAuthoringOp('set_camera_limits', request.params.arguments, []);
+        case 'connect_signal':
+          return await this.handleAuthoringOp('connect_signal', request.params.arguments, ['fromPath', 'signal', 'toPath', 'method']);
+        case 'add_animated_sprite':
+          return await this.handleAuthoringOp('add_animated_sprite', request.params.arguments, ['parentPath', 'texture']);
+        case 'paint_tilemap':
+          return await this.handleAuthoringOp('paint_tilemap', request.params.arguments, ['parentPath', 'texture']);
+        case 'batch_author':
+          return await this.handleAuthoringOp('batch_author', request.params.arguments, ['ops']);
+        case 'add_area2d':
+          return await this.handleAuthoringOp('add_area2d', request.params.arguments, ['parentPath']);
+        case 'add_particles':
+          return await this.handleAuthoringOp('add_particles', request.params.arguments, ['parentPath']);
+        case 'attach_script':
+          return await this.handleAuthoringOp('attach_script', request.params.arguments, ['nodePath', 'scriptPath']);
+        case 'set_node_property':
+          return await this.handleAuthoringOp('set_node_property', request.params.arguments, ['nodePath', 'properties']);
+        case 'remove_node':
+          return await this.handleAuthoringOp('remove_node', request.params.arguments, ['nodePath']);
+        case 'instance_scene':
+          return await this.handleAuthoringOp('instance_scene', request.params.arguments, ['subScene']);
+        case 'get_scene_tree':
+          // returns the tree on stdout, not a TCP ack — must stay spawn-per-op
+          return await this.handleAuthoringOp('get_scene_tree', request.params.arguments, [], true, false);
+        case 'add_input_action':
+          return await this.handleAuthoringOp('add_input_action', request.params.arguments, ['action'], false);
+        case 'set_project_setting':
+          return await this.handleAuthoringOp('set_project_setting', request.params.arguments, ['settings'], false);
         case 'load_sprite':
           return await this.handleLoadSprite(request.params.arguments);
         case 'export_mesh_library':
@@ -1087,7 +1537,13 @@ class GodotServer {
         this.activeProcess.process.kill();
       }
 
-      const cmdArgs = ['-d', '--path', args.projectPath];
+      // Reduce cross-instance contention when multiple teams/subagents run Godot at
+      // once: silence audio (avoid the shared audio device) and spread the window so
+      // concurrent instances don't perfectly overlap. Keep a real (non-headless)
+      // render so rendering bugs are still visible — headless uses the dummy renderer.
+      const px = 40 + Math.floor(Math.random() * 400);
+      const py = 40 + Math.floor(Math.random() * 200);
+      const cmdArgs = ['-d', '--path', args.projectPath, '--audio-driver', 'Dummy', '--position', `${px},${py}`];
       if (args.scene && this.validatePath(args.scene)) {
         this.logDebug(`Adding scene parameter: ${args.scene}`);
         cmdArgs.push(args.scene);
@@ -1152,17 +1608,177 @@ class GodotServer {
   }
 
   /**
+   * Handle the capture_level_overview tool — render the WHOLE level (the
+   * "level-designer's view"), not the in-game camera. We generate a tiny throwaway
+   * capture scene into the project that: instances the target scene, computes the
+   * level's world AABB (authored Camera2D limits if present, else the union of
+   * TileMapLayer/Sprite2D extents), frames an orthographic Camera2D to fit, and grabs
+   * exactly one REAL (non-headless) rendered frame to a PNG. Headless is useless here —
+   * the dummy renderer produces blank frames — so this runs with the real renderer,
+   * same as run_project. Temp files are cleaned up afterwards.
+   */
+  private async handleCaptureLevelOverview(args: any) {
+    if (!args || !args.projectPath) {
+      return this.createErrorResponse('Project path is required', ['Provide a valid path to a Godot project directory']);
+    }
+    if (!this.validatePath(args.projectPath)) {
+      return this.createErrorResponse('Invalid project path', ['Provide a valid path without ".." or other potentially unsafe characters']);
+    }
+    if (!args.scene) {
+      return this.createErrorResponse('scene is required', ['Provide the .tscn to capture, e.g. "res://levels/level1.tscn"']);
+    }
+    const projectFile = join(args.projectPath, 'project.godot');
+    if (!existsSync(projectFile)) {
+      return this.createErrorResponse(`Not a valid Godot project: ${args.projectPath}`, [
+        'Ensure the path points to a directory containing a project.godot file',
+      ]);
+    }
+
+    if (!this.godotPath) {
+      await this.detectGodotPath();
+      if (!this.godotPath) {
+        return this.createErrorResponse('Could not find a Godot executable', ['Set GODOT_PATH to your Godot binary']);
+      }
+    }
+
+    // Normalise the scene to a res:// path.
+    let resScene: string = String(args.scene);
+    if (!resScene.startsWith('res://')) resScene = 'res://' + resScene.replace(/^\/+/, '');
+
+    // Output PNG — default into the studio shot convention.
+    let outPath: string = args.outputPath ? String(args.outputPath) : join(args.projectPath, '.studio', 'shots', 'level-overview.png');
+    if (!isAbsolute(outPath)) outPath = join(args.projectPath, outPath);
+    try {
+      mkdirSync(dirname(outPath), { recursive: true });
+    } catch {}
+
+    const maxW = Math.min(Math.max(parseInt(String(args.maxWidth ?? 1920), 10) || 1920, 128), 4096);
+    const maxH = Math.min(Math.max(parseInt(String(args.maxHeight ?? 1080), 10) || 1080, 128), 4096);
+    const pad = Math.min(Math.max(Number(args.padding ?? 0.06) || 0.06, 0), 0.5);
+
+    // Throwaway capture scene + script written into the project (so res:// resolves).
+    const stamp = Date.now().toString(36);
+    const gdName = `__leon_capture_${stamp}.gd`;
+    const tscnName = `__leon_capture_${stamp}.tscn`;
+    const gdAbs = join(args.projectPath, gdName);
+    const tscnAbs = join(args.projectPath, tscnName);
+    const gdSource = GodotServer.CAPTURE_GD
+      .replace(/__TARGET__/g, resScene)
+      .replace(/__OUT__/g, outPath.replace(/\\/g, '/'))
+      .replace(/__MAXW__/g, String(maxW))
+      .replace(/__MAXH__/g, String(maxH))
+      .replace(/__PAD__/g, String(pad));
+    const tscnSource =
+      `[gd_scene load_steps=2 format=3]\n\n` +
+      `[ext_resource type="Script" path="res://${gdName}" id="1_cap"]\n\n` +
+      `[node name="LeonCapture" type="Node2D"]\n` +
+      `script = ExtResource("1_cap")\n`;
+
+    const cleanup = () => {
+      for (const f of [gdAbs, tscnAbs, `${gdAbs}.uid`, `${tscnAbs}.uid`, `${gdAbs}.import`, `${tscnAbs}.import`]) {
+        try { unlinkSync(f); } catch {}
+      }
+    };
+
+    try {
+      writeFileSync(gdAbs, gdSource, 'utf8');
+      writeFileSync(tscnAbs, tscnSource, 'utf8');
+
+      // Kill any of OUR older capture/run before spawning (avoid piling up windows).
+      if (this.activeProcess) {
+        try { this.activeProcess.process.kill(); } catch {}
+        this.activeProcess = null;
+      }
+
+      const px = 40 + Math.floor(Math.random() * 400);
+      const py = 40 + Math.floor(Math.random() * 200);
+      const cmdArgs = ['-d', '--path', args.projectPath, '--audio-driver', 'Dummy', '--position', `${px},${py}`, `res://${tscnName}`];
+      this.logDebug(`Capturing level overview: ${resScene} -> ${outPath}`);
+
+      const result = await new Promise<{ code: number | null; out: string; err: string; timedOut: boolean }>((resolve) => {
+        const proc = spawn(this.godotPath!, cmdArgs, { stdio: 'pipe' });
+        let out = '';
+        let err = '';
+        let timedOut = false;
+        const timer = setTimeout(() => {
+          timedOut = true;
+          try { proc.kill('SIGKILL'); } catch {}
+        }, 60000);
+        proc.stdout?.on('data', (d: Buffer) => { out += d.toString(); });
+        proc.stderr?.on('data', (d: Buffer) => { err += d.toString(); });
+        proc.on('exit', (code: number | null) => { clearTimeout(timer); resolve({ code, out, err, timedOut }); });
+        proc.on('error', (e: Error) => { clearTimeout(timer); resolve({ code: -1, out, err: `${err}\n${e.message}`, timedOut }); });
+      });
+
+      const produced = existsSync(outPath);
+      const doneLine = (result.out.split('\n').find((l) => l.includes('LEON_CAPTURE_DONE')) || '').trim();
+
+      if (!produced) {
+        const tail = (result.err || result.out).split('\n').filter(Boolean).slice(-12).join('\n');
+        return this.createErrorResponse(
+          `Level overview capture produced no PNG${result.timedOut ? ' (timed out after 60s)' : ` (exit ${result.code})`}`,
+          [
+            'Confirm the scene path is correct and the scene loads standalone',
+            'The scene needs some visible TileMapLayer/Sprite2D content (or a Camera2D with limits) to frame',
+            'A real display/renderer is required — headless produces blank frames',
+            tail ? `Godot said:\n${tail}` : 'No output captured from Godot',
+          ]
+        );
+      }
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(
+              {
+                savedTo: outPath,
+                scene: resScene,
+                detail: doneLine || `captured (exit ${result.code})`,
+                note: 'Whole-level overview (level-designer view), not the in-game camera. Read the PNG and judge it like an art director.',
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    } catch (error: unknown) {
+      const msg = error instanceof Error ? error.message : 'Unknown error';
+      return this.createErrorResponse(`Failed to capture level overview: ${msg}`, [
+        'Ensure Godot is installed and GODOT_PATH is correct',
+        'Verify the project path and scene are accessible',
+      ]);
+    } finally {
+      cleanup();
+    }
+  }
+
+  /**
    * Handle the get_debug_output tool
    */
   private async handleGetDebugOutput() {
+    // Return GRACEFULLY (not an error) when there's no active process. An error
+    // tool_result here surfaces to the Agent SDK as `error_during_execution` and
+    // KILLS the whole session — especially under concurrency, when another run
+    // replaced/killed this one. A benign "no active process" is safe.
     if (!this.activeProcess) {
-      return this.createErrorResponse(
-        'No active Godot process.',
-        [
-          'Use run_project to start a Godot project first',
-          'Check if the Godot process crashed unexpectedly',
-        ]
-      );
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(
+              {
+                output: [],
+                errors: [],
+                note: 'No active Godot process — it may have finished, been stopped, or been replaced by another run (concurrency). Use run_project to start one.',
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
     }
 
     return {
@@ -1186,14 +1802,11 @@ class GodotServer {
    * Handle the stop_project tool
    */
   private async handleStopProject() {
+    // Graceful (not an error) — see handleGetDebugOutput: an error here can kill the session.
     if (!this.activeProcess) {
-      return this.createErrorResponse(
-        'No active Godot process to stop.',
-        [
-          'Use run_project to start a Godot project first',
-          'The process may have already terminated',
-        ]
-      );
+      return {
+        content: [{ type: 'text', text: 'No active Godot process to stop (already stopped, exited, or replaced by another run).' }],
+      };
     }
 
     this.logDebug('Stopping active Godot process');
@@ -1561,6 +2174,78 @@ class GodotServer {
   /**
    * Handle the add_node tool
    */
+  // Generic handler for the headless AUTHORING-LAYER ops (animation, collision,
+  // camera limits, signals, animated sprites, tilemaps, areas, particles). Each
+  // validates the project + scene, then drives godot_operations.gd via executeOperation.
+  private async handleAuthoringOp(operation: string, args: any, required: string[], needsScene = true, residentOk = true) {
+    args = this.normalizeParameters(args);
+    const need = ['projectPath', ...(needsScene ? ['scenePath'] : []), ...required];
+    for (const key of need) {
+      if (args[key] === undefined || args[key] === null || args[key] === '') {
+        return this.createErrorResponse(`Missing required parameter: ${key}`, [
+          `Provide: ${need.join(', ')}`,
+        ]);
+      }
+    }
+    if (!this.validatePath(args.projectPath) || (needsScene && !this.validatePath(args.scenePath))) {
+      return this.createErrorResponse('Invalid path', [
+        'Provide valid paths without ".." or other unsafe characters',
+      ]);
+    }
+    if (!existsSync(join(args.projectPath, 'project.godot'))) {
+      return this.createErrorResponse(`Not a valid Godot project: ${args.projectPath}`, [
+        'The path must contain a project.godot file',
+      ]);
+    }
+    if (needsScene && !existsSync(join(args.projectPath, args.scenePath))) {
+      return this.createErrorResponse(`Scene file does not exist: ${args.scenePath}`, [
+        'Create it with create_scene first',
+      ]);
+    }
+    const params: any = { ...args };
+    delete params.projectPath;
+
+    // Prefer the warm resident when enabled. It's a pure accelerator: on success we return;
+    // on an INFRA failure (resident died/unavailable — which also covers a handler that
+    // crashed the process BEFORE its save, so nothing persisted) we transparently fall
+    // through to spawn-per-op, which re-runs cleanly and reports the real error. A resident
+    // TIMEOUT is NOT retried (the op may have run), it's surfaced as an error.
+    if (this.opServer && residentOk && needsScene) {
+      const rr = await this.opServer
+        .call(args.projectPath, operation, params)
+        .catch((e: unknown) => ({ ok: false, error: String((e as Error)?.message ?? e), stdout: '' }));
+      if (rr.ok) {
+        return { content: [{ type: 'text', text: `${operation} completed (resident).\n${rr.stdout}`.trim() }] };
+      }
+      const err = rr.error ?? '';
+      const infraFailure = /resident died|not available|ready|become ready|process exited|no Godot|socket closed/.test(err);
+      if (!infraFailure) {
+        return this.createErrorResponse(
+          `${operation} failed: ${err || 'resident error'}`,
+          [
+            'Check the node paths (parentPath/fromPath/toPath) exist in the scene',
+            'Verify any referenced texture path is a res:// resource',
+            rr.stdout ? `Resident output:\n${rr.stdout.slice(-400)}` : '',
+          ].filter(Boolean),
+        );
+      }
+      // infra failure — fall through to the spawn-per-op path below
+    }
+
+    try {
+      const { stdout, stderr } = await this.executeOperation(operation, params, args.projectPath);
+      if (stderr && /Failed to|not found|does not exist|has no signal/.test(stderr)) {
+        return this.createErrorResponse(`${operation} failed: ${stderr.trim().slice(-400)}`, [
+          'Check the node paths (parentPath/fromPath/toPath) exist in the scene',
+          'Verify any referenced texture path is a res:// resource',
+        ]);
+      }
+      return { content: [{ type: 'text', text: `${operation} completed.\n${stdout}`.trim() }] };
+    } catch (e: any) {
+      return this.createErrorResponse(`${operation} error: ${e?.message ?? String(e)}`, []);
+    }
+  }
+
   private async handleAddNode(args: any) {
     // Normalize parameters to camelCase
     args = this.normalizeParameters(args);
