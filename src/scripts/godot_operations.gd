@@ -522,6 +522,29 @@ func add_node(params):
                 value = load(value)
                 if debug_mode:
                     print("Loaded resource for property: " + property + " -> " + str(value))
+            # JSON-typed values (Arrays, floats) must be converted to the
+            # property's declared type, or Object.set() silently drops them.
+            var expected_type: int = TYPE_NIL
+            for prop_info in new_node.get_property_list():
+                if prop_info["name"] == property:
+                    expected_type = prop_info["type"]
+                    break
+            if expected_type == TYPE_NIL:
+                printerr("Warning: property '" + str(property) + "' is not listed on " + str(params.node_type) + "; set() may silently fail")
+            if value is Array and not value.is_empty():
+                if expected_type == TYPE_VECTOR2 and value.size() >= 2:
+                    value = Vector2(value[0], value[1])
+                elif expected_type == TYPE_VECTOR3 and value.size() >= 3:
+                    value = Vector3(value[0], value[1], value[2])
+                elif expected_type == TYPE_VECTOR4 and value.size() >= 4:
+                    value = Vector4(value[0], value[1], value[2], value[3])
+                elif expected_type == TYPE_QUATERNION and value.size() >= 4:
+                    value = Quaternion(value[0], value[1], value[2], value[3])
+                elif expected_type == TYPE_COLOR and value.size() >= 3:
+                    var alpha: float = value[3] if value.size() > 3 else 1.0
+                    value = Color(value[0], value[1], value[2], alpha)
+            elif typeof(value) == TYPE_FLOAT and expected_type == TYPE_INT:
+                value = int(value)
             new_node.set(property, value)
     
     parent.add_child(new_node)
