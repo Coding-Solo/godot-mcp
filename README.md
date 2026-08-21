@@ -216,6 +216,74 @@ Then point your MCP client to `build/index.js` instead of using `npx`.
 </details>
 
 
+## Live game control (fork addition)
+
+This fork adds three tools that talk to a *running* project — `screenshot`,
+`send_input` and `get_game_state` — so an assistant can actually play the game
+it is editing instead of only launching it.
+
+### Setup
+
+Copy [`examples/debug_remote.gd`](examples/debug_remote.gd) into your project
+(e.g. `scripts/debug_remote.gd`) and register it as an autoload:
+
+```ini
+[autoload]
+
+DebugRemote="*res://scripts/debug_remote.gd"
+```
+
+The autoload opens a newline-delimited JSON socket on `127.0.0.1:8765`. It is
+**debug-only** (`OS.is_debug_build()`) and **localhost-only**, so an exported
+release build never listens. Set `GODOT_REMOTE_INPUT=0` to disable it even in a
+debug build, `GODOT_REMOTE_INPUT_PORT` to move it, and
+`GODOT_DEBUG_BRIDGE_PORT` on the MCP server side to match.
+
+Start the game with `run_project` (or from the editor) before using the tools.
+
+### `screenshot`
+
+Captures the game's framebuffer from inside Godot and returns it as an image
+plus a saved PNG.
+
+| Parameter | Description |
+| --- | --- |
+| `outputPath` | Absolute path for the PNG (default: a temp file) |
+| `maxWidth` | Downscale width in pixels, default 1280, `0` keeps full size |
+
+Capturing inside the engine rather than grabbing the OS window means it works
+while the window is occluded or in the background, and avoids DPI scaling and
+the black-frame problem that affects `PrintWindow` on GPU-composited
+(D3D12/Vulkan) windows.
+
+### `send_input`
+
+| Parameter | Description |
+| --- | --- |
+| `event` | `tap` (default), `press`, `release`, `release_all`, `click` |
+| `action` | Input action name, e.g. `accelerate` |
+| `durationMs` | Hold time for `tap`, default 120, max 10000 |
+| `strength` | Analog strength 0–1 for `press`/`tap`, default 1 |
+| `path` / `text` | For `click`: the Button's node path, or its visible label |
+
+Each action is delivered both as an `InputEventAction` (so `_input` and
+`_unhandled_input` handlers fire) and via `Input.action_press()` (so polled
+`Input.is_action_pressed()` / `get_action_strength()` reads see it).
+
+Prefer `tap`: a bare `press` stays held until an explicit `release`. Held
+actions are released automatically if the MCP server disconnects, so a crashed
+client cannot leave the throttle stuck down.
+
+### `get_game_state`
+
+Returns the current scene, pause state, held actions, FPS, window size, and
+every visible label and button with its node path. When the current scene
+exposes `state`, `elapsed` and `ball`, level timing and player physics are
+included too — adapt `_state()` in `debug_remote.gd` to your own scene API.
+
+It is far cheaper than a screenshot and gives exact numbers, so reach for it
+first and use `screenshot` when you need to see what something looks like.
+
 ## Architecture
 
 The Godot MCP server uses a bundled GDScript approach for complex operations:

@@ -22,6 +22,9 @@ import {
   McpError,
 } from '@modelcontextprotocol/sdk/types.js';
 
+import { BridgeError, DebugBridge, DEFAULT_BRIDGE_PORT } from './debug_bridge.js';
+import { captureScreenshot, getGameState, sendInput } from './game_tools.js';
+
 // Check if debug mode is enabled
 const DEBUG_MODE: boolean = process.env.DEBUG === 'true';
 const GODOT_DEBUG_MODE: boolean = true; // Always use GODOT DEBUG MODE
@@ -64,6 +67,7 @@ interface OperationParams {
 class GodotServer {
   private server: Server;
   private activeProcess: GodotProcess | null = null;
+  private debugBridge: DebugBridge | null = null;
   private godotPath: string | null = null;
   private operationsScriptPath: string;
   private validatedPaths: Map<string, boolean> = new Map();
@@ -389,10 +393,43 @@ class GodotServer {
   }
 
   /**
+   * Run a tool against the in-game debug bridge, turning bridge failures into
+   * the server's normal error responses.
+   *
+   * The connection is created lazily and then kept open: the bridge releases
+   * every held input action when its client disconnects, so reconnecting per
+   * call would make 'press' useless.
+   */
+  private async withDebugBridge(handler: (bridge: DebugBridge) => Promise<any>): Promise<any> {
+    if (!this.debugBridge) {
+      const configured = Number(process.env.GODOT_DEBUG_BRIDGE_PORT);
+      const port = Number.isFinite(configured) && configured > 0 ? configured : DEFAULT_BRIDGE_PORT;
+      this.logDebug(`Creating debug bridge client for 127.0.0.1:${port}`);
+      this.debugBridge = new DebugBridge('127.0.0.1', port);
+    }
+
+    try {
+      return await handler(this.debugBridge);
+    } catch (error) {
+      if (error instanceof BridgeError) {
+        return this.createErrorResponse(error.message, error.hints);
+      }
+      return this.createErrorResponse(
+        `Debug bridge failure: ${error instanceof Error ? error.message : String(error)}`,
+        ['Confirm the project is running with run_project']
+      );
+    }
+  }
+
+  /**
    * Clean up resources when shutting down
    */
   private async cleanup() {
     this.logDebug('Cleaning up resources');
+    if (this.debugBridge) {
+      this.debugBridge.close();
+      this.debugBridge = null;
+    }
     if (this.activeProcess) {
       this.logDebug('Killing active Godot process');
       this.activeProcess.process.kill();
@@ -923,6 +960,72 @@ class GodotServer {
             required: ['projectPath'],
           },
         },
+        {
+          name: 'screenshot',
+          description:
+            "Capture the running Godot game's framebuffer as a PNG. Requires the project to be running in debug mode with the debug_remote.gd autoload. Works even when the game window is behind other windows.",
+          inputSchema: {
+            type: 'object',
+            properties: {
+              outputPath: {
+                type: 'string',
+                description: 'Optional: absolute path for the PNG (defaults to a temp file)',
+              },
+              maxWidth: {
+                type: 'number',
+                description: 'Optional: downscale the capture to this width in pixels (default 1280, 0 keeps full size)',
+              },
+            },
+            required: [],
+          },
+        },
+        {
+          name: 'send_input',
+          description:
+            "Drive the running Godot game's input remotely: hold, release or tap an input action, release everything, or press an on-screen Button. Requires the debug_remote.gd autoload.",
+          inputSchema: {
+            type: 'object',
+            properties: {
+              event: {
+                type: 'string',
+                enum: ['tap', 'press', 'release', 'release_all', 'click'],
+                description:
+                  "What to do: 'tap' holds an action for durationMs then releases it (default), 'press'/'release' are manual, 'release_all' clears every held action, 'click' presses an on-screen Button",
+              },
+              action: {
+                type: 'string',
+                description: "Input action name, e.g. 'accelerate' or 'steer_left' (required except for release_all and click)",
+              },
+              durationMs: {
+                type: 'number',
+                description: 'Optional: hold time for tap, in milliseconds (default 120, max 10000)',
+              },
+              strength: {
+                type: 'number',
+                description: 'Optional: analog strength from 0 to 1 for press and tap (default 1)',
+              },
+              path: {
+                type: 'string',
+                description: "For click: the Button's node path, as reported by get_game_state",
+              },
+              text: {
+                type: 'string',
+                description: 'For click: the visible label of the Button, used when no path is given',
+              },
+            },
+            required: [],
+          },
+        },
+        {
+          name: 'get_game_state',
+          description:
+            'Read structured state from the running Godot game: current scene, pause state, held input actions, visible labels and buttons, plus level timing and player physics when the scene exposes them. Cheaper and more precise than a screenshot.',
+          inputSchema: {
+            type: 'object',
+            properties: {},
+            required: [],
+          },
+        },
       ],
     }));
 
@@ -958,6 +1061,12 @@ class GodotServer {
           return await this.handleGetUid(request.params.arguments);
         case 'update_project_uids':
           return await this.handleUpdateProjectUids(request.params.arguments);
+        case 'screenshot':
+          return await this.withDebugBridge((bridge) => captureScreenshot(bridge, request.params.arguments));
+        case 'send_input':
+          return await this.withDebugBridge((bridge) => sendInput(bridge, request.params.arguments));
+        case 'get_game_state':
+          return await this.withDebugBridge((bridge) => getGameState(bridge));
         default:
           throw new McpError(
             ErrorCode.MethodNotFound,
