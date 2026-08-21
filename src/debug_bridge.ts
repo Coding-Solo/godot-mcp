@@ -35,6 +35,8 @@ export class BridgeError extends Error {
 export class DebugBridge {
   private socket: net.Socket | null = null;
   private connecting: Promise<net.Socket> | null = null;
+  private abortConnect: ((error: Error) => void) | null = null;
+  private closed = false;
   private buffer = '';
   private pending = new Map<string, PendingRequest>();
   private nextId = 1;
@@ -83,10 +85,14 @@ export class DebugBridge {
   }
 
   close(): void {
+    this.closed = true;
     this.teardown(new BridgeError('The debug bridge client was closed'));
   }
 
   private async connect(): Promise<net.Socket> {
+    if (this.closed) {
+      throw new BridgeError('The debug bridge client was closed');
+    }
     if (this.socket && !this.socket.destroyed) {
       return this.socket;
     }
@@ -94,25 +100,43 @@ export class DebugBridge {
       return this.connecting;
     }
 
+    const unreachable = (detail: string) =>
+      new BridgeError(`Cannot reach the game's debug bridge at ${this.host}:${this.port} (${detail})`, [
+        'Start the project with run_project first',
+        'Ensure scripts/debug_remote.gd is registered as an autoload in project.godot',
+        'The bridge only listens in debug builds, and not when GODOT_REMOTE_INPUT=0',
+      ]);
+
     const attempt = new Promise<net.Socket>((resolve, reject) => {
       const socket = net.connect({ host: this.host, port: this.port });
       socket.setEncoding('utf8');
       socket.setNoDelay(true);
 
-      const onConnectError = (error: NodeJS.ErrnoException) => {
+      const fail = (error: Error) => {
         socket.destroy();
-        reject(
-          new BridgeError(`Cannot reach the game's debug bridge at ${this.host}:${this.port} (${error.code ?? error.message})`, [
-            'Start the project with run_project first',
-            'Ensure scripts/debug_remote.gd is registered as an autoload in project.godot',
-            'The bridge only listens in debug builds, and not when GODOT_REMOTE_INPUT=0',
-          ])
-        );
+        reject(error);
       };
+      // Lets close() abandon an attempt that is still in flight.
+      this.abortConnect = fail;
 
+      const onConnectError = (error: NodeJS.ErrnoException) => fail(unreachable(error.code ?? error.message));
+      // The per-request timeout only starts once the socket is up, so
+      // without this a host that neither accepts nor refuses the connection
+      // (a firewall drop) would hang the tool call indefinitely.
+      const onConnectTimeout = () => fail(unreachable(`no response within ${this.timeoutMs}ms`));
+
+      socket.setTimeout(this.timeoutMs, onConnectTimeout);
       socket.once('error', onConnectError);
       socket.once('connect', () => {
+        socket.setTimeout(0);
         socket.off('error', onConnectError);
+        socket.off('timeout', onConnectTimeout);
+        this.abortConnect = null;
+        if (this.closed) {
+          socket.destroy();
+          reject(new BridgeError('The debug bridge client was closed'));
+          return;
+        }
         socket.on('error', (error) => this.teardown(new BridgeError(`Debug bridge error: ${error.message}`)));
         socket.on('close', () => this.teardown(new BridgeError('The game closed the debug bridge connection')));
         socket.on('data', (chunk: string) => this.onData(chunk));
@@ -127,6 +151,7 @@ export class DebugBridge {
       return await attempt;
     } finally {
       this.connecting = null;
+      this.abortConnect = null;
     }
   }
 
@@ -169,7 +194,17 @@ export class DebugBridge {
     this.buffer = '';
     if (socket) {
       socket.removeAllListeners();
+      // destroy() can still emit 'error'; with every listener gone that
+      // would be an unhandled 'error' event, taking the MCP server down.
+      socket.on('error', () => {});
       socket.destroy();
+    }
+    // An attempt still in flight has to go too, or close() gets undone by a
+    // socket that finishes connecting afterwards and keeps the process alive.
+    const abortConnect = this.abortConnect;
+    this.abortConnect = null;
+    if (abortConnect) {
+      abortConnect(error);
     }
     for (const [id] of this.pending) {
       this.settle(id, undefined, error);

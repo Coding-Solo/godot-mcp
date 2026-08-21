@@ -14,13 +14,20 @@ const DEFAULT_PORT := 8765
 const BIND_ADDRESS := "127.0.0.1"
 const MAX_BUFFER_BYTES := 65536
 const LEVEL_STATE_NAMES := ["READY", "RUNNING", "FINISHED"]
+const NEWLINE_BYTE := 10
+## Longer than any handler can legitimately take: a tap is capped at 10 s.
+const PUMP_STALL_MSEC := 30000
 
 var _server: TCPServer = null
 var _peer: StreamPeerTCP = null
-var _rx := ""
+var _rx := PackedByteArray()
 var _queue: Array[String] = []
 var _held: Dictionary = {}
 var _pumping := false
+var _pump_deadline_msec := 0
+## Bumped on every peer change, so a reply from a handler that started
+## under an earlier connection can be recognised as stale and dropped.
+var _peer_generation := 0
 
 
 func _ready() -> void:
@@ -63,7 +70,8 @@ func _process(_delta: float) -> void:
 		var incoming := _server.take_connection()
 		_drop_peer()
 		_peer = incoming
-		_rx = ""
+		_peer_generation += 1
+		_rx = PackedByteArray()
 		_queue.clear()
 
 	if _peer == null:
@@ -74,20 +82,34 @@ func _process(_delta: float) -> void:
 		_drop_peer()
 		return
 
+	# Buffered as raw bytes rather than as a String: a multi-byte UTF-8
+	# character can straddle two TCP reads, and get_utf8_string() on a
+	# truncated sequence returns an empty string, swallowing the command.
 	var available := _peer.get_available_bytes()
 	if available > 0:
-		_rx += _peer.get_utf8_string(available)
-		if _rx.length() > MAX_BUFFER_BYTES:
+		var chunk: Array = _peer.get_data(available)
+		if int(chunk[0]) == OK:
+			_rx.append_array(chunk[1] as PackedByteArray)
+		if _rx.size() > MAX_BUFFER_BYTES:
 			push_warning("debug_remote: oversized request, dropping client")
 			_drop_peer()
 			return
 
-	while _rx.contains("\n"):
-		var cut := _rx.find("\n")
-		var line := _rx.substr(0, cut).strip_edges()
-		_rx = _rx.substr(cut + 1)
+	while true:
+		var cut := _rx.find(NEWLINE_BYTE)
+		if cut < 0:
+			break
+		var line := _rx.slice(0, cut).get_string_from_utf8().strip_edges()
+		_rx = _rx.slice(cut + 1)
 		if not line.is_empty():
 			_queue.append(line)
+
+	# A GDScript runtime error inside a handler aborts _pump() without ever
+	# clearing the flag, which would leave the bridge deaf for the rest of
+	# the run. The deadline is what gets it back.
+	if _pumping and Time.get_ticks_msec() > _pump_deadline_msec:
+		push_warning("debug_remote: a command handler never returned, resetting the pump")
+		_pumping = false
 
 	_pump()
 
@@ -100,8 +122,10 @@ func _pump() -> void:
 	_pumping = true
 	while not _queue.is_empty():
 		var line: String = _queue.pop_front()
+		var generation := _peer_generation
+		_pump_deadline_msec = Time.get_ticks_msec() + PUMP_STALL_MSEC
 		var reply: Dictionary = await _handle(line)
-		_send(reply)
+		_send(reply, generation)
 	_pumping = false
 
 
@@ -236,18 +260,23 @@ func _state() -> Dictionary:
 		"window_size": [window.size.x, window.size.y],
 	}
 
+	# Every property is probed with `in` first: this script is meant to be
+	# dropped into any project, and "Game" is a common autoload name.
 	var game := get_node_or_null(^"/root/Game")
 	if game != null:
-		out["current_level"] = game.current_level
-		out["best_times"] = game.best_times
+		if "current_level" in game:
+			out["current_level"] = game.current_level
+		if "best_times" in game:
+			out["best_times"] = game.best_times
 
 	if scene != null and "state" in scene and "elapsed" in scene:
 		var idx := int(scene.state)
-		out["level_state"] = LEVEL_STATE_NAMES[idx] if idx < LEVEL_STATE_NAMES.size() else str(idx)
+		out["level_state"] = LEVEL_STATE_NAMES[idx] if idx >= 0 and idx < LEVEL_STATE_NAMES.size() else str(idx)
 		out["elapsed"] = snappedf(float(scene.elapsed), 0.001)
-		out["level_index"] = scene.level_index
-		var ball: Node = scene.ball
-		if ball != null and ball is RigidBody3D:
+		if "level_index" in scene:
+			out["level_index"] = scene.level_index
+		var ball: Variant = scene.ball if "ball" in scene else null
+		if ball is RigidBody3D:
 			var body := ball as RigidBody3D
 			out["ball_position"] = _v3(body.global_position)
 			out["ball_velocity"] = _v3(body.linear_velocity)
@@ -340,7 +369,13 @@ func _screenshot(path: String, max_width: int) -> Dictionary:
 
 # --- connection --------------------------------------------------------------
 
-func _send(reply: Dictionary) -> void:
+## A suspended handler outlives its client: the peer can be replaced while a
+## tap holds the pump for up to 10 s. Without the generation check the reply
+## would be written to whoever connected in the meantime, who would then
+## match it against a request of their own carrying the same id.
+func _send(reply: Dictionary, generation: int) -> void:
+	if generation != _peer_generation:
+		return
 	if _peer == null or _peer.get_status() != StreamPeerTCP.STATUS_CONNECTED:
 		return
 	_peer.put_data((JSON.stringify(reply) + "\n").to_utf8_buffer())
@@ -354,5 +389,6 @@ func _drop_peer() -> void:
 	_release_all()
 	_peer.disconnect_from_host()
 	_peer = null
-	_rx = ""
+	_peer_generation += 1
+	_rx = PackedByteArray()
 	_queue.clear()

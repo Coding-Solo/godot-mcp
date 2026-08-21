@@ -32,7 +32,11 @@ export async function captureScreenshot(bridge: DebugBridge, args: any): Promise
       ? args.outputPath.trim()
       : join(tmpdir(), 'godot-mcp-screenshots', `godot-${Date.now()}.png`);
 
-  mkdirSync(dirname(outputPath), { recursive: true });
+  // 'user://...' and 'res://...' are Godot paths, not filesystem paths: the
+  // game resolves them itself, and mkdirSync would only fail on 'user:'.
+  if (!outputPath.includes('://')) {
+    mkdirSync(dirname(outputPath), { recursive: true });
+  }
 
   const reply = await bridge.command({
     cmd: 'screenshot',
@@ -145,14 +149,29 @@ function describeInputReply(event: InputEvent, reply: Record<string, unknown>): 
   }
 }
 
+/**
+ * Deliberately not Number(): Number(null), Number(true), Number([]) and
+ * Number('') are all finite, so an explicit null would become a 0ms tap, a
+ * strength of 0, or a full-resolution screenshot instead of falling back to
+ * the documented default.
+ */
+function toNumber(value: unknown): number | null {
+  if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+  if (typeof value === 'string' && value.trim()) {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+  return null;
+}
+
 function clampInt(value: unknown, fallback: number, min: number, max: number): number {
-  const parsed = typeof value === 'number' ? value : Number(value);
-  if (!Number.isFinite(parsed)) return fallback;
+  const parsed = toNumber(value);
+  if (parsed === null) return fallback;
   return Math.min(max, Math.max(min, Math.round(parsed)));
 }
 
 function clampFloat(value: unknown, fallback: number, min: number, max: number): number {
-  const parsed = typeof value === 'number' ? value : Number(value);
-  if (!Number.isFinite(parsed)) return fallback;
+  const parsed = toNumber(value);
+  if (parsed === null) return fallback;
   return Math.min(max, Math.max(min, parsed));
 }

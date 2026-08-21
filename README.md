@@ -65,6 +65,7 @@ Godot MCP enables AI agents to launch the Godot editor, run projects, capture de
 - **Run Godot Projects**: Execute Godot projects in debug mode
 - **Capture Debug Output**: Retrieve console output and error messages
 - **Control Execution**: Start and stop Godot projects programmatically
+- **Live Game Control** (fork addition): Screenshot, drive input and read state in a *running* project — see [Live game control](#live-game-control-fork-addition)
 - **Get Godot Version**: Retrieve the installed Godot version
 - **List Godot Projects**: Find Godot projects in a specified directory
 - **Project Analysis**: Get detailed information about project structure
@@ -225,7 +226,8 @@ it is editing instead of only launching it.
 ### Setup
 
 Copy [`examples/debug_remote.gd`](examples/debug_remote.gd) into your project
-(e.g. `scripts/debug_remote.gd`) and register it as an autoload:
+(e.g. `scripts/debug_remote.gd`), register it as an autoload, then start the game
+with `run_project` or from the editor:
 
 ```ini
 [autoload]
@@ -233,13 +235,18 @@ Copy [`examples/debug_remote.gd`](examples/debug_remote.gd) into your project
 DebugRemote="*res://scripts/debug_remote.gd"
 ```
 
+That is the whole setup. The script requires nothing of your project and reports
+only what it finds, so it can be dropped into any codebase unchanged.
+
 The autoload opens a newline-delimited JSON socket on `127.0.0.1:8765`. It is
 **debug-only** (`OS.is_debug_build()`) and **localhost-only**, so an exported
-release build never listens. Set `GODOT_REMOTE_INPUT=0` to disable it even in a
-debug build, `GODOT_REMOTE_INPUT_PORT` to move it, and
-`GODOT_DEBUG_BRIDGE_PORT` on the MCP server side to match.
+release build never listens.
 
-Start the game with `run_project` (or from the editor) before using the tools.
+| Variable | Set on | Effect |
+| --- | --- | --- |
+| `GODOT_REMOTE_INPUT=0` | game | Disables the bridge even in a debug build |
+| `GODOT_REMOTE_INPUT_PORT` | game | Moves the socket off port 8765 |
+| `GODOT_DEBUG_BRIDGE_PORT` | MCP server | Must match the port above |
 
 ### `screenshot`
 
@@ -248,7 +255,7 @@ plus a saved PNG.
 
 | Parameter | Description |
 | --- | --- |
-| `outputPath` | Absolute path for the PNG (default: a temp file) |
+| `outputPath` | Absolute path or Godot `user://` path for the PNG (default: a temp file) |
 | `maxWidth` | Downscale width in pixels, default 1280, `0` keeps full size |
 
 Capturing inside the engine rather than grabbing the OS window means it works
@@ -277,12 +284,16 @@ client cannot leave the throttle stuck down.
 ### `get_game_state`
 
 Returns the current scene, pause state, held actions, FPS, window size, and
-every visible label and button with its node path. When the current scene
-exposes `state`, `elapsed` and `ball`, level timing and player physics are
-included too — adapt `_state()` in `debug_remote.gd` to your own scene API.
+every visible label and button with its node path. It is far cheaper than a
+screenshot and gives exact numbers, so reach for it first and use `screenshot`
+when you need to see what something looks like.
 
-It is far cheaper than a screenshot and gives exact numbers, so reach for it
-first and use `screenshot` when you need to see what something looks like.
+Project-specific fields are added only when they exist. A `/root/Game` autoload
+contributes `current_level` and `best_times`; a current scene exposing both
+`state` and `elapsed` contributes level timing, plus `level_index` and ball
+physics when it has those too. None of it is required — a project with none of
+these still gets the generic dump. Add your own fields in `_state()` in
+`debug_remote.gd`.
 
 ## Architecture
 
@@ -298,6 +309,7 @@ The bundled script accepts operation type and parameters as JSON, allowing for f
 - **Godot Not Found**: Set the `GODOT_PATH` environment variable to your Godot executable path
 - **Connection Issues**: Ensure the server is running and restart your AI assistant
 - **Invalid Project Path**: Ensure the path points to a directory containing a `project.godot` file
+- **Debug Bridge Unreachable**: The game must be running in a debug build with `debug_remote.gd` registered as an autoload — look for `debug_remote: listening on 127.0.0.1:8765` in its console output
 - **Build Issues**: Make sure all dependencies are installed by running `npm install`
 
 <details>
