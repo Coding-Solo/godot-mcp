@@ -26,3 +26,4 @@ Thumbs.db
 
 # Coverage directory
 coverage/
+pnpm-lock.yaml
