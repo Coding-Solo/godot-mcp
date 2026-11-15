@@ -7,9 +7,9 @@
 [![](https://img.shields.io/badge/Node.js-339933?style=flat&logo=nodedotjs&logoColor=white 'Node.js')](https://nodejs.org/en/download/)
 [![](https://img.shields.io/badge/TypeScript-3178C6?style=flat&logo=typescript&logoColor=white 'TypeScript')](https://www.typescriptlang.org/)
 
-[![](https://img.shields.io/github/last-commit/Coding-Solo/godot-mcp 'Last Commit')](https://github.com/Coding-Solo/godot-mcp/commits/main)
-[![](https://img.shields.io/github/stars/Coding-Solo/godot-mcp 'Stars')](https://github.com/Coding-Solo/godot-mcp/stargazers)
-[![](https://img.shields.io/github/forks/Coding-Solo/godot-mcp 'Forks')](https://github.com/Coding-Solo/godot-mcp/network/members)
+[![](https://img.shields.io/github/last-commit/HazielCC/godot-mcp 'Last Commit')](https://github.com/HazielCC/godot-mcp/commits/main)
+[![](https://img.shields.io/github/stars/HazielCC/godot-mcp 'Stars')](https://github.com/HazielCC/godot-mcp/stargazers)
+[![](https://img.shields.io/github/forks/HazielCC/godot-mcp 'Forks')](https://github.com/HazielCC/godot-mcp/network/members)
 [![](https://img.shields.io/badge/License-MIT-red.svg 'MIT License')](https://opensource.org/licenses/MIT)
 
 
@@ -55,6 +55,8 @@
 
 A Model Context Protocol (MCP) server for interacting with the Godot game engine.
 
+> **Fork note:** This is a maintained fork of [Coding-Solo/godot-mcp](https://github.com/Coding-Solo/godot-mcp), originally created by Solomon Elias and distributed under the MIT License. This fork is maintained independently at [HazielCC/godot-mcp](https://github.com/HazielCC/godot-mcp), and install commands below point here.
+
 ## Introduction
 
 Godot MCP enables AI agents to launch the Godot editor, run projects, capture debug output, and control project execution. This direct feedback loop helps agents understand what works and what doesn't in real Godot projects, leading to better code generation and debugging assistance.
@@ -89,7 +91,7 @@ Godot MCP enables AI agents to launch the Godot editor, run projects, capture de
 ### Claude Code
 
 ```bash
-claude mcp add godot -- npx @coding-solo/godot-mcp
+claude mcp add godot -- npx -y github:HazielCC/godot-mcp
 ```
 
 That's it. Restart Claude Code and your Godot MCP tools are available.
@@ -97,7 +99,7 @@ That's it. Restart Claude Code and your Godot MCP tools are available.
 With environment variables:
 
 ```bash
-claude mcp add godot -e GODOT_PATH=/path/to/godot -e DEBUG=true -- npx @coding-solo/godot-mcp
+claude mcp add godot -e GODOT_PATH=/path/to/godot -e DEBUG=true -- npx -y github:HazielCC/godot-mcp
 ```
 
 <details>
@@ -110,7 +112,7 @@ Add to your Cline MCP settings file (`~/Library/Application Support/Code/User/gl
   "mcpServers": {
     "godot": {
       "command": "npx",
-      "args": ["@coding-solo/godot-mcp"],
+      "args": ["-y", "github:HazielCC/godot-mcp"],
       "env": {
         "DEBUG": "true"
       },
@@ -148,7 +150,7 @@ Add to your Cline MCP settings file (`~/Library/Application Support/Code/User/gl
 3. Fill out the form:
    - Name: `godot`
    - Type: `command`
-   - Command: `npx @coding-solo/godot-mcp`
+   - Command: `npx -y github:HazielCC/godot-mcp`
 4. Click "Add"
 5. You may need to press the refresh button in the top right corner of the MCP server card to populate the tool list
 
@@ -161,7 +163,7 @@ Create a file at `.cursor/mcp.json` in your project directory:
   "mcpServers": {
     "godot": {
       "command": "npx",
-      "args": ["@coding-solo/godot-mcp"],
+      "args": ["-y", "github:HazielCC/godot-mcp"],
       "env": {
         "DEBUG": "true"
       }
@@ -182,7 +184,7 @@ For any MCP-compatible client, use this configuration:
   "mcpServers": {
     "godot": {
       "command": "npx",
-      "args": ["@coding-solo/godot-mcp"],
+      "args": ["-y", "github:HazielCC/godot-mcp"],
       "env": {
         "GODOT_PATH": "/path/to/godot",
         "DEBUG": "true"
@@ -205,7 +207,7 @@ For any MCP-compatible client, use this configuration:
 <summary><strong>Building from Source</strong></summary>
 
 ```bash
-git clone https://github.com/Coding-Solo/godot-mcp.git
+git clone https://github.com/HazielCC/godot-mcp.git
 cd godot-mcp
 npm install
 npm run build
